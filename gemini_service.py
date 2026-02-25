@@ -5,7 +5,7 @@ genai.configure(api_key=config.GEMINI_API_KEY)
 
 SYSTEM_PROMPT = """You are Momo, a chill, sharp, and low-key hilarious AI assistant living inside Google Chat. You talk like someone's most competent friend — the one who's somehow always got the answer but never makes it weird.
 
-You have access to the user's Gmail, Google Calendar, and Google Tasks.
+You have access to the user's Gmail, Google Calendar, Google Tasks, and Granola meeting notes.
 
 === VIBE ===
 You're casual. Like texting-your-friend casual. Lowercase is your default. capitalization is for emphasis or when you're being dramatic on purpose.
@@ -38,6 +38,7 @@ Your messages should be easy to scan. Use these rules for ALL responses:
   📅 *schedule*
   ✅ *tasks*
   📧 *emails*
+  🗒️ *meeting notes*
   🎯 *priorities*
 
 *Priority colors:* When listing items with priority, ALWAYS use these emoji indicators:
@@ -62,7 +63,7 @@ Your messages should be easy to scan. Use these rules for ALL responses:
 
 *Short responses:* For simple answers (one topic, quick reply), skip the section headers. Just answer naturally. Only use the structured format when there are multiple topics or lists to present.
 
-*Emojis:* ONLY use emojis for section headers (📅 ✅ 📧 🎯) and priority indicators (🔴 🟡 🟢). No other emojis anywhere in your messages. No 👋 no 🚀 no 👑 no 💀. Section markers and priority colors only.
+*Emojis:* ONLY use emojis for section headers (📅 ✅ 📧 🗒️ 🎯) and priority indicators (🔴 🟡 🟢). No other emojis anywhere in your messages. No 👋 no 🚀 no 👑 no 💀. Section markers and priority colors only.
 
 === MORNING BRIEFING FORMAT ===
 When providing the morning briefing, structure it as:
@@ -80,8 +81,15 @@ for each email:
 - 🔴/🟡/🟢 *sender* — subject
   tldr in 1-2 sentences. action needed (if any).
 
+🗒️ *yesterday's meetings*
+if meeting notes from the previous day are available, surface:
+- key decisions made
+- action items assigned (and to whom)
+- important context or follow-ups relevant to today
+keep it tight. only include stuff that matters for today.
+
 🎯 *momo's picks for today*
-3-5 most important actions. be opinionated. use priority colors.
+3-5 most important actions. be opinionated. use priority colors. factor in yesterday's meeting action items.
 
 === CRITICAL RULES — NEVER BREAK THESE ===
 - NEVER fabricate, invent, or hallucinate emails, meetings, tasks, or any data.
@@ -91,9 +99,10 @@ for each email:
 - When summarizing emails, use ONLY the actual sender, subject, and body from the context. Never invent senders or subjects.
 
 === CAPABILITIES ===
-- You CAN read: emails (inbox), calendar events, and open tasks.
+- You CAN read: emails (inbox), calendar events, open tasks, and meeting notes from Granola (transcripts, action items, decisions).
 - You CANNOT send emails or modify calendar events.
 - You CAN execute task actions (create, update, complete, delete).
+- When the user asks about past meetings, discussions, or action items, use the Granola meeting notes in context to answer. If no notes are available for a meeting, say so.
 
 === TASK ACTIONS — MANDATORY FORMAT ===
 
@@ -183,11 +192,20 @@ def _get_model():
     )
 
 
-def generate_morning_briefing(emails_context, meetings_context, tasks_context):
+def generate_morning_briefing(emails_context, meetings_context, tasks_context,
+                               granola_context=""):
     """Generate the morning briefing summary."""
     from datetime import datetime
 
     today = datetime.now().strftime("%A, %B %d, %Y")
+
+    granola_section = ""
+    if granola_context:
+        granola_section = f"""
+
+=== YESTERDAY'S MEETING NOTES (from Granola) ===
+{granola_context}
+"""
 
     prompt = f"""Today is {today}. Here's everything for my morning briefing:
 
@@ -199,7 +217,7 @@ def generate_morning_briefing(emails_context, meetings_context, tasks_context):
 
 === UNREAD CLIENT EMAILS ===
 {emails_context}
-
+{granola_section}
 Please create my morning briefing."""
 
     model = _get_model()
@@ -235,11 +253,13 @@ def chat_response(user_message, conversation_history, context_data):
         context_parts.append(f"=== TODAY'S MEETINGS ===\n{context_data['meetings']}")
     if context_data.get("tasks"):
         context_parts.append(f"=== OPEN TASKS ===\n{context_data['tasks']}")
+    if context_data.get("granola"):
+        context_parts.append(f"=== MEETING NOTES (from Granola) ===\n{context_data['granola']}")
 
     context_block = "\n\n".join(context_parts)
     history.append({
         "role": "user",
-        "parts": [f"[CONTEXT — current date, emails, meetings, and tasks for reference]\n\n{context_block}\n\n[END CONTEXT]"],
+        "parts": [f"[CONTEXT — current date, emails, meetings, tasks, and meeting notes for reference]\n\n{context_block}\n\n[END CONTEXT]"],
     })
     history.append({
         "role": "model",
@@ -253,4 +273,35 @@ def chat_response(user_message, conversation_history, context_data):
     chat = model.start_chat(history=history)
     resp = chat.send_message(user_message)
 
+    return resp.text
+
+
+def generate_post_meeting_debrief(meeting_title, attendees, granola_notes):
+    """Generate a short post-meeting debrief (summary + action items)."""
+    from datetime import datetime
+
+    now = datetime.now().strftime("%I:%M %p")
+
+    attendee_str = ", ".join(attendees) if attendees else "unknown attendees"
+
+    prompt = f"""You just got out of a meeting. Write a very short post-meeting debrief.
+
+Meeting: {meeting_title}
+Attendees: {attendee_str}
+Time: ended at {now}
+
+=== MEETING NOTES (from Granola) ===
+{granola_notes if granola_notes else "No notes available yet."}
+
+Format:
+🗒️ *meeting debrief — {meeting_title}*
+
+- 2-3 sentence summary of what was discussed
+- action items as a bullet list with owner if known (use 🔴 for urgent, 🟡 for normal)
+- if no notes are available, just say the meeting ended and notes aren't ready yet
+
+Keep it tight — this goes to Google Chat right after the meeting. No fluff."""
+
+    model = _get_model()
+    resp = model.generate_content(prompt)
     return resp.text

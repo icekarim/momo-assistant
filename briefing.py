@@ -7,11 +7,20 @@ from gmail_service import (
     format_emails_for_context,
     fetch_email_alert_candidates,
 )
-from calendar_service import fetch_todays_meetings, format_meetings_for_context
+from calendar_service import (
+    fetch_todays_meetings,
+    fetch_recently_ended_meetings,
+    format_meetings_for_context,
+)
 from tasks_service import fetch_open_tasks, format_tasks_for_context
-from gemini_service import generate_morning_briefing
+from gemini_service import generate_morning_briefing, generate_post_meeting_debrief
 from chat_service import send_chat_message, format_for_google_chat
-from conversation_store import has_email_alert_been_sent, mark_email_alert_sent
+from conversation_store import (
+    has_email_alert_been_sent,
+    mark_email_alert_sent,
+    has_debrief_been_sent,
+    mark_debrief_sent,
+)
 import config
 
 
@@ -31,7 +40,18 @@ def run_morning_briefing():
     tasks = fetch_open_tasks()
     print(f"     Found {len(tasks)} open task(s)")
 
-    if not emails and not meetings and not tasks:
+    granola_ctx = ""
+    if config.GRANOLA_ENABLED:
+        print("  Fetching yesterday's meeting notes from Granola...")
+        try:
+            from granola_service import fetch_yesterday_meeting_notes, format_granola_notes_for_context
+            raw_notes = fetch_yesterday_meeting_notes()
+            granola_ctx = format_granola_notes_for_context(raw_notes)
+            print(f"     Granola notes loaded ({len(granola_ctx)} chars)")
+        except Exception as e:
+            print(f"     Granola fetch failed: {e}")
+
+    if not emails and not meetings and not tasks and not granola_ctx:
         print("  Nothing to report. Skipping.")
         return {"status": "skipped", "reason": "nothing to report"}
 
@@ -40,7 +60,9 @@ def run_morning_briefing():
     tasks_ctx = format_tasks_for_context(tasks)
 
     print("  Generating briefing with Gemini...")
-    summary = generate_morning_briefing(emails_ctx, meetings_ctx, tasks_ctx)
+    summary = generate_morning_briefing(
+        emails_ctx, meetings_ctx, tasks_ctx, granola_context=granola_ctx,
+    )
 
     if config.CHAT_SPACE_ID:
         print("  Sending to Google Chat...")
@@ -174,6 +196,52 @@ def _gemini_triage_emails(emails):
         })
 
     return flagged
+
+
+def run_post_meeting_debrief():
+    """Check for recently ended meetings and send short debriefs with Granola notes."""
+    if not config.GRANOLA_ENABLED:
+        return {"status": "skipped", "reason": "granola disabled"}
+    if not config.CHAT_SPACE_ID:
+        return {"status": "skipped", "reason": "CHAT_SPACE_ID not configured"}
+
+    lookback = config.MEETING_DEBRIEF_LOOKBACK_MINUTES
+    ended = fetch_recently_ended_meetings(lookback_minutes=lookback)
+
+    if not ended:
+        return {"status": "no_meetings", "debriefs_sent": 0}
+
+    from granola_service import fetch_meeting_notes_for_context
+    from datetime import datetime
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    sent_count = 0
+
+    for meeting in ended:
+        event_id = meeting.get("id", "")
+        if not event_id or has_debrief_been_sent(event_id):
+            continue
+
+        title = meeting["title"]
+        attendees = [a["name"] for a in meeting.get("attendees", [])]
+
+        print(f"  Generating debrief for: {title}")
+        try:
+            granola_notes = fetch_meeting_notes_for_context(title, today_str)
+        except Exception as e:
+            print(f"    Granola fetch failed: {e}")
+            granola_notes = ""
+
+        try:
+            debrief = generate_post_meeting_debrief(title, attendees, granola_notes)
+            formatted = format_for_google_chat(debrief)
+            send_chat_message(config.CHAT_SPACE_ID, formatted)
+            mark_debrief_sent(event_id, title)
+            sent_count += 1
+        except Exception as e:
+            print(f"    Debrief generation/send failed for '{title}': {e}")
+
+    return {"status": "sent" if sent_count else "no_debriefs", "debriefs_sent": sent_count}
 
 
 def _format_email_alert_message(email, reason, summary, priority):

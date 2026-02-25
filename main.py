@@ -2,10 +2,11 @@
 Momo — FastAPI Application
 
 Endpoints:
-  POST /chat       — Google Chat webhook (receives user messages)
-  POST /briefing   — Trigger morning briefing (called by Cloud Scheduler)
-  POST /email-alerts — Trigger proactive important email checks
-  GET  /health     — Health check
+  POST /chat            — Google Chat webhook (receives user messages)
+  POST /briefing        — Trigger morning briefing (called by Cloud Scheduler)
+  POST /email-alerts    — Trigger proactive important email checks
+  POST /meeting-debrief — Post-meeting debrief with Granola notes (Cloud Scheduler)
+  GET  /health          — Health check
 """
 
 from fastapi import FastAPI, Request, HTTPException
@@ -14,7 +15,7 @@ import traceback
 
 import re
 import config
-from briefing import run_morning_briefing, run_proactive_email_alerts
+from briefing import run_morning_briefing, run_proactive_email_alerts, run_post_meeting_debrief
 from gmail_service import (
     fetch_unread_client_emails,
     search_emails,
@@ -135,6 +136,20 @@ async def trigger_email_alerts():
     """Called by Cloud Scheduler to proactively alert on important/client emails."""
     try:
         result = run_proactive_email_alerts()
+        return result
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Post-Meeting Debrief Trigger ─────────────────────────────
+
+@app.post("/meeting-debrief")
+async def trigger_meeting_debrief():
+    """Called by Cloud Scheduler every ~10 min during work hours.
+    Sends short debriefs for recently ended meetings using Granola notes."""
+    try:
+        result = run_post_meeting_debrief()
         return result
     except Exception as e:
         traceback.print_exc()
@@ -510,6 +525,23 @@ def _build_context(user_message):
             context["emails"] = format_emails_for_context(emails)
         except Exception as e:
             print(f"Error fetching emails: {e}")
+
+    if config.GRANOLA_ENABLED:
+        meeting_keywords = [
+            "meeting notes", "meeting note", "discussed", "action items",
+            "transcript", "granola", "notes from", "what happened in",
+            "debrief", "takeaways", "decisions", "follow up", "follow-up",
+        ]
+        wants_meeting_notes = any(kw in lower for kw in meeting_keywords)
+
+        if wants_meeting_notes or is_general:
+            try:
+                from granola_service import query_granola
+                granola_result = query_granola(user_message)
+                if granola_result:
+                    context["granola"] = granola_result
+            except Exception as e:
+                print(f"Error fetching Granola data: {e}")
 
     return context
 
