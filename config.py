@@ -1,0 +1,61 @@
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ── Gemini ───────────────────────────────────────────────────
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = "gemini-2.5-flash"
+
+# ── Gmail ────────────────────────────────────────────────────
+GMAIL_QUERY = "is:unread in:inbox"
+BRIEFING_LOOKBACK_HOURS = 24
+SEARCH_LOOKBACK_DAYS = 90
+MAX_EMAILS = 50
+EMAIL_ALERTS_ENABLED = os.getenv("EMAIL_ALERTS_ENABLED", "true").lower() == "true"
+EMAIL_ALERT_GMAIL_QUERY = os.getenv(
+    "EMAIL_ALERT_GMAIL_QUERY",
+    "is:unread in:inbox newer_than:2d",
+)
+EMAIL_ALERTS_MAX_PER_RUN = int(os.getenv("EMAIL_ALERTS_MAX_PER_RUN", "5"))
+IMPORTANT_EMAIL_KEYWORDS = [
+    kw.strip().lower()
+    for kw in os.getenv(
+        "IMPORTANT_EMAIL_KEYWORDS",
+        "urgent,asap,important,action required,deadline,escalation,blocker",
+    ).split(",")
+    if kw.strip()
+]
+CLIENT_EMAIL_KEYWORDS = [
+    kw.strip().lower()
+    for kw in os.getenv("CLIENT_EMAIL_KEYWORDS", "client,customer").split(",")
+    if kw.strip()
+]
+CLIENT_DOMAINS = [
+    domain.strip().lower()
+    for domain in os.getenv("CLIENT_DOMAINS", "").split(",")
+    if domain.strip()
+]
+
+# ── Google Auth ──────────────────────────────────────────────
+GOOGLE_CLIENT_SECRET_FILE = os.getenv("GOOGLE_CLIENT_SECRET_FILE", "client_secret.json")
+GOOGLE_TOKEN_FILE = os.getenv("GOOGLE_TOKEN_FILE", "token.json")
+
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/tasks",
+]
+
+# ── Google Chat ──────────────────────────────────────────────
+CHAT_SPACE_ID = os.getenv("CHAT_SPACE_ID", "")
+
+# ── Firestore ────────────────────────────────────────────────
+GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "")
+FIRESTORE_DATABASE = os.getenv("FIRESTORE_DATABASE", "testing")
+FIRESTORE_COLLECTION = "conversations"
+FIRESTORE_EMAIL_ALERTS_COLLECTION = "email_alerts"
+MAX_CONVERSATION_TURNS = 50
+
+# ── Server ───────────────────────────────────────────────────
+PORT = int(os.getenv("PORT", "8080"))

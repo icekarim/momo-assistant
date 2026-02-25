@@ -1,0 +1,521 @@
+"""
+Momo — FastAPI Application
+
+Endpoints:
+  POST /chat       — Google Chat webhook (receives user messages)
+  POST /briefing   — Trigger morning briefing (called by Cloud Scheduler)
+  POST /email-alerts — Trigger proactive important email checks
+  GET  /health     — Health check
+"""
+
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+import traceback
+
+import re
+import config
+from briefing import run_morning_briefing, run_proactive_email_alerts
+from gmail_service import (
+    fetch_unread_client_emails,
+    search_emails,
+    format_emails_for_context,
+)
+from calendar_service import (
+    fetch_todays_meetings,
+    format_meetings_for_context,
+)
+from tasks_service import fetch_open_tasks, format_tasks_for_context, create_task, update_task, complete_task, delete_task
+from gemini_service import chat_response
+from chat_service import format_for_google_chat
+from conversation_store import get_conversation, add_turn, clear_conversation
+
+app = FastAPI(title="Momo")
+
+
+# ── Helpers for Workspace Add-on format ──────────────────────
+
+def _parse_event(body: dict) -> dict:
+    """Parse both standard Chat events and Workspace Add-on events into a
+    normalized dict with keys: event_type, text, user_id, user_name, space, is_addon."""
+    is_addon = "commonEventObject" in body or "chat" in body
+
+    # Standard Chat app format
+    event_type = body.get("type")
+    text = ""
+    user_id = "unknown"
+    user_name = "there"
+    space = ""
+
+    if is_addon:
+        chat_payload = body.get("chat", {})
+        if not event_type:
+            if "messagePayload" in chat_payload:
+                event_type = "MESSAGE"
+            elif "addedToSpacePayload" in chat_payload:
+                event_type = "ADDED_TO_SPACE"
+            elif "removedFromSpacePayload" in chat_payload:
+                event_type = "REMOVED_FROM_SPACE"
+            elif "buttonClickedPayload" in chat_payload:
+                event_type = "CARD_CLICKED"
+
+        msg_payload = chat_payload.get("messagePayload", {})
+        msg = msg_payload.get("message", {})
+        text = msg.get("argumentText", msg.get("text", "")).strip()
+
+        chat_user = chat_payload.get("user", {})
+        user_id = chat_user.get("name", "unknown")
+        user_name = chat_user.get("displayName", "there")
+
+        space_info = msg_payload.get("space", {})
+        space = space_info.get("name", "")
+    else:
+        msg = body.get("message", {})
+        text = msg.get("argumentText", msg.get("text", "")).strip()
+        user = body.get("user", {})
+        user_id = user.get("name", "unknown")
+        user_name = user.get("displayName", "there")
+        space = body.get("space", {}).get("name", "")
+
+    return {
+        "event_type": event_type,
+        "text": text,
+        "user_id": user_id,
+        "user_name": user_name,
+        "space": space,
+        "is_addon": is_addon,
+    }
+
+
+def _make_response(text: str, is_addon: bool) -> dict:
+    """Build the response in the correct format (add-on vs standard Chat)."""
+    if not text:
+        return {}
+    if is_addon:
+        return {
+            "hostAppDataAction": {
+                "chatDataAction": {
+                    "createMessageAction": {
+                        "message": {
+                            "text": text
+                        }
+                    }
+                }
+            }
+        }
+    return {"text": text}
+
+
+# ── Health Check ─────────────────────────────────────────────
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.get("/")
+async def index():
+    return {"status": "ok", "service": "momo"}
+
+
+# ── Morning Briefing Trigger ─────────────────────────────────
+
+@app.post("/briefing")
+async def trigger_briefing():
+    """Called by Cloud Scheduler at 8 AM daily."""
+    try:
+        result = run_morning_briefing()
+        return result
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/email-alerts")
+async def trigger_email_alerts():
+    """Called by Cloud Scheduler to proactively alert on important/client emails."""
+    try:
+        result = run_proactive_email_alerts()
+        return result
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Google Chat Webhook ──────────────────────────────────────
+
+@app.api_route("/chat", methods=["GET", "POST"])
+async def chat_webhook(request: Request):
+    """Receives messages from Google Chat (supports both standard and Add-on format)."""
+    if request.method == "GET":
+        return {"status": "ok", "message": "Momo Chat endpoint"}
+
+    body = await request.json()
+    ev = _parse_event(body)
+    event_type = ev["event_type"]
+    is_addon = ev["is_addon"]
+
+    if event_type == "ADDED_TO_SPACE":
+        space = ev["space"]
+        user_name = ev["user_name"]
+        print(f"Momo added to space: {space}")
+        reply = (
+            f"Heyyy {user_name}! I'm Momo — your personal briefing sidekick.\n\n"
+            "Every morning at 8 AM I'll hit you with the rundown: client emails, "
+            "meetings, tasks — the whole vibe.\n\n"
+            "You can also just ask me stuff like:\n"
+            "- *What's on my schedule today?*\n"
+            "- *Any urgent emails?*\n"
+            "- *What did [client] send me?*\n"
+            "- *What are my overdue tasks?*\n"
+            "- *Help me draft a reply to [person]*\n\n"
+            "Type *clear* to wipe our chat history and start fresh.\n\n"
+            "Let's get it"
+        )
+        return _make_response(reply, is_addon)
+
+    if event_type == "REMOVED_FROM_SPACE":
+        print("Momo removed from space.")
+        return {}
+
+    if event_type == "MESSAGE":
+        return await handle_message(ev)
+
+    return _make_response("Momo is here. Send me a message to get started.", is_addon)
+
+
+async def handle_message(ev: dict) -> dict:
+    """Process an incoming chat message."""
+    text = ev["text"]
+    user_id = ev["user_id"]
+    space = ev["space"]
+    is_addon = ev["is_addon"]
+
+    if space and not config.CHAT_SPACE_ID:
+        print(f"Detected space ID: {space}")
+        print(f"   Set CHAT_SPACE_ID={space} in your environment variables")
+
+    if not text:
+        return _make_response(
+            "Hmm, I got nothing there. Try asking about your emails, meetings, or tasks",
+            is_addon,
+        )
+
+    lower = text.lower().strip()
+    if lower in ("clear", "reset", "start over"):
+        clear_conversation(user_id)
+        return _make_response("Slate wiped. What can Momo do for you?", is_addon)
+
+    if lower in ("briefing", "morning briefing", "daily briefing"):
+        try:
+            run_morning_briefing()
+            return _make_response("Morning briefing sent!", is_addon)
+        except Exception as e:
+            return _make_response(f"Error generating briefing: {str(e)}", is_addon)
+
+    history = get_conversation(user_id)
+
+    try:
+        context_data = _build_context(text)
+        response = chat_response(text, history, context_data)
+
+        task_actions = _extract_all_task_proposals(response)
+
+        if not task_actions:
+            bulk = _detect_bulk_task_action(text)
+            if bulk:
+                task_actions = bulk
+
+        task_summary = ""
+        if task_actions:
+            results = []
+            errors = []
+            for action_item in task_actions:
+                try:
+                    result = _execute_task_action(action_item)
+                    if "error" in result:
+                        errors.append(f"{action_item.get('title', action_item.get('find', '?'))}: {result['error']}")
+                    else:
+                        results.append(f"*{result['title']}* — {result['status']}")
+                except Exception as e:
+                    errors.append(f"{action_item.get('title', action_item.get('find', '?'))}: {str(e)}")
+
+            lines = []
+            if results:
+                lines.append(f"\n✅ *done — {len(results)} task(s):*")
+                lines.extend(f"  - {r}" for r in results)
+            if errors:
+                lines.append(f"\n🔴 *couldn't do {len(errors)}:*")
+                lines.extend(f"  - {e}" for e in errors)
+            task_summary = "\n".join(lines)
+
+        clean_response = _remove_task_tags(response)
+        full_response = clean_response + task_summary if task_summary else clean_response
+
+        add_turn(user_id, "user", text)
+        add_turn(user_id, "assistant", clean_response)
+
+        formatted = format_for_google_chat(full_response)
+        return _make_response(formatted, is_addon)
+
+    except Exception as e:
+        traceback.print_exc()
+        return _make_response(f"sorry, something went wrong: {str(e)}", is_addon)
+
+
+def _extract_all_task_proposals(response):
+    """Extract ALL task action proposals from Gemini's response.
+    Returns a list of action dicts. Supports bulk operations."""
+    proposals = []
+
+    # CREATE
+    for match in re.finditer(
+        r'\[CREATE_TASK\]\s*title="([^"]+)"(?:\s*due="([^"]*)")?(?:\s*notes="([^"]*)")?',
+        response,
+    ):
+        task = {"action": "create", "title": match.group(1)}
+        if match.group(2):
+            task["due"] = match.group(2)
+        if match.group(3):
+            task["notes"] = match.group(3)
+        proposals.append(task)
+
+    # UPDATE
+    for match in re.finditer(
+        r'\[UPDATE_TASK\]\s*find="([^"]+)"(?:\s*title="([^"]*)")?(?:\s*due="([^"]*)")?(?:\s*notes="([^"]*)")?',
+        response,
+    ):
+        task = {"action": "update", "find": match.group(1)}
+        if match.group(2):
+            task["new_title"] = match.group(2)
+        if match.group(3):
+            task["new_due"] = match.group(3)
+        if match.group(4):
+            task["new_notes"] = match.group(4)
+        proposals.append(task)
+
+    # COMPLETE
+    for match in re.finditer(r'\[COMPLETE_TASK\]\s*find="([^"]+)"', response):
+        proposals.append({"action": "complete", "find": match.group(1)})
+
+    # DELETE
+    for match in re.finditer(r'\[DELETE_TASK\]\s*find="([^"]+)"', response):
+        proposals.append({"action": "delete", "find": match.group(1)})
+
+    if proposals:
+        return proposals
+
+    return _fallback_parse_prose(response)
+
+
+def _fallback_parse_prose(response):
+    """Fallback: detect task actions from Gemini's prose when it forgets tags.
+    Looks for patterns like 'moved "X" to today' or 'added "X"'."""
+    from datetime import datetime, timedelta
+
+    lower = response.lower()
+    proposals = []
+
+    now = datetime.now()
+    today_iso = now.strftime("%Y-%m-%d")
+    tomorrow_iso = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    weekday_map = {}
+    for i in range(1, 8):
+        d = now + timedelta(days=i)
+        weekday_map[d.strftime("%A").lower()] = d.strftime("%Y-%m-%d")
+
+    def _resolve_date(text):
+        t = text.lower().strip().rstrip(".")
+        if t == "today":
+            return today_iso
+        if t == "tomorrow":
+            return tomorrow_iso
+        for day_name, iso in weekday_map.items():
+            if day_name in t:
+                return iso
+        date_match = re.search(r'(\d{4}-\d{2}-\d{2})', t)
+        if date_match:
+            return date_match.group(1)
+        return None
+
+    for match in re.finditer(
+        r'(?:moved|updated|pushed|changed|rescheduled)\s+"([^"]+)"\s+(?:to|due)\s+(\w+[\w\s,]*)',
+        lower,
+    ):
+        title = match.group(1)
+        date = _resolve_date(match.group(2))
+        if date:
+            orig_match = re.search(re.escape(match.group(1)), response, re.IGNORECASE)
+            orig_title = orig_match.group(0) if orig_match else title
+            proposals.append({"action": "update", "find": orig_title, "new_due": date})
+
+    for match in re.finditer(
+        r'(?:added|created)\s+"([^"]+)"(?:\s+(?:to your tasks?|for you))?(?:[,.]?\s*due\s+(\w+[\w\s,]*))?',
+        lower,
+    ):
+        title = match.group(1)
+        orig_match = re.search(re.escape(match.group(1)), response, re.IGNORECASE)
+        orig_title = orig_match.group(0) if orig_match else title
+        task = {"action": "create", "title": orig_title}
+        if match.group(2):
+            date = _resolve_date(match.group(2))
+            if date:
+                task["due"] = date
+        proposals.append(task)
+
+    for match in re.finditer(
+        r'(?:marked|completed|finished|crossed off)\s+"([^"]+)"',
+        lower,
+    ):
+        orig_match = re.search(re.escape(match.group(1)), response, re.IGNORECASE)
+        orig_title = orig_match.group(0) if orig_match else match.group(1)
+        proposals.append({"action": "complete", "find": orig_title})
+
+    for match in re.finditer(
+        r'(?:deleted|removed)\s+"([^"]+)"',
+        lower,
+    ):
+        orig_match = re.search(re.escape(match.group(1)), response, re.IGNORECASE)
+        orig_title = orig_match.group(0) if orig_match else match.group(1)
+        proposals.append({"action": "delete", "find": orig_title})
+
+    return proposals if proposals else None
+
+
+def _remove_task_tags(response):
+    """Remove all task action tags from the response shown to the user."""
+    cleaned = re.sub(r'\[(CREATE|UPDATE|COMPLETE|DELETE)_TASK\][^\n]*\n?', '', response)
+    return cleaned.strip()
+
+
+def _execute_task_action(action_item):
+    """Execute a single confirmed task action."""
+    action = action_item.get("action", "create")
+    if action == "create":
+        return create_task(
+            title=action_item["title"],
+            notes=action_item.get("notes", ""),
+            due_date=action_item.get("due"),
+        )
+    elif action == "update":
+        return update_task(
+            task_title=action_item["find"],
+            new_title=action_item.get("new_title"),
+            new_notes=action_item.get("new_notes"),
+            new_due=action_item.get("new_due"),
+        )
+    elif action == "complete":
+        return complete_task(task_title=action_item["find"])
+    elif action == "delete":
+        return delete_task(task_title=action_item["find"])
+    return {"error": f"Unknown action: {action}"}
+
+
+def _detect_bulk_task_action(user_message):
+    """Detect bulk task operations like 'change all tasks to due today' and
+    programmatically generate update actions for every open task.
+    Skips tasks that already have the target due date."""
+    from datetime import datetime, timedelta
+
+    lower = user_message.lower().strip()
+
+    all_patterns = [
+        r'(?:change|move|push|set|update|reschedule)\s+(?:all|every|each)\s+(?:my\s+)?(?:pending\s+|open\s+)?tasks?\b',
+        r'(?:make|set)\s+(?:all|every|each)\s+(?:my\s+)?(?:pending\s+|open\s+)?tasks?\s+(?:due|to)',
+        r'(?:push|move)\s+everything\s+(?:to|due)',
+    ]
+    if not any(re.search(p, lower) for p in all_patterns):
+        return None
+
+    now = datetime.now()
+    today_iso = now.strftime("%Y-%m-%d")
+    tomorrow_iso = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+    weekday_map = {}
+    for i in range(1, 8):
+        d = now + timedelta(days=i)
+        weekday_map[d.strftime("%A").lower()] = d.strftime("%Y-%m-%d")
+
+    target_date = None
+    if "today" in lower:
+        target_date = today_iso
+    elif "tomorrow" in lower:
+        target_date = tomorrow_iso
+    else:
+        for day_name, iso in weekday_map.items():
+            if day_name in lower:
+                target_date = iso
+                break
+        if not target_date:
+            date_match = re.search(r'(\d{4}-\d{2}-\d{2})', lower)
+            if date_match:
+                target_date = date_match.group(1)
+
+    if not target_date:
+        return None
+
+    try:
+        tasks = fetch_open_tasks()
+    except Exception:
+        return None
+
+    if not tasks:
+        return None
+
+    target_human = datetime.strptime(target_date, "%Y-%m-%d").strftime("%b %d, %Y")
+
+    actions = []
+    for t in tasks:
+        if t.get("due") == target_human:
+            continue
+        if not t.get("is_overdue"):
+            continue
+        actions.append({
+            "action": "update",
+            "find": t["title"],
+            "new_due": target_date,
+        })
+
+    return actions if actions else None
+
+
+def _build_context(user_message):
+    """Fetch relevant context based on what the user is asking about."""
+    lower = user_message.lower()
+    context = {}
+
+    try:
+        meetings = fetch_todays_meetings()
+        context["meetings"] = format_meetings_for_context(meetings)
+    except Exception as e:
+        print(f"Error fetching meetings: {e}")
+
+    try:
+        tasks = fetch_open_tasks()
+        context["tasks"] = format_tasks_for_context(tasks)
+    except Exception as e:
+        print(f"Error fetching tasks: {e}")
+
+    email_keywords = [
+        "email", "mail", "sent", "inbox", "message", "client",
+        "unread", "from", "urgent", "reply", "respond",
+    ]
+    wants_emails = any(kw in lower for kw in email_keywords)
+
+    general_keywords = ["what", "how", "any", "update", "status", "summary", "briefing", "today"]
+    is_general = any(kw in lower for kw in general_keywords)
+
+    if wants_emails or is_general:
+        try:
+            emails = fetch_unread_client_emails()
+            context["emails"] = format_emails_for_context(emails)
+        except Exception as e:
+            print(f"Error fetching emails: {e}")
+
+    return context
+
+
+# ── Run ──────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=config.PORT)

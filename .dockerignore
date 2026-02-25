@@ -1,0 +1,10 @@
+.env
+token.json
+.git
+.gitignore
+__pycache__
+*.pyc
+.venv
+venv
+*.md
+.cursor
