@@ -2,7 +2,7 @@
 
 A personal AI assistant that lives in Google Chat. Every morning it delivers a briefing of your emails, calendar, and tasks. Throughout the day you can ask it anything about your inbox, schedule, or to-do list — and it can create, update, complete, and delete tasks on your behalf.
 
-Built with FastAPI + Gemini 2.5 Flash, deployed on Google Cloud Run.
+Built with FastAPI + Gemini 2.5 Flash Preview, deployed on Google Cloud Run.
 
 ---
 
@@ -23,52 +23,77 @@ Built with FastAPI + Gemini 2.5 Flash, deployed on Google Cloud Run.
 Google Chat
     │
     ▼ POST /chat (webhook)
-┌──────────────────────────────────────────────┐
-│                FastAPI (main.py)             │
-│                                              │
-│  ┌─────────────────────────────────────────┐ │
-│  │           Event Parser                  │ │
-│  │  handles standard Chat + Workspace      │ │
-│  │  Add-on event formats                   │ │
-│  └──────────────┬──────────────────────────┘ │
-│                 │                             │
-│         ┌───────▼────────┐                   │
-│         │ _build_context │  fetches live data │
-│         └───────┬────────┘  (always: meetings│
-│                 │            + tasks; emails  │
-│    ┌────────────┼────────────┐  if relevant)  │
-│    ▼            ▼            ▼                │
-│  Gmail      Calendar       Tasks              │
-│  Service    Service        Service            │
-│    │            │            │                │
-│    └────────────┴────────────┘                │
-│                 │                             │
-│         ┌───────▼────────┐                   │
-│         │ Gemini Service │  chat_response()   │
-│         │  (2.5 Flash)   │  with conversation │
-│         │                │  history + context │
-│         └───────┬────────┘                   │
-│                 │                             │
-│   ┌─────────────▼──────────────┐             │
-│   │   Task Action Extractor    │             │
-│   │  parses [CREATE_TASK],     │             │
-│   │  [UPDATE_TASK], etc. tags  │             │
-│   │  from Gemini's response    │             │
-│   └─────────────┬──────────────┘             │
-│                 │ executes actions            │
-│         ┌───────▼────────┐                   │
-│         │  Tasks Service │  create/update/   │
-│         │   (write ops)  │  complete/delete  │
-│         └───────┬────────┘                   │
-│                 │                             │
-│         ┌───────▼────────┐                   │
-│         │ Conversation   │  Firestore         │
-│         │ Store          │  (per-user turns)  │
-│         └───────┬────────┘                   │
-└─────────────────┼────────────────────────────┘
-                  │ formatted reply
-                  ▼
-           Google Chat
+┌───────────────────────────────────────────────────────┐
+│                   FastAPI (main.py)                   │
+│                                                       │
+│  ┌──────────────────────────────────────────────────┐ │
+│  │                  Event Parser                    │ │
+│  │      handles standard Chat + Workspace           │ │
+│  │      Add-on event formats                        │ │
+│  └─────────────────────┬────────────────────────────┘ │
+│                        │                              │
+│               ┌────────▼────────┐                     │
+│               │  _build_context │  fetches live data  │
+│               └────────┬────────┘                     │
+│                        │                              │
+│    ┌───────────┬────────┴────────┬──────────────┐     │
+│    ▼           ▼                 ▼              ▼     │
+│  Gmail     Calendar            Tasks         Granola  │
+│  Service   Service             Service        MCP     │
+│  (read)  (today+ended)       (read/write)  (notes,   │
+│    │           │                 │          transcripts│
+│    └───────────┴─────────────────┴──────────────┘     │
+│                        │                              │
+│               ┌────────▼────────┐                     │
+│               │  Gemini Service │  chat_response()    │
+│               │ (2.5 Flash Prev)│  conversation       │
+│               │                 │  history + context  │
+│               └────────┬────────┘                     │
+│                        │                              │
+│      ┌─────────────────▼─────────────────┐           │
+│      │        Task Action Extractor       │           │
+│      │  parses [CREATE_TASK],             │           │
+│      │  [UPDATE_TASK], etc. tags          │           │
+│      └─────────────────┬─────────────────┘           │
+│                        │ executes actions             │
+│               ┌────────▼────────┐                     │
+│               │  Tasks Service  │  create/update/     │
+│               │   (write ops)   │  complete/delete    │
+│               └────────┬────────┘                     │
+│                        │                              │
+│               ┌────────▼────────┐                     │
+│               │  Conversation   │  Firestore           │
+│               │  Store          │  (per-user turns)   │
+│               └────────┬────────┘                     │
+└────────────────────────┼──────────────────────────────┘
+                         │ formatted reply
+                         ▼
+                   Google Chat
+
+
+Cloud Scheduler ──► POST /briefing
+                         │
+                ┌────────┴────────────────┐
+                ▼                         ▼
+           Gmail/Calendar/Tasks       Granola MCP
+           (morning context)       (yesterday's notes)
+                └────────┬────────────────┘
+                         ▼
+                   Gemini (briefing)
+                         ▼
+                   Google Chat
+
+Cloud Scheduler ──► POST /meeting-debrief
+                         │
+                ┌────────┴────────────────┐
+                ▼                         ▼
+        Calendar Service             Granola MCP
+      (recently ended mtgs)        (notes for mtg)
+                └────────┬────────────────┘
+                         ▼
+                  Gemini (debrief)
+                         ▼
+                   Google Chat
 ```
 
 ### Scheduled jobs (Cloud Scheduler)
