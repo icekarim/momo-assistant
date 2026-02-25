@@ -1,0 +1,190 @@
+"""Momo briefing + proactive email alert orchestrator."""
+
+import json
+import google.generativeai as genai
+from gmail_service import (
+    fetch_unread_client_emails,
+    format_emails_for_context,
+    fetch_email_alert_candidates,
+)
+from calendar_service import fetch_todays_meetings, format_meetings_for_context
+from tasks_service import fetch_open_tasks, format_tasks_for_context
+from gemini_service import generate_morning_briefing
+from chat_service import send_chat_message, format_for_google_chat
+from conversation_store import has_email_alert_been_sent, mark_email_alert_sent
+import config
+
+
+def run_morning_briefing():
+    """Full morning briefing pipeline."""
+    print("Momo is preparing the morning briefing...")
+
+    print("  Fetching emails...")
+    emails = fetch_unread_client_emails()
+    print(f"     Found {len(emails)} unread client email(s)")
+
+    print("  Fetching meetings...")
+    meetings = fetch_todays_meetings()
+    print(f"     Found {len(meetings)} meeting(s)")
+
+    print("  Fetching tasks...")
+    tasks = fetch_open_tasks()
+    print(f"     Found {len(tasks)} open task(s)")
+
+    if not emails and not meetings and not tasks:
+        print("  Nothing to report. Skipping.")
+        return {"status": "skipped", "reason": "nothing to report"}
+
+    emails_ctx = format_emails_for_context(emails)
+    meetings_ctx = format_meetings_for_context(meetings)
+    tasks_ctx = format_tasks_for_context(tasks)
+
+    print("  Generating briefing with Gemini...")
+    summary = generate_morning_briefing(emails_ctx, meetings_ctx, tasks_ctx)
+
+    if config.CHAT_SPACE_ID:
+        print("  Sending to Google Chat...")
+        formatted = format_for_google_chat(summary)
+        send_chat_message(config.CHAT_SPACE_ID, formatted)
+    else:
+        print("  No CHAT_SPACE_ID configured. Printing to console:")
+        print(summary)
+
+    print("Momo's morning briefing delivered.")
+    return {
+        "status": "sent",
+        "emails": len(emails),
+        "meetings": len(meetings),
+        "tasks": len(tasks),
+    }
+
+
+def run_proactive_email_alerts():
+    """Notify user when a new client/important email arrives.
+    Uses Gemini to triage emails the same way Momo would in conversation."""
+    if not config.EMAIL_ALERTS_ENABLED:
+        return {"status": "skipped", "reason": "email alerts disabled"}
+    if not config.CHAT_SPACE_ID:
+        return {"status": "skipped", "reason": "CHAT_SPACE_ID not configured"}
+
+    emails = fetch_email_alert_candidates()
+    unseen = [e for e in emails if not has_email_alert_been_sent(e["id"])]
+
+    if not unseen:
+        return {"status": "no_alerts", "alerts_sent": 0, "checked": len(emails)}
+
+    # Batch up to 10 unseen emails for a single Gemini triage call
+    batch = unseen[: config.EMAIL_ALERTS_MAX_PER_RUN * 2]
+    triage_results = _gemini_triage_emails(batch)
+    sent_count = 0
+
+    for result in triage_results:
+        if sent_count >= config.EMAIL_ALERTS_MAX_PER_RUN:
+            break
+
+        email = result["email"]
+        if has_email_alert_been_sent(email["id"]):
+            continue
+
+        message = _format_email_alert_message(
+            email, result["reason"], result["summary"], result["priority"]
+        )
+        formatted = format_for_google_chat(message)
+        send_chat_message(config.CHAT_SPACE_ID, formatted)
+        mark_email_alert_sent(email)
+        sent_count += 1
+
+    return {
+        "status": "sent" if sent_count else "no_alerts",
+        "alerts_sent": sent_count,
+        "checked": len(emails),
+    }
+
+
+_TRIAGE_PROMPT = """You are an email triage assistant. Your job is to decide which emails are important enough to proactively notify someone about.
+
+An email is worth alerting on if it's:
+- From a client, partner, or external stakeholder (not internal newsletters, automated notifications, marketing, or system alerts)
+- Requires action or a timely response
+- Contains urgent or time-sensitive information (deadlines, escalations, blockers)
+- Is from a real person about something that matters (not spam, promotions, or automated digests)
+
+An email is NOT worth alerting on if it's:
+- Automated notifications (JIRA, GitHub, Slack digests, CI/CD, monitoring)
+- Marketing, newsletters, or promotional emails
+- Internal FYI or low-priority updates
+- Calendar invites or routine scheduling
+- Anything the user would not want to be interrupted for
+
+For each email below, respond with a JSON array. Each element should be:
+{"id": "<email_id>", "alert": true/false, "priority": "high"/"medium", "reason": "<1 short phrase>", "summary": "<1-2 sentence summary>"}
+
+Only set "alert": true for emails that genuinely deserve an interruption. Be selective — when in doubt, don't alert.
+
+EMAILS:
+"""
+
+
+def _gemini_triage_emails(emails):
+    """Use Gemini to decide which emails deserve a proactive alert."""
+    genai.configure(api_key=config.GEMINI_API_KEY)
+
+    email_block = ""
+    for i, e in enumerate(emails):
+        body_preview = (e.get("body", "") or "")[:800]
+        email_block += (
+            f"\n--- Email {i+1} (id={e['id']}) ---\n"
+            f"From: {e.get('from', 'Unknown')}\n"
+            f"Subject: {e.get('subject', '(no subject)')}\n"
+            f"Date: {e.get('date_human', '')}\n"
+            f"Labels: {', '.join(e.get('labels', []))}\n"
+            f"Body preview:\n{body_preview}\n"
+        )
+
+    prompt = _TRIAGE_PROMPT + email_block
+
+    model = genai.GenerativeModel(model_name=config.GEMINI_MODEL)
+
+    try:
+        resp = model.generate_content(prompt)
+        text = resp.text.strip()
+        # Strip markdown code fences if present
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+        if text.endswith("```"):
+            text = text[: text.rfind("```")]
+        results = json.loads(text.strip())
+    except Exception as exc:
+        print(f"Gemini triage failed: {exc}")
+        return []
+
+    email_map = {e["id"]: e for e in emails}
+    flagged = []
+    for item in results:
+        if not item.get("alert"):
+            continue
+        email = email_map.get(item.get("id"))
+        if not email:
+            continue
+        flagged.append({
+            "email": email,
+            "reason": item.get("reason", "flagged by momo"),
+            "summary": item.get("summary", ""),
+            "priority": item.get("priority", "medium"),
+        })
+
+    return flagged
+
+
+def _format_email_alert_message(email, reason, summary, priority):
+    priority_icon = "🔴" if priority == "high" else "🟡"
+    lines = [
+        f"{priority_icon} *new email needs your attention*",
+        f"- *From:* {email.get('from', 'Unknown')}",
+        f"- *Subject:* {email.get('subject', '(no subject)')}",
+        f"- *Why:* {reason}",
+    ]
+    if summary:
+        lines.append(f"- *TLDR:* {summary}")
+    lines.append("ask me to `summarize this email` or `draft a reply` if you need more.")
+    return "\n".join(lines)
