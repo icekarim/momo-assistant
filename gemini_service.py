@@ -266,7 +266,8 @@ def chat_response(user_message, conversation_history, context_data):
         "parts": ["got it, i have the date and your current data loaded. what's up?"],
     })
 
-    for turn in conversation_history:
+    recent_history = conversation_history[-20:] if len(conversation_history) > 20 else conversation_history
+    for turn in recent_history:
         role = "model" if turn["role"] == "assistant" else "user"
         history.append({"role": role, "parts": [turn["content"]]})
 
