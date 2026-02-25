@@ -199,13 +199,19 @@ def _gemini_triage_emails(emails):
 
 
 def run_post_meeting_debrief():
-    """Check for recently ended meetings and send short debriefs with Granola notes."""
+    """Check for recently ended meetings and send short debriefs with Granola notes.
+
+    Uses a grace period to wait for Granola to finish processing notes before
+    sending.  If notes still aren't available after the grace window, sends the
+    debrief without them so the user isn't left hanging.
+    """
     if not config.GRANOLA_ENABLED:
         return {"status": "skipped", "reason": "granola disabled"}
     if not config.CHAT_SPACE_ID:
         return {"status": "skipped", "reason": "CHAT_SPACE_ID not configured"}
 
     lookback = config.MEETING_DEBRIEF_LOOKBACK_MINUTES
+    grace = config.MEETING_DEBRIEF_GRACE_MINUTES
     ended = fetch_recently_ended_meetings(lookback_minutes=lookback)
 
     if not ended:
@@ -214,8 +220,10 @@ def run_post_meeting_debrief():
     from granola_service import fetch_meeting_notes_for_context
     from datetime import datetime
 
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    now = datetime.now().astimezone()
+    today_str = now.strftime("%Y-%m-%d")
     sent_count = 0
+    deferred_count = 0
 
     for meeting in ended:
         event_id = meeting.get("id", "")
@@ -225,15 +233,28 @@ def run_post_meeting_debrief():
         title = meeting["title"]
         attendees = [a["name"] for a in meeting.get("attendees", [])]
 
-        print(f"  Generating debrief for: {title}")
+        try:
+            end_dt = datetime.fromisoformat(meeting["end_iso"])
+            minutes_since_end = (now - end_dt).total_seconds() / 60
+        except (ValueError, TypeError):
+            minutes_since_end = grace + 1  # treat parse failures as past grace
+
+        print(f"  Checking debrief for: {title} (ended {minutes_since_end:.0f}m ago)")
+
         try:
             granola_notes = fetch_meeting_notes_for_context(title, today_str)
         except Exception as e:
             print(f"    Granola fetch failed: {e}")
             granola_notes = ""
 
+        if not granola_notes and minutes_since_end < grace:
+            print(f"    Notes not ready yet, will retry (grace window: {grace}m)")
+            deferred_count += 1
+            continue
+
         try:
-            debrief = generate_post_meeting_debrief(title, attendees, granola_notes)
+            end_time = meeting.get("end_time", "")
+            debrief = generate_post_meeting_debrief(title, attendees, granola_notes, end_time)
             formatted = format_for_google_chat(debrief)
             send_chat_message(config.CHAT_SPACE_ID, formatted)
             mark_debrief_sent(event_id, title)
@@ -241,7 +262,11 @@ def run_post_meeting_debrief():
         except Exception as e:
             print(f"    Debrief generation/send failed for '{title}': {e}")
 
-    return {"status": "sent" if sent_count else "no_debriefs", "debriefs_sent": sent_count}
+    return {
+        "status": "sent" if sent_count else ("deferred" if deferred_count else "no_debriefs"),
+        "debriefs_sent": sent_count,
+        "deferred": deferred_count,
+    }
 
 
 def _format_email_alert_message(email, reason, summary, priority):
