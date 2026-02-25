@@ -12,6 +12,7 @@ Endpoints:
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 import traceback
+import threading
 
 import re
 import config
@@ -27,10 +28,27 @@ from calendar_service import (
 )
 from tasks_service import fetch_open_tasks, format_tasks_for_context, create_task, update_task, complete_task, delete_task
 from gemini_service import chat_response
-from chat_service import format_for_google_chat
+from chat_service import format_for_google_chat, send_chat_message
 from conversation_store import get_conversation, add_turn, clear_conversation
 
 app = FastAPI(title="Momo")
+
+
+@app.on_event("startup")
+async def startup_warmup():
+    """Pre-initialize Google credentials and cache discovery docs on startup."""
+    from google_auth import warmup
+    warmup()
+    try:
+        from google_auth import get_credentials
+        from googleapiclient.discovery import build
+        creds = get_credentials()
+        build("gmail", "v1", credentials=creds)
+        build("calendar", "v3", credentials=creds)
+        build("tasks", "v1", credentials=creds)
+        print("Discovery docs cached on startup")
+    except Exception as e:
+        print(f"Discovery cache warmup failed (will retry on first request): {e}")
 
 
 # ── Helpers for Workspace Add-on format ──────────────────────
@@ -199,7 +217,9 @@ async def chat_webhook(request: Request):
 
 
 async def handle_message(ev: dict) -> dict:
-    """Process an incoming chat message."""
+    """Process an incoming chat message.
+    Returns an immediate ack and processes the real response in a background
+    thread, sending it via the Chat API when ready."""
     text = ev["text"]
     user_id = ev["user_id"]
     space = ev["space"]
@@ -227,13 +247,25 @@ async def handle_message(ev: dict) -> dict:
         except Exception as e:
             return _make_response(f"Error generating briefing: {str(e)}", is_addon)
 
-    history = get_conversation(user_id)
+    target_space = space or config.CHAT_SPACE_ID
+    thread = threading.Thread(
+        target=_process_message_background,
+        args=(text, user_id, target_space),
+        daemon=True,
+    )
+    thread.start()
 
+    return _make_response("", is_addon)
+
+
+def _process_message_background(text, user_id, space):
+    """Heavy processing in background thread — no 30s webhook pressure."""
     try:
+        history = get_conversation(user_id)
         context_data = _build_context(text)
         response = chat_response(text, history, context_data)
 
-        task_actions = _extract_all_task_proposals(response)
+        task_actions = _extract_all_task_proposals(response, text)
 
         if not task_actions:
             bulk = _detect_bulk_task_action(text)
@@ -270,14 +302,17 @@ async def handle_message(ev: dict) -> dict:
         add_turn(user_id, "assistant", clean_response)
 
         formatted = format_for_google_chat(full_response)
-        return _make_response(formatted, is_addon)
+        send_chat_message(space, formatted)
 
     except Exception as e:
         traceback.print_exc()
-        return _make_response(f"sorry, something went wrong: {str(e)}", is_addon)
+        try:
+            send_chat_message(space, f"sorry, something went wrong: {str(e)}")
+        except Exception:
+            print(f"Failed to send error message: {e}")
 
 
-def _extract_all_task_proposals(response):
+def _extract_all_task_proposals(response, user_message=""):
     """Extract ALL task action proposals from Gemini's response.
     Returns a list of action dicts. Supports bulk operations."""
     proposals = []
@@ -319,7 +354,27 @@ def _extract_all_task_proposals(response):
     if proposals:
         return proposals
 
-    return _fallback_parse_prose(response)
+    if _user_has_task_intent(user_message):
+        return _fallback_parse_prose(response)
+
+    return None
+
+
+def _user_has_task_intent(user_message):
+    """Only use fallback prose parsing when the user's message clearly
+    indicates they want to create, update, complete, or delete a task."""
+    lower = user_message.lower()
+    task_intent_patterns = [
+        r'\b(?:add|create|make|set up|new)\b.*\btask',
+        r'\btask\b.*\b(?:add|create|make)',
+        r'\b(?:move|push|reschedule|change|update)\b.*\b(?:task|due|deadline)',
+        r'\b(?:complete|finish|done|mark)\b.*\btask',
+        r'\b(?:delete|remove)\b.*\btask',
+        r'\bremind\s+me\b',
+        r'\b(?:add|create)\b.*\bto.do\b',
+        r'\b(?:move|push)\b.*\bto\s+(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)',
+    ]
+    return any(re.search(p, lower) for p in task_intent_patterns)
 
 
 def _fallback_parse_prose(response):
@@ -493,22 +548,33 @@ def _detect_bulk_task_action(user_message):
     return actions if actions else None
 
 
+def _extract_search_terms(user_message):
+    """Extract entity names/keywords for targeted email search."""
+    stopwords = {
+        "what", "whats", "how", "is", "are", "the", "a", "an", "my", "me", "i",
+        "from", "with", "them", "as", "well", "going", "on", "about", "any",
+        "emails", "email", "meetings", "meeting", "tasks", "task", "update",
+        "status", "today", "tell", "show", "do", "does", "did", "can", "could",
+        "would", "should", "will", "in", "to", "for", "of", "and", "or", "but",
+        "not", "also", "please", "hey", "hi", "hello", "momo", "check", "look",
+        "whats", "hows", "anything", "give", "get", "got", "has", "have", "had",
+        "been", "their", "there", "they", "this", "that", "those", "these",
+        "up", "out", "all", "some", "just", "like", "know", "see", "want",
+    }
+    words = re.findall(r'\b[a-zA-Z0-9]+\b', user_message.lower())
+    keywords = [w for w in words if w not in stopwords and len(w) > 1]
+    return " ".join(keywords[:3]) if keywords else None
+
+
 def _build_context(user_message):
-    """Fetch relevant context based on what the user is asking about."""
+    """Fetch relevant context based on what the user is asking about.
+    All API calls run in parallel. Runs in background thread so no webhook
+    timeout pressure."""
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
     lower = user_message.lower()
     context = {}
-
-    try:
-        meetings = fetch_todays_meetings()
-        context["meetings"] = format_meetings_for_context(meetings)
-    except Exception as e:
-        print(f"Error fetching meetings: {e}")
-
-    try:
-        tasks = fetch_open_tasks()
-        context["tasks"] = format_tasks_for_context(tasks)
-    except Exception as e:
-        print(f"Error fetching tasks: {e}")
 
     email_keywords = [
         "email", "mail", "sent", "inbox", "message", "client",
@@ -519,30 +585,63 @@ def _build_context(user_message):
     general_keywords = ["what", "how", "any", "update", "status", "summary", "briefing", "today"]
     is_general = any(kw in lower for kw in general_keywords)
 
+    meeting_keywords = [
+        "meeting notes", "meeting note", "discussed", "action items",
+        "transcript", "granola", "notes from", "what happened in",
+        "debrief", "takeaways", "decisions", "follow up", "follow-up",
+    ]
+    wants_meeting_notes = any(kw in lower for kw in meeting_keywords)
+    wants_granola = config.GRANOLA_ENABLED and (wants_meeting_notes or is_general)
+
+    search_terms = _extract_search_terms(user_message)
+
+    def _fetch_meetings():
+        meetings = fetch_todays_meetings()
+        return "meetings", format_meetings_for_context(meetings)
+
+    def _fetch_tasks():
+        tasks = fetch_open_tasks()
+        return "tasks", format_tasks_for_context(tasks)
+
+    def _fetch_unread_emails():
+        emails = fetch_unread_client_emails(max_results=config.MAX_CHAT_EMAILS)
+        return "emails", format_emails_for_context(emails)
+
+    def _fetch_targeted_emails():
+        targeted = search_emails(search_terms, days_back=90, max_results=10)
+        return "targeted_emails", format_emails_for_context(targeted)
+
+    def _fetch_granola():
+        from granola_service import query_granola
+        return "granola", query_granola(user_message)
+
+    pool = ThreadPoolExecutor(max_workers=6)
+    futures = {}
+    futures["meetings"] = pool.submit(_fetch_meetings)
+    futures["tasks"] = pool.submit(_fetch_tasks)
     if wants_emails or is_general:
+        futures["emails"] = pool.submit(_fetch_unread_emails)
+    if search_terms:
+        futures["targeted_emails"] = pool.submit(_fetch_targeted_emails)
+    if wants_granola:
+        futures["granola"] = pool.submit(_fetch_granola)
+
+    deadline = time.time() + 90
+    for key, future in futures.items():
+        remaining = max(0.1, deadline - time.time())
         try:
-            emails = fetch_unread_client_emails()
-            context["emails"] = format_emails_for_context(emails)
+            ctx_key, value = future.result(timeout=remaining)
+            if value:
+                if ctx_key == "targeted_emails" and "emails" in context:
+                    context["emails"] = context["emails"] + "\n\n--- Targeted search results ---\n\n" + value
+                elif ctx_key == "targeted_emails":
+                    context["emails"] = value
+                else:
+                    context[ctx_key] = value
         except Exception as e:
-            print(f"Error fetching emails: {e}")
+            print(f"Error fetching {key}: {e}")
 
-    if config.GRANOLA_ENABLED:
-        meeting_keywords = [
-            "meeting notes", "meeting note", "discussed", "action items",
-            "transcript", "granola", "notes from", "what happened in",
-            "debrief", "takeaways", "decisions", "follow up", "follow-up",
-        ]
-        wants_meeting_notes = any(kw in lower for kw in meeting_keywords)
-
-        if wants_meeting_notes or is_general:
-            try:
-                from granola_service import query_granola
-                granola_result = query_granola(user_message)
-                if granola_result:
-                    context["granola"] = granola_result
-            except Exception as e:
-                print(f"Error fetching Granola data: {e}")
-
+    pool.shutdown(wait=False)
     return context
 
 
