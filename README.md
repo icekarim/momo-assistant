@@ -2,7 +2,7 @@
 
 A personal AI assistant that lives in Google Chat. Every morning it delivers a briefing of your emails, calendar, and tasks. Throughout the day you can ask it anything about your inbox, schedule, or to-do list — and it can create, update, complete, and delete tasks on your behalf.
 
-Built with FastAPI + Gemini 2.5 Flash Preview, deployed on Google Cloud Run.
+Built with FastAPI + Gemini 3 Flash Preview, deployed on Google Cloud Run.
 
 ---
 
