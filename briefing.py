@@ -201,9 +201,11 @@ def _gemini_triage_emails(emails):
 def run_post_meeting_debrief():
     """Check for recently ended meetings and send short debriefs with Granola notes.
 
-    Uses a grace period to wait for Granola to finish processing notes before
-    sending.  If notes still aren't available after the grace window, sends the
-    debrief without them so the user isn't left hanging.
+    Notes-gated: a debrief is only sent once Granola notes are available.
+    Meetings that run over their scheduled time are handled naturally — the
+    lookback window is wide enough to keep retrying on subsequent scheduler
+    runs until the notes appear.  If notes never materialise within the
+    lookback window the meeting is silently skipped.
     """
     if not config.GRANOLA_ENABLED:
         return {"status": "skipped", "reason": "granola disabled"}
@@ -211,7 +213,6 @@ def run_post_meeting_debrief():
         return {"status": "skipped", "reason": "CHAT_SPACE_ID not configured"}
 
     lookback = config.MEETING_DEBRIEF_LOOKBACK_MINUTES
-    grace = config.MEETING_DEBRIEF_GRACE_MINUTES
     ended = fetch_recently_ended_meetings(lookback_minutes=lookback)
 
     if not ended:
@@ -237,9 +238,9 @@ def run_post_meeting_debrief():
             end_dt = datetime.fromisoformat(meeting["end_iso"])
             minutes_since_end = (now - end_dt).total_seconds() / 60
         except (ValueError, TypeError):
-            minutes_since_end = grace + 1  # treat parse failures as past grace
+            minutes_since_end = 0
 
-        print(f"  Checking debrief for: {title} (ended {minutes_since_end:.0f}m ago)")
+        print(f"  Checking debrief for: {title} (scheduled end was {minutes_since_end:.0f}m ago)")
 
         try:
             granola_notes = fetch_meeting_notes_for_context(title, today_str)
@@ -247,8 +248,8 @@ def run_post_meeting_debrief():
             print(f"    Granola fetch failed: {e}")
             granola_notes = ""
 
-        if not granola_notes and minutes_since_end < grace:
-            print(f"    Notes not ready yet, will retry (grace window: {grace}m)")
+        if not granola_notes:
+            print(f"    Notes not available yet, deferring to next run")
             deferred_count += 1
             continue
 
@@ -259,6 +260,7 @@ def run_post_meeting_debrief():
             send_chat_message(config.CHAT_SPACE_ID, formatted)
             mark_debrief_sent(event_id, title)
             sent_count += 1
+            print(f"    Debrief sent for: {title}")
         except Exception as e:
             print(f"    Debrief generation/send failed for '{title}': {e}")
 
