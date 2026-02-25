@@ -277,29 +277,27 @@ def chat_response(user_message, conversation_history, context_data):
     return resp.text
 
 
-def generate_post_meeting_debrief(meeting_title, attendees, granola_notes):
+def generate_post_meeting_debrief(meeting_title, attendees, granola_notes, end_time=""):
     """Generate a short post-meeting debrief (summary + action items)."""
-    from datetime import datetime
-
-    now = datetime.now().strftime("%I:%M %p")
-
     attendee_str = ", ".join(attendees) if attendees else "unknown attendees"
+
+    notes_section = granola_notes if granola_notes else "No notes were captured for this meeting."
 
     prompt = f"""You just got out of a meeting. Write a very short post-meeting debrief.
 
 Meeting: {meeting_title}
 Attendees: {attendee_str}
-Time: ended at {now}
+Time: ended at {end_time or "recently"}
 
 === MEETING NOTES (from Granola) ===
-{granola_notes if granola_notes else "No notes available yet."}
+{notes_section}
 
 Format:
 🗒️ *meeting debrief — {meeting_title}*
 
-- 2-3 sentence summary of what was discussed
+- 2-3 sentence summary of what was discussed (from the notes)
 - action items as a bullet list with owner if known (use 🔴 for urgent, 🟡 for normal)
-- if no notes are available, just say the meeting ended and notes aren't ready yet
+- if no notes were captured, just mention the meeting ended and who attended — skip the summary and action items
 
 Keep it tight — this goes to Google Chat right after the meeting. No fluff."""
 
