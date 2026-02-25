@@ -258,8 +258,8 @@ async def _call_tool(tool_name: str, arguments: dict | None = None):
             return result
 
 
-def _run(coro):
-    """Run an async coroutine from sync code."""
+def _run(coro, timeout=50):
+    """Run an async coroutine from sync code with a timeout."""
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -269,7 +269,7 @@ def _run(coro):
         import concurrent.futures
 
         with concurrent.futures.ThreadPoolExecutor() as pool:
-            return pool.submit(asyncio.run, coro).result()
+            return pool.submit(asyncio.run, coro).result(timeout=timeout)
     return asyncio.run(coro)
 
 

@@ -5,13 +5,14 @@ load_dotenv()
 
 # ── Gemini ───────────────────────────────────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3-flash-preview"
 
 # ── Gmail ────────────────────────────────────────────────────
 GMAIL_QUERY = "is:unread in:inbox"
 BRIEFING_LOOKBACK_HOURS = 24
 SEARCH_LOOKBACK_DAYS = 90
 MAX_EMAILS = 50
+MAX_CHAT_EMAILS = 15
 EMAIL_ALERTS_ENABLED = os.getenv("EMAIL_ALERTS_ENABLED", "true").lower() == "true"
 EMAIL_ALERT_GMAIL_QUERY = os.getenv(
     "EMAIL_ALERT_GMAIL_QUERY",
