@@ -63,7 +63,8 @@ MAX_CONVERSATION_TURNS = 50
 GRANOLA_ENABLED = os.getenv("GRANOLA_ENABLED", "false").lower() == "true"
 GRANOLA_MCP_URL = os.getenv("GRANOLA_MCP_URL", "https://mcp.granola.ai/mcp")
 GRANOLA_TOKEN = os.getenv("GRANOLA_TOKEN", "")
-MEETING_DEBRIEF_LOOKBACK_MINUTES = int(os.getenv("MEETING_DEBRIEF_LOOKBACK_MINUTES", "15"))
+MEETING_DEBRIEF_LOOKBACK_MINUTES = int(os.getenv("MEETING_DEBRIEF_LOOKBACK_MINUTES", "60"))
+MEETING_DEBRIEF_GRACE_MINUTES = int(os.getenv("MEETING_DEBRIEF_GRACE_MINUTES", "45"))
 
 # ── Server ───────────────────────────────────────────────────
 PORT = int(os.getenv("PORT", "8080"))
