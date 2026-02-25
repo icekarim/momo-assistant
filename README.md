@@ -1,19 +1,50 @@
 # Momo
 
-A personal AI assistant that lives in Google Chat. Every morning it delivers a briefing of your emails, calendar, and tasks. Throughout the day you can ask it anything about your inbox, schedule, or to-do list — and it can create, update, complete, and delete tasks on your behalf.
+Momo is a personal AI chief of staff that lives in Google Chat. It knows your inbox, your calendar, your tasks, and your meeting history — and it keeps you on top of all of it without you having to ask.
 
-Built with FastAPI + Gemini 3 Flash Preview, deployed on Google Cloud Run.
+Every morning it drops a briefing in Chat: what needs your attention in your inbox, what's on your calendar, what's open in your task list, and what came out of yesterday's meetings. Throughout the day you can message it like a colleague — ask questions, get summaries, delegate tasks, or dig into what was decided in a meeting last week.
+
+Built with **FastAPI** + **Gemini 3 Flash Preview**, deployed on **Google Cloud Run**.
 
 ---
 
 ## What it does
 
-- **Daily briefing** — at 8 AM, Momo pushes a formatted summary of your unread emails, today's meetings, open tasks, and yesterday's meeting notes (via Granola) directly into your Google Chat space
-- **Proactive email alerts** — runs on a 5-minute interval, uses Gemini to triage your inbox and pings you in Chat if something genuinely needs your attention (clients, deadlines, escalations)
-- **Post-meeting debriefs** — runs every ~10 minutes during work hours; when a calendar meeting ends, Momo pulls the Granola notes and sends a short debrief with key decisions and action items
-- **Conversational assistant** — ask anything: *"what's on my calendar today?"*, *"any urgent emails?"*, *"what did we decide in the standup?"*, *"push all my tasks to Friday"*
-- **Task management** — full CRUD over Google Tasks via natural language; Momo emits structured action tags in its response that the backend executes automatically
-- **Meeting notes** — ask about past meetings, decisions, action items, or transcripts; Momo queries Granola in real time to answer
+### Morning briefing
+At 8 AM, Momo sends a structured daily briefing covering:
+- **Inbox** — prioritized summary of unread emails with triage (🔴 urgent / 🟡 needs attention / 🟢 FYI)
+- **Calendar** — today's meetings and schedule
+- **Tasks** — all open items from Google Tasks
+- **Yesterday's meetings** — key decisions, action items, and follow-ups pulled from Granola notes
+
+### Proactive email alerts
+Runs every 5 minutes. Momo triages your inbox with Gemini and pings you in Chat the moment something genuinely needs your attention — client emails, escalations, deadlines, blockers. Each alert fires once and is never duplicated.
+
+### Post-meeting debriefs
+Within minutes of a calendar meeting ending, Momo pulls the Granola notes for that meeting and sends a short debrief to Chat: what was decided, what action items came out, and who owns them. No manual note-taking required.
+
+### Conversational assistant
+Ask Momo anything about your work context in plain language:
+- *"what's on my calendar today?"*
+- *"any urgent emails from clients?"*
+- *"what did we decide in the product standup?"*
+- *"pull up the action items from yesterday's investor call"*
+- *"push all my tasks to Friday"*
+- *"draft a reply to [person] about [topic]"*
+
+Momo fetches live data (emails, calendar, tasks, meeting notes) on every message and answers with full context.
+
+### Task management
+Full CRUD over Google Tasks via natural language. Momo emits structured action tags in its response (`[CREATE_TASK]`, `[UPDATE_TASK]`, `[COMPLETE_TASK]`, `[DELETE_TASK]`) that the backend parses and executes automatically — no confirmation dialogs, just done.
+
+### Meeting intelligence (via Granola)
+Momo is connected to [Granola](https://granola.ai) via MCP and can answer questions about any recorded meeting:
+- *"what were the action items from Monday's sync?"*
+- *"who was in the Q1 planning meeting?"*
+- *"pull the full transcript from yesterday's call"*
+- *"what decisions have we made about [topic] this month?"*
+
+The Granola token is managed automatically — it's stored in Firestore and refreshed in the background. You authenticate once with `python granola_auth_setup.py` and never think about it again.
 
 ---
 
