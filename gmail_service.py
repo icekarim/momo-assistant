@@ -11,24 +11,24 @@ def get_gmail_service():
     return build("gmail", "v1", credentials=creds)
 
 
-def fetch_unread_client_emails(lookback_hours=None):
+def fetch_unread_client_emails(lookback_hours=None, max_results=None):
     """Fetch unread client emails using the configured Gmail filter."""
     hours = lookback_hours or config.BRIEFING_LOOKBACK_HOURS
     after = datetime.now(timezone.utc) - timedelta(hours=hours)
     after_str = after.strftime("%Y/%m/%d")
 
     query = f"{config.GMAIL_QUERY} after:{after_str}"
-    return _search_emails(query, config.MAX_EMAILS)
+    return _search_emails(query, max_results or config.MAX_EMAILS)
 
 
-def search_emails(search_query, days_back=None):
+def search_emails(search_query, days_back=None, max_results=None):
     """Search emails with a custom query for conversational lookups."""
     days = days_back or config.SEARCH_LOOKBACK_DAYS
     after = datetime.now(timezone.utc) - timedelta(days=days)
     after_str = after.strftime("%Y/%m/%d")
 
     query = f"{search_query} after:{after_str}"
-    return _search_emails(query, config.MAX_EMAILS)
+    return _search_emails(query, max_results or config.MAX_EMAILS)
 
 
 def fetch_email_alert_candidates():
@@ -74,8 +74,7 @@ def _parse_message(msg):
 
     body = _extract_body(msg["payload"])
 
-    # Truncate long bodies
-    max_len = 5000
+    max_len = 1500
     if len(body) > max_len:
         body = body[:max_len] + "\n[... truncated]"
 
