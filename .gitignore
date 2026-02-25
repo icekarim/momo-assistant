@@ -1,5 +1,6 @@
 .env
 token.json
+granola_token.json
 client_secret.json
 __pycache__/
 *.pyc

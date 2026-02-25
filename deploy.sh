@@ -18,8 +18,9 @@ echo "Deploying Momo to Cloud Run..."
 # Ensure we're using the right project
 gcloud config set project $PROJECT_ID
 
-# Read token.json into a variable for passing as env var
+# Read token files into variables for passing as env vars
 GOOGLE_TOKEN_JSON=$(cat token.json)
+GRANOLA_TOKEN_JSON=$(cat granola_token.json 2>/dev/null || echo "")
 
 # Build and deploy in one step
 gcloud run deploy $SERVICE_NAME \
@@ -27,8 +28,8 @@ gcloud run deploy $SERVICE_NAME \
   --region $REGION \
   --platform managed \
   --allow-unauthenticated \
-  --set-env-vars="GEMINI_API_KEY=${GEMINI_API_KEY},GCP_PROJECT_ID=$PROJECT_ID,CHAT_SPACE_ID=${CHAT_SPACE_ID}" \
-  --set-env-vars="^##^GOOGLE_TOKEN_JSON=${GOOGLE_TOKEN_JSON}" \
+  --set-env-vars="GEMINI_API_KEY=${GEMINI_API_KEY},GCP_PROJECT_ID=$PROJECT_ID,CHAT_SPACE_ID=${CHAT_SPACE_ID},GRANOLA_ENABLED=true" \
+  --set-env-vars="^##^GOOGLE_TOKEN_JSON=${GOOGLE_TOKEN_JSON}##GRANOLA_TOKEN_JSON=${GRANOLA_TOKEN_JSON}" \
   --memory=1Gi \
   --timeout=120 \
   --min-instances=0 \
@@ -45,3 +46,4 @@ echo "Next steps:"
 echo "  1. Set Google Chat App HTTP endpoint to: ${URL}/chat"
 echo "  2. Cloud Scheduler job should point to: ${URL}/briefing"
 echo "  3. Create another Cloud Scheduler job to call: ${URL}/email-alerts (e.g. every 5 minutes)"
+echo "  4. Create Cloud Scheduler job for: ${URL}/meeting-debrief (e.g. */10 9-18 * * 1-5)"

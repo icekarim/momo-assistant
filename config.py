@@ -55,7 +55,14 @@ GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "")
 FIRESTORE_DATABASE = os.getenv("FIRESTORE_DATABASE", "testing")
 FIRESTORE_COLLECTION = "conversations"
 FIRESTORE_EMAIL_ALERTS_COLLECTION = "email_alerts"
+FIRESTORE_MEETING_DEBRIEFS_COLLECTION = "meeting_debriefs"
 MAX_CONVERSATION_TURNS = 50
+
+# ── Granola MCP ──────────────────────────────────────────────
+GRANOLA_ENABLED = os.getenv("GRANOLA_ENABLED", "false").lower() == "true"
+GRANOLA_MCP_URL = os.getenv("GRANOLA_MCP_URL", "https://mcp.granola.ai/mcp")
+GRANOLA_TOKEN = os.getenv("GRANOLA_TOKEN", "")
+MEETING_DEBRIEF_LOOKBACK_MINUTES = int(os.getenv("MEETING_DEBRIEF_LOOKBACK_MINUTES", "15"))
 
 # ── Server ───────────────────────────────────────────────────
 PORT = int(os.getenv("PORT", "8080"))

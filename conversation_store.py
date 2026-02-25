@@ -80,3 +80,22 @@ def mark_email_alert_sent(email):
             "sent_at": datetime.now(timezone.utc).isoformat(),
         }
     )
+
+
+def has_debrief_been_sent(calendar_event_id):
+    """Return True if a post-meeting debrief was already sent for this event."""
+    db = get_db()
+    doc = db.collection(config.FIRESTORE_MEETING_DEBRIEFS_COLLECTION).document(calendar_event_id).get()
+    return doc.exists
+
+
+def mark_debrief_sent(calendar_event_id, meeting_title):
+    """Record that a debrief was sent so we don't send it again."""
+    db = get_db()
+    db.collection(config.FIRESTORE_MEETING_DEBRIEFS_COLLECTION).document(calendar_event_id).set(
+        {
+            "event_id": calendar_event_id,
+            "title": meeting_title,
+            "sent_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )

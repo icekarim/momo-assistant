@@ -8,10 +8,12 @@ Built with FastAPI + Gemini 2.5 Flash, deployed on Google Cloud Run.
 
 ## What it does
 
-- **Daily briefing** — at 8 AM, Momo pushes a formatted summary of your unread emails, today's meetings, and open tasks directly into your Google Chat space
+- **Daily briefing** — at 8 AM, Momo pushes a formatted summary of your unread emails, today's meetings, open tasks, and yesterday's meeting notes (via Granola) directly into your Google Chat space
 - **Proactive email alerts** — runs on a 5-minute interval, uses Gemini to triage your inbox and pings you in Chat if something genuinely needs your attention (clients, deadlines, escalations)
-- **Conversational assistant** — ask anything: *"what's on my calendar today?"*, *"any urgent emails?"*, *"draft a reply to [person]"*, *"push all my tasks to Friday"*
+- **Post-meeting debriefs** — runs every ~10 minutes during work hours; when a calendar meeting ends, Momo pulls the Granola notes and sends a short debrief with key decisions and action items
+- **Conversational assistant** — ask anything: *"what's on my calendar today?"*, *"any urgent emails?"*, *"what did we decide in the standup?"*, *"push all my tasks to Friday"*
 - **Task management** — full CRUD over Google Tasks via natural language; Momo emits structured action tags in its response that the backend executes automatically
+- **Meeting notes** — ask about past meetings, decisions, action items, or transcripts; Momo queries Granola in real time to answer
 
 ---
 
@@ -72,8 +74,9 @@ Google Chat
 ### Scheduled jobs (Cloud Scheduler)
 
 ```
-Cloud Scheduler ──► POST /briefing      (daily at 8 AM)
-Cloud Scheduler ──► POST /email-alerts  (every 5 minutes)
+Cloud Scheduler ──► POST /briefing        (daily at 8 AM)
+Cloud Scheduler ──► POST /email-alerts    (every 5 minutes)
+Cloud Scheduler ──► POST /meeting-debrief (every 10 minutes, work hours)
 ```
 
 **`/briefing`** — orchestrated by `briefing.py`:
@@ -87,6 +90,12 @@ Cloud Scheduler ──► POST /email-alerts  (every 5 minutes)
 3. Batches up to 10 unseen emails → Gemini triage (returns JSON with `alert: true/false`, `priority`, `summary`)
 4. Posts alerts to Chat for emails that pass triage; marks each as sent in Firestore to prevent duplicates
 
+**`/meeting-debrief`** — also in `briefing.py`:
+1. Fetches today's calendar meetings whose end time falls within the last N minutes (default 15)
+2. Skips any already debriefed (checked against Firestore `meeting_debriefs` collection)
+3. For each new ending meeting, fetches Granola notes matching the meeting title
+4. Sends a short debrief to Chat with key decisions and action items; marks meeting as debriefed in Firestore
+
 ---
 
 ## File structure
@@ -94,13 +103,15 @@ Cloud Scheduler ──► POST /email-alerts  (every 5 minutes)
 ```
 momo/
 ├── main.py               # FastAPI app, endpoints, message handling, task action execution
-├── gemini_service.py     # Gemini API wrapper; system prompt; chat_response(); generate_morning_briefing()
-├── briefing.py           # Morning briefing + proactive email alert pipelines
+├── gemini_service.py     # Gemini API wrapper; system prompt; chat_response(); briefing/debrief generators
+├── briefing.py           # Morning briefing, proactive email alerts, post-meeting debrief pipelines
 ├── gmail_service.py      # Gmail API: fetch unread emails, search, format for context
-├── calendar_service.py   # Google Calendar API: fetch today's events, format for context
+├── calendar_service.py   # Google Calendar API: fetch today's events, recently ended meetings
 ├── tasks_service.py      # Google Tasks API: fetch, create, update, complete, delete tasks
 ├── chat_service.py       # Google Chat API: send_chat_message(), format_for_google_chat()
-├── conversation_store.py # Firestore-backed per-user conversation history + email alert dedup
+├── conversation_store.py # Firestore-backed conversation history, email alert + debrief dedup
+├── granola_service.py    # Granola MCP client: fetch meeting notes, transcripts, auto token refresh
+├── granola_auth_setup.py # One-time local OAuth flow to authenticate with Granola (saves token)
 ├── google_auth.py        # OAuth credential loading (file for local dev, env var for Cloud Run)
 ├── auth_setup.py         # One-time local script to generate token.json via browser OAuth flow
 ├── config.py             # All config loaded from environment variables
@@ -172,9 +183,10 @@ format_for_google_chat() → send reply
 | Google Calendar API | Read today's events | `calendar.readonly` |
 | Google Tasks API | Read + write tasks | `tasks` |
 | Google Chat API | Receive webhooks, send messages | N/A (bot config) |
-| Cloud Firestore | Conversation history, email alert deduplication | via ADC / service account |
+| Cloud Firestore | Conversation history, email alert + debrief deduplication, Granola token storage | via ADC / service account |
 | Cloud Run | Hosts the FastAPI server | N/A |
-| Cloud Scheduler | Triggers `/briefing` and `/email-alerts` | N/A |
+| Cloud Scheduler | Triggers `/briefing`, `/email-alerts`, and `/meeting-debrief` | N/A |
+| Granola MCP | Fetch meeting notes, transcripts, action items | OAuth 2.0 (PKCE) |
 
 ---
 
@@ -247,7 +259,27 @@ CLIENT_EMAIL_KEYWORDS=client,customer
 CLIENT_DOMAINS=                          # e.g. acme.com,clientco.io
 ```
 
-### 5. Run locally
+### 5. Granola integration (optional)
+
+Momo can pull meeting notes, decisions, and action items from [Granola](https://granola.ai).
+
+**Authenticate once:**
+
+```bash
+python granola_auth_setup.py
+```
+
+This opens a browser OAuth flow, saves the token to `granola_token.json` (gitignored), and syncs it to Firestore so Cloud Run can use it automatically. The token auto-refreshes — you only need to run this once.
+
+**Enable it in `.env`:**
+
+```env
+GRANOLA_ENABLED=true
+```
+
+If Granola is disabled, all meeting-note features are silently skipped.
+
+### 6. Run locally
 
 ```bash
 uvicorn main:app --host 0.0.0.0 --port 8080 --reload
@@ -274,9 +306,10 @@ The script passes `GOOGLE_TOKEN_JSON` (the contents of `token.json`) as an envir
 After deploying:
 1. Copy the Cloud Run URL
 2. Set it as the HTTP endpoint in your Google Chat App config: `https://<url>/chat`
-3. Create two Cloud Scheduler jobs:
+3. Create Cloud Scheduler jobs:
    - `POST https://<url>/briefing` — daily at 8 AM (or your preferred time)
    - `POST https://<url>/email-alerts` — every 5 minutes
+   - `POST https://<url>/meeting-debrief` — every 10 minutes during work hours (optional, requires Granola)
 
 ---
 
@@ -286,6 +319,8 @@ After deploying:
 |---|---|---|
 | `conversations` | sanitized user ID | Stores up to 50 conversation turns per user |
 | `email_alerts` | Gmail message ID | Tracks which emails have already triggered an alert |
+| `meeting_debriefs` | Google Calendar event ID | Tracks which meetings have already been debriefed |
+| `granola_auth` | `token` | Stores the Granola OAuth token for Cloud Run (auto-refreshed) |
 
 ---
 
@@ -305,4 +340,8 @@ After deploying:
 | `IMPORTANT_EMAIL_KEYWORDS` | No | `urgent,asap,...` | Keywords that flag an email as important |
 | `CLIENT_EMAIL_KEYWORDS` | No | `client,customer` | Keywords that identify client emails |
 | `CLIENT_DOMAINS` | No | — | Comma-separated domains to treat as clients |
+| `GRANOLA_ENABLED` | No | `false` | Enable Granola meeting notes integration |
+| `GRANOLA_MCP_URL` | No | `https://mcp.granola.ai/mcp` | Granola MCP server URL |
+| `GRANOLA_TOKEN_JSON` | Cloud Run | — | Full Granola token JSON as a string (seeds Firestore on first boot) |
+| `MEETING_DEBRIEF_LOOKBACK_MINUTES` | No | `15` | How far back to look for recently ended meetings |
 | `PORT` | No | `8080` | Server port |

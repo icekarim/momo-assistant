@@ -94,6 +94,25 @@ def _fetch_events(time_min, time_max):
     return events
 
 
+def fetch_recently_ended_meetings(lookback_minutes=15):
+    """Return today's meetings whose end time falls within the last N minutes."""
+    now = datetime.now().astimezone()
+    cutoff = now - timedelta(minutes=lookback_minutes)
+    today_meetings = fetch_todays_meetings()
+
+    ended = []
+    for m in today_meetings:
+        if m["is_all_day"]:
+            continue
+        try:
+            end_dt = datetime.fromisoformat(m["end_iso"])
+            if cutoff <= end_dt <= now:
+                ended.append(m)
+        except (ValueError, TypeError):
+            continue
+    return ended
+
+
 def format_meetings_for_context(meetings):
     """Format meetings into a text block for Gemini."""
     if not meetings:
