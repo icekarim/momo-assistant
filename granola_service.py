@@ -93,6 +93,10 @@ def _load_token() -> str | None:
             _cached_token = json.load(f)
         _token_loaded_at = time.time()
 
+        if "_expires_at" not in _cached_token:
+            file_mtime = os.path.getmtime(_TOKEN_FILE)
+            _cached_token["_expires_at"] = file_mtime + _cached_token.get("expires_in", 21600)
+
         if _is_expired():
             _refresh()
         return _cached_token.get("access_token") if _cached_token else None
@@ -133,9 +137,10 @@ def _load_token() -> str | None:
 def _is_expired() -> bool:
     if not _cached_token:
         return True
-    expires_in = _cached_token.get("expires_in", 21600)
-    elapsed = time.time() - _token_loaded_at
-    return elapsed >= (expires_in - 300)  # refresh 5 min early
+    expires_at = _cached_token.get("_expires_at")
+    if expires_at:
+        return time.time() >= (expires_at - 300)
+    return True
 
 
 def _refresh():
@@ -174,6 +179,7 @@ def _refresh():
         new_tokens.setdefault("refresh_token", refresh_token)
         new_tokens["_token_endpoint"] = token_endpoint
         new_tokens["_client_id"] = client_id
+        new_tokens["_expires_at"] = time.time() + new_tokens.get("expires_in", 21600)
 
         _cached_token = new_tokens
         _token_loaded_at = time.time()
@@ -289,18 +295,17 @@ def _extract_text(result) -> str:
 # ── Public helpers ───────────────────────────────────────────
 
 
-def list_granola_meetings(start_date: str, end_date: str) -> str:
-    """List meetings in a date range (YYYY-MM-DD)."""
+def list_granola_meetings(time_range: str = "last_30_days") -> str:
+    """List meetings in a time range (this_week, last_week, last_30_days)."""
     result = _run(_call_tool("list_meetings", {
-        "start_date": start_date,
-        "end_date": end_date,
+        "time_range": time_range,
     }))
     return _extract_text(result)
 
 
 def get_granola_meeting_notes(query: str) -> str:
     """Search meeting content (notes, action items, attendees)."""
-    result = _run(_call_tool("get_meetings", {"query": query}))
+    result = _run(_call_tool("query_granola_meetings", {"query": query}))
     return _extract_text(result)
 
 
@@ -332,16 +337,17 @@ def fetch_yesterday_meeting_notes() -> str:
 
 
 def fetch_meeting_notes_for_context(meeting_title: str, meeting_date: str | None = None) -> str:
-    """Find Granola notes matching a specific calendar event."""
+    """Find Granola notes matching a specific calendar event.
+
+    Returns the notes text (possibly empty if none found).
+    Raises on transport / auth errors so callers can distinguish
+    "no notes yet" from "Granola is unreachable."
+    """
     query = meeting_title
     if meeting_date:
         query = f"{meeting_title} on {meeting_date}"
-    try:
-        notes = get_granola_meeting_notes(query)
-        return notes if notes else ""
-    except Exception as exc:
-        print(f"Granola: error fetching notes for '{meeting_title}': {exc}")
-        return ""
+    notes = get_granola_meeting_notes(query)
+    return notes if notes else ""
 
 
 def format_granola_notes_for_context(notes: str) -> str:
