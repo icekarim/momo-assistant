@@ -308,7 +308,7 @@ def format_knowledge_for_context(entries: list[dict]) -> str:
     if not entries:
         return ""
 
-    entries = entries[:50]
+    entries = entries[:15]
     lines = []
     for e in entries:
         owner = f" (owner: {e['owner']})" if e.get("owner") else ""
@@ -360,24 +360,24 @@ def query_knowledge_graph(user_message: str) -> str:
     wants_decisions = any(kw in lower for kw in decision_keywords)
 
     if wants_commitments:
-        results.extend(query_open_commitments())
+        results.extend(query_open_commitments(limit=10))
     if wants_blockers:
-        results.extend(query_by_type("blocker"))
+        results.extend(query_by_type("blocker", limit=10))
     if wants_decisions:
-        results.extend(query_by_type("decision"))
+        results.extend(query_by_type("decision", limit=10))
 
     if person_name:
-        results.extend(query_by_person(person_name))
+        results.extend(query_by_person(person_name, limit=10))
     if project_name:
-        results.extend(query_by_project(project_name))
+        results.extend(query_by_project(project_name, limit=10))
 
     if not results:
         search_terms = _extract_knowledge_search_terms(user_message)
         if search_terms:
-            results = search_knowledge(search_terms)
+            results = search_knowledge(search_terms, limit=10)
 
     if not results:
-        results = query_recent(days=14, limit=30)
+        return ""
 
     seen_ids = set()
     unique = []
