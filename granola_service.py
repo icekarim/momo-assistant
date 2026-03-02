@@ -358,17 +358,44 @@ def fetch_yesterday_meeting_notes() -> str:
         return ""
 
 
+def _find_meeting_id(meeting_title: str) -> str | None:
+    """Match a calendar event title to a Granola meeting ID via list_meetings.
+
+    Uses case-insensitive substring matching — Granola titles sometimes have
+    extra whitespace or slight variations from the calendar title.
+    """
+    import re
+    xml = list_granola_meetings("this_week")
+    if not xml:
+        return None
+
+    title_lower = meeting_title.strip().lower()
+    for match in re.finditer(r'<meeting\s+id="([^"]+)"\s+title="([^"]+)"', xml):
+        granola_title = match.group(2).strip().lower()
+        if title_lower in granola_title or granola_title in title_lower:
+            return match.group(1)
+    return None
+
+
 def fetch_meeting_notes_for_context(meeting_title: str, meeting_date: str | None = None) -> str:
     """Find Granola notes matching a specific calendar event.
 
-    Returns the notes text (possibly empty if none found).
+    Two-step lookup: list_meetings to find the meeting ID by title, then
+    get_meetings to fetch the actual notes by ID.  This avoids the
+    query_granola_meetings tool which returns conversational answers
+    (including notes from unrelated meetings) rather than exact matches.
+
+    Returns the notes text (empty string if no matching meeting found).
     Raises on transport / auth errors so callers can distinguish
     "no notes yet" from "Granola is unreachable."
     """
-    query = meeting_title
-    if meeting_date:
-        query = f"{meeting_title} on {meeting_date}"
-    notes = get_granola_meeting_notes(query)
+    meeting_id = _find_meeting_id(meeting_title)
+    if not meeting_id:
+        print(f"    Granola: no meeting ID found for '{meeting_title}'")
+        return ""
+
+    result = _run(_call_tool("get_meetings", {"meeting_ids": [meeting_id]}))
+    notes = _extract_text(result)
     return notes if notes else ""
 
 
