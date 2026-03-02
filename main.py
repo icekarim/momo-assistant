@@ -2,11 +2,12 @@
 Momo — FastAPI Application
 
 Endpoints:
-  POST /chat            — Google Chat webhook (receives user messages)
-  POST /briefing        — Trigger morning briefing (called by Cloud Scheduler)
-  POST /email-alerts    — Trigger proactive important email checks
-  POST /meeting-debrief — Post-meeting debrief with Granola notes (Cloud Scheduler)
-  GET  /health          — Health check
+  POST /chat               — Google Chat webhook (receives user messages)
+  POST /briefing           — Trigger morning briefing (called by Cloud Scheduler)
+  POST /email-alerts       — Trigger proactive important email checks
+  POST /meeting-debrief    — Post-meeting debrief with Granola notes (Cloud Scheduler)
+  POST /knowledge-backfill — Backfill knowledge graph from recent meetings/emails
+  GET  /health             — Health check
 """
 
 from fastapi import FastAPI, Request, HTTPException
@@ -172,6 +173,90 @@ async def trigger_meeting_debrief():
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Knowledge Graph Backfill ─────────────────────────────────
+
+@app.post("/knowledge-backfill")
+async def trigger_knowledge_backfill():
+    """Reprocess recent meetings and emails into the knowledge graph.
+    Useful for bootstrapping the graph with existing data."""
+    import time as _time
+
+    if not config.KNOWLEDGE_GRAPH_ENABLED:
+        return {"status": "skipped", "reason": "knowledge graph disabled"}
+
+    from knowledge_graph import extract_and_store
+
+    results = {"meetings_processed": 0, "meetings_failed": 0,
+               "emails_processed": 0, "emails_failed": 0}
+
+    if config.GRANOLA_ENABLED:
+        try:
+            from granola_service import list_granola_meetings, fetch_meeting_notes_batch
+            import re as _re
+
+            xml = list_granola_meetings("last_30_days")
+            if xml:
+                meetings = []
+                for match in _re.finditer(r'<meeting\s+id="([^"]+)"\s+title="([^"]+)"', xml):
+                    meetings.append({"id": match.group(1), "title": match.group(2)})
+
+                batch_size = 10
+                for i in range(0, len(meetings), batch_size):
+                    batch = meetings[i:i + batch_size]
+                    ids = [m["id"] for m in batch]
+                    try:
+                        notes_by_id = fetch_meeting_notes_batch(ids)
+                    except Exception as e:
+                        print(f"  Backfill: batch fetch failed: {e}")
+                        results["meetings_failed"] += len(batch)
+                        continue
+
+                    for m in batch:
+                        notes = notes_by_id.get(m["id"], "")
+                        if not notes:
+                            continue
+                        try:
+                            extract_and_store(
+                                source_type="meeting",
+                                source_id=m["id"],
+                                source_title=m["title"],
+                                source_date="",
+                                content=notes,
+                                attendees=[],
+                            )
+                            results["meetings_processed"] += 1
+                        except Exception as e:
+                            print(f"  Backfill: extraction failed for '{m['title']}': {e}")
+                            results["meetings_failed"] += 1
+                        _time.sleep(0.5)
+        except Exception as e:
+            print(f"  Backfill: Granola processing failed: {e}")
+
+    try:
+        from gmail_service import fetch_unread_client_emails
+        emails = fetch_unread_client_emails(max_results=50)
+        for email in emails:
+            try:
+                extract_and_store(
+                    source_type="email",
+                    source_id=email["id"],
+                    source_title=email.get("subject", ""),
+                    source_date=email.get("date_human", ""),
+                    content=email.get("body", ""),
+                    attendees=[email.get("from", "")],
+                )
+                results["emails_processed"] += 1
+            except Exception as e:
+                print(f"  Backfill: email extraction failed: {e}")
+                results["emails_failed"] += 1
+            _time.sleep(0.5)
+    except Exception as e:
+        print(f"  Backfill: email processing failed: {e}")
+
+    results["status"] = "completed"
+    return results
 
 
 # ── Google Chat Webhook ──────────────────────────────────────
@@ -615,7 +700,19 @@ def _build_context(user_message):
         from granola_service import query_granola
         return "granola", query_granola(user_message)
 
-    pool = ThreadPoolExecutor(max_workers=6)
+    knowledge_keywords = [
+        "history", "discussed", "decided", "committed", "promised",
+        "blocker", "last time", "changed since", "full story",
+        "what happened with", "track", "follow up", "follow-up",
+        "commitment", "action item", "outstanding", "owe",
+    ]
+    wants_knowledge = config.KNOWLEDGE_GRAPH_ENABLED and any(kw in lower for kw in knowledge_keywords)
+
+    def _fetch_knowledge():
+        from knowledge_graph import query_knowledge_graph
+        return "knowledge_graph", query_knowledge_graph(user_message)
+
+    pool = ThreadPoolExecutor(max_workers=7)
     futures = {}
     futures["meetings"] = pool.submit(_fetch_meetings)
     futures["tasks"] = pool.submit(_fetch_tasks)
@@ -625,6 +722,8 @@ def _build_context(user_message):
         futures["targeted_emails"] = pool.submit(_fetch_targeted_emails)
     if wants_granola:
         futures["granola"] = pool.submit(_fetch_granola)
+    if wants_knowledge:
+        futures["knowledge_graph"] = pool.submit(_fetch_knowledge)
 
     deadline = time.time() + 90
     for key, future in futures.items():
