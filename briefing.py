@@ -204,8 +204,11 @@ def run_post_meeting_debrief():
     Notes-gated: a debrief is only sent once Granola notes are available.
     Meetings that run over their scheduled time are handled naturally — the
     lookback window is wide enough to keep retrying on subsequent scheduler
-    runs until the notes appear.  If notes never materialise within the
-    lookback window the meeting is silently skipped.
+    runs until the notes appear.
+
+    If Granola itself is erroring (auth, network, etc.) the debrief is sent
+    without notes after MEETING_DEBRIEF_GRACE_MINUTES so the user isn't left
+    with nothing.
     """
     if not config.GRANOLA_ENABLED:
         return {"status": "skipped", "reason": "granola disabled"}
@@ -213,6 +216,7 @@ def run_post_meeting_debrief():
         return {"status": "skipped", "reason": "CHAT_SPACE_ID not configured"}
 
     lookback = config.MEETING_DEBRIEF_LOOKBACK_MINUTES
+    grace = config.MEETING_DEBRIEF_GRACE_MINUTES
     ended = fetch_recently_ended_meetings(lookback_minutes=lookback)
 
     if not ended:
@@ -242,16 +246,22 @@ def run_post_meeting_debrief():
 
         print(f"  Checking debrief for: {title} (scheduled end was {minutes_since_end:.0f}m ago)")
 
+        granola_error = None
         try:
             granola_notes = fetch_meeting_notes_for_context(title, today_str)
         except Exception as e:
             print(f"    Granola fetch failed: {e}")
+            granola_error = str(e)
             granola_notes = ""
 
         if not granola_notes:
-            print(f"    Notes not available yet, deferring to next run")
-            deferred_count += 1
-            continue
+            if granola_error and minutes_since_end >= grace:
+                print(f"    Granola unavailable past grace window ({grace}m), sending without notes")
+            else:
+                reason = "Granola error, retrying" if granola_error else "notes not available yet"
+                print(f"    {reason}, deferring to next run")
+                deferred_count += 1
+                continue
 
         try:
             end_time = meeting.get("end_time", "")
