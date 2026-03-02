@@ -18,6 +18,22 @@ echo "Deploying Momo to Cloud Run..."
 # Ensure we're using the right project
 gcloud config set project $PROJECT_ID
 
+# Sync Granola token to Firestore so Cloud Run has the latest (with _client_id etc.)
+if [ -f granola_token.json ]; then
+    echo "Syncing Granola token to Firestore..."
+    python3 -c "
+from granola_service import _write_token_to_firestore
+import json, time
+with open('granola_token.json') as f:
+    token = json.load(f)
+if '_expires_at' not in token:
+    import os
+    token['_expires_at'] = os.path.getmtime('granola_token.json') + token.get('expires_in', 21600)
+_write_token_to_firestore(token)
+print('  Granola token synced to Firestore')
+" 2>/dev/null || echo "  (Firestore sync skipped — will use env var fallback)"
+fi
+
 # Read token files into variables for passing as env vars
 GOOGLE_TOKEN_JSON=$(cat token.json)
 GRANOLA_TOKEN_JSON=$(cat granola_token.json 2>/dev/null || echo "")
