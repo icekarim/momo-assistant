@@ -175,8 +175,10 @@ async def run_auth_flow():
     print("Exchanging code for token...")
     tokens = await _exchange_code(token_endpoint, _auth_code, client_id, code_verifier)
 
+    import time as _time
     tokens["_token_endpoint"] = token_endpoint
     tokens["_client_id"] = client_id
+    tokens["_expires_at"] = _time.time() + tokens.get("expires_in", 21600)
 
     with open(TOKEN_FILE, "w") as f:
         json.dump(tokens, f, indent=2)

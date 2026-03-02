@@ -93,34 +93,48 @@ def _load_token() -> str | None:
             _cached_token = json.load(f)
         _token_loaded_at = time.time()
 
+        if "_expires_at" not in _cached_token:
+            file_mtime = os.path.getmtime(_TOKEN_FILE)
+            _cached_token["_expires_at"] = file_mtime + _cached_token.get("expires_in", 21600)
+
         if _is_expired():
             _refresh()
         return _cached_token.get("access_token") if _cached_token else None
 
     # Firestore (Cloud Run path)
     fs_token = _read_token_from_firestore()
-    if fs_token:
-        _cached_token = fs_token
+
+    # GRANOLA_TOKEN_JSON env var — used to seed Firestore or as fallback
+    env_token = None
+    if _GRANOLA_TOKEN_JSON_ENV:
+        try:
+            env_token = json.loads(_GRANOLA_TOKEN_JSON_ENV)
+        except json.JSONDecodeError:
+            print("Granola: GRANOLA_TOKEN_JSON is not valid JSON")
+
+    # Prefer whichever source has the required _client_id for refresh
+    chosen = None
+    if fs_token and fs_token.get("_client_id"):
+        chosen = fs_token
+    elif env_token and env_token.get("_client_id"):
+        chosen = env_token
+        _write_token_to_firestore(chosen)
+        print("Granola: seeded Firestore from GRANOLA_TOKEN_JSON env var")
+    elif fs_token:
+        chosen = fs_token
+    elif env_token:
+        chosen = env_token
+
+    if chosen:
+        _cached_token = chosen
         _token_loaded_at = time.time()
+
+        if "_expires_at" not in _cached_token and _cached_token.get("expires_in"):
+            _cached_token["_expires_at"] = time.time() + _cached_token["expires_in"]
 
         if _is_expired():
             _refresh()
         return _cached_token.get("access_token") if _cached_token else None
-
-    # GRANOLA_TOKEN_JSON env var — seed Firestore on first boot, then Firestore
-    # handles all future refreshes automatically
-    if _GRANOLA_TOKEN_JSON_ENV:
-        try:
-            _cached_token = json.loads(_GRANOLA_TOKEN_JSON_ENV)
-            _token_loaded_at = time.time()
-            _write_token_to_firestore(_cached_token)
-            print("Granola: seeded Firestore from GRANOLA_TOKEN_JSON env var")
-
-            if _is_expired():
-                _refresh()
-            return _cached_token.get("access_token") if _cached_token else None
-        except json.JSONDecodeError:
-            print("Granola: GRANOLA_TOKEN_JSON is not valid JSON")
 
     # Static env var (no refresh possible, last resort)
     if config.GRANOLA_TOKEN:
@@ -133,9 +147,10 @@ def _load_token() -> str | None:
 def _is_expired() -> bool:
     if not _cached_token:
         return True
-    expires_in = _cached_token.get("expires_in", 21600)
-    elapsed = time.time() - _token_loaded_at
-    return elapsed >= (expires_in - 300)  # refresh 5 min early
+    expires_at = _cached_token.get("_expires_at")
+    if expires_at:
+        return time.time() >= (expires_at - 300)
+    return True
 
 
 def _refresh():
@@ -151,10 +166,15 @@ def _refresh():
     token_endpoint = (_cached_token or {}).get("_token_endpoint")
     client_id = (_cached_token or {}).get("_client_id")
 
-    if not token_endpoint or not client_id:
-        token_endpoint, client_id = _discover_refresh_params()
+    if not client_id:
+        print("Granola: _client_id missing from token — re-run `python granola_auth_setup.py`")
+        _cached_token = None
+        return
+
+    if not token_endpoint:
+        token_endpoint = _discover_token_endpoint()
         if not token_endpoint:
-            print("Granola: could not discover OAuth endpoints for refresh")
+            print("Granola: could not discover token endpoint for refresh")
             _cached_token = None
             return
 
@@ -174,6 +194,7 @@ def _refresh():
         new_tokens.setdefault("refresh_token", refresh_token)
         new_tokens["_token_endpoint"] = token_endpoint
         new_tokens["_client_id"] = client_id
+        new_tokens["_expires_at"] = time.time() + new_tokens.get("expires_in", 21600)
 
         _cached_token = new_tokens
         _token_loaded_at = time.time()
@@ -186,8 +207,13 @@ def _refresh():
         _cached_token = None
 
 
-def _discover_refresh_params() -> tuple[str | None, str | None]:
-    """Discover token_endpoint and register a client for refresh."""
+def _discover_token_endpoint() -> str | None:
+    """Discover just the token_endpoint via OAuth well-known metadata.
+
+    Does NOT register a new client — the refresh_token is bound to the
+    client_id from the original auth flow and a new registration would
+    produce a mismatched client_id, causing 400 on refresh.
+    """
     base = config.GRANOLA_MCP_URL.rstrip("/")
 
     for url in [
@@ -197,34 +223,11 @@ def _discover_refresh_params() -> tuple[str | None, str | None]:
         try:
             resp = httpx.get(url, follow_redirects=True)
             if resp.status_code == 200:
-                meta = resp.json()
-                token_endpoint = meta.get("token_endpoint")
-                reg_endpoint = meta.get("registration_endpoint")
-
-                client_id = "momo-assistant"
-                if reg_endpoint:
-                    try:
-                        reg_resp = httpx.post(
-                            reg_endpoint,
-                            json={
-                                "client_name": "Momo Assistant",
-                                "redirect_uris": ["http://localhost:9876/callback"],
-                                "grant_types": ["authorization_code", "refresh_token"],
-                                "response_types": ["code"],
-                                "token_endpoint_auth_method": "none",
-                            },
-                            follow_redirects=True,
-                        )
-                        reg_resp.raise_for_status()
-                        client_id = reg_resp.json().get("client_id", client_id)
-                    except Exception:
-                        pass
-
-                return token_endpoint, client_id
+                return resp.json().get("token_endpoint")
         except Exception:
             continue
 
-    return None, None
+    return None
 
 
 # ── MCP transport ────────────────────────────────────────────
@@ -240,22 +243,47 @@ class _BearerAuth(httpx.Auth):
 
 
 async def _call_tool(tool_name: str, arguments: dict | None = None):
-    """Open a short-lived MCP session and call a single tool."""
-    token = _load_token()
-    if not token:
-        return None
+    """Open a short-lived MCP session and call a single tool.
 
-    auth = _BearerAuth(token)
+    Automatically retries once on 401 after forcing a token refresh.
+    """
+    for attempt in range(2):
+        token = _load_token()
+        if not token:
+            return None
 
-    async with streamablehttp_client(config.GRANOLA_MCP_URL, auth=auth) as (
-        read_stream,
-        write_stream,
-        _,
-    ):
-        async with ClientSession(read_stream, write_stream) as session:
-            await session.initialize()
-            result = await session.call_tool(tool_name, arguments=arguments or {})
-            return result
+        auth = _BearerAuth(token)
+
+        try:
+            async with streamablehttp_client(config.GRANOLA_MCP_URL, auth=auth) as (
+                read_stream,
+                write_stream,
+                _,
+            ):
+                async with ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+                    result = await session.call_tool(tool_name, arguments=arguments or {})
+                    return result
+        except Exception as exc:
+            if attempt == 0 and _is_auth_error(exc):
+                print("Granola: 401 received, forcing token refresh and retrying...")
+                global _cached_token
+                _cached_token = None
+                continue
+            raise
+
+
+def _is_auth_error(exc: Exception) -> bool:
+    """Check if an exception (possibly wrapped in ExceptionGroup) is a 401."""
+    if hasattr(exc, 'status_code') and exc.status_code == 401:
+        return True
+    if hasattr(exc, 'response') and hasattr(exc.response, 'status_code') and exc.response.status_code == 401:
+        return True
+    if hasattr(exc, 'exceptions'):
+        return any(_is_auth_error(sub) for sub in exc.exceptions)
+    if '401' in str(exc):
+        return True
+    return False
 
 
 def _run(coro, timeout=50):
@@ -289,18 +317,17 @@ def _extract_text(result) -> str:
 # ── Public helpers ───────────────────────────────────────────
 
 
-def list_granola_meetings(start_date: str, end_date: str) -> str:
-    """List meetings in a date range (YYYY-MM-DD)."""
+def list_granola_meetings(time_range: str = "last_30_days") -> str:
+    """List meetings in a time range (this_week, last_week, last_30_days)."""
     result = _run(_call_tool("list_meetings", {
-        "start_date": start_date,
-        "end_date": end_date,
+        "time_range": time_range,
     }))
     return _extract_text(result)
 
 
 def get_granola_meeting_notes(query: str) -> str:
     """Search meeting content (notes, action items, attendees)."""
-    result = _run(_call_tool("get_meetings", {"query": query}))
+    result = _run(_call_tool("query_granola_meetings", {"query": query}))
     return _extract_text(result)
 
 
@@ -331,17 +358,45 @@ def fetch_yesterday_meeting_notes() -> str:
         return ""
 
 
+def _find_meeting_id(meeting_title: str) -> str | None:
+    """Match a calendar event title to a Granola meeting ID via list_meetings.
+
+    Uses case-insensitive substring matching — Granola titles sometimes have
+    extra whitespace or slight variations from the calendar title.
+    """
+    import re
+    xml = list_granola_meetings("this_week")
+    if not xml:
+        return None
+
+    title_lower = meeting_title.strip().lower()
+    for match in re.finditer(r'<meeting\s+id="([^"]+)"\s+title="([^"]+)"', xml):
+        granola_title = match.group(2).strip().lower()
+        if title_lower in granola_title or granola_title in title_lower:
+            return match.group(1)
+    return None
+
+
 def fetch_meeting_notes_for_context(meeting_title: str, meeting_date: str | None = None) -> str:
-    """Find Granola notes matching a specific calendar event."""
-    query = meeting_title
-    if meeting_date:
-        query = f"{meeting_title} on {meeting_date}"
-    try:
-        notes = get_granola_meeting_notes(query)
-        return notes if notes else ""
-    except Exception as exc:
-        print(f"Granola: error fetching notes for '{meeting_title}': {exc}")
+    """Find Granola notes matching a specific calendar event.
+
+    Two-step lookup: list_meetings to find the meeting ID by title, then
+    get_meetings to fetch the actual notes by ID.  This avoids the
+    query_granola_meetings tool which returns conversational answers
+    (including notes from unrelated meetings) rather than exact matches.
+
+    Returns the notes text (empty string if no matching meeting found).
+    Raises on transport / auth errors so callers can distinguish
+    "no notes yet" from "Granola is unreachable."
+    """
+    meeting_id = _find_meeting_id(meeting_title)
+    if not meeting_id:
+        print(f"    Granola: no meeting ID found for '{meeting_title}'")
         return ""
+
+    result = _run(_call_tool("get_meetings", {"meeting_ids": [meeting_id]}))
+    notes = _extract_text(result)
+    return notes if notes else ""
 
 
 def format_granola_notes_for_context(notes: str) -> str:
