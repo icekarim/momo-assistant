@@ -47,7 +47,7 @@ gcloud run deploy $SERVICE_NAME \
   --set-env-vars="GEMINI_API_KEY=${GEMINI_API_KEY},GCP_PROJECT_ID=$PROJECT_ID,CHAT_SPACE_ID=${CHAT_SPACE_ID},GRANOLA_ENABLED=true" \
   --set-env-vars="^##^GOOGLE_TOKEN_JSON=${GOOGLE_TOKEN_JSON}##GRANOLA_TOKEN_JSON=${GRANOLA_TOKEN_JSON}" \
   --memory=1Gi \
-  --timeout=120 \
+  --timeout=300 \
   --min-instances=0 \
   --max-instances=3
 
@@ -63,3 +63,4 @@ echo "  1. Set Google Chat App HTTP endpoint to: ${URL}/chat"
 echo "  2. Cloud Scheduler job should point to: ${URL}/briefing"
 echo "  3. Create another Cloud Scheduler job to call: ${URL}/email-alerts (e.g. every 5 minutes)"
 echo "  4. Create Cloud Scheduler job for: ${URL}/meeting-debrief (e.g. */10 9-18 * * 1-5)"
+echo "  5. (One-time) Backfill knowledge graph: curl -X POST ${URL}/knowledge-backfill"
