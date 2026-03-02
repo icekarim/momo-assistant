@@ -4,7 +4,9 @@ Momo is a personal AI chief of staff that lives in Google Chat. It knows your in
 
 Every morning it drops a briefing in Chat: what needs your attention in your inbox, what's on your calendar, what's open in your task list, and what came out of yesterday's meetings. Throughout the day you can message it like a colleague — ask questions, get summaries, delegate tasks, or dig into what was decided in a meeting last week.
 
-Built with **FastAPI** + **Gemini 3 Flash Preview**, deployed on **Google Cloud Run**.
+Momo also builds a **cross-meeting knowledge graph** — it extracts decisions, commitments, action items, blockers, and topics from every meeting and email, then connects dots across them over time. Ask it *"what commitments have I made this week?"* or *"what's the full history of the pricing discussion?"* and it pulls from institutional memory, not just today's data.
+
+Built with **FastAPI** + **Gemini 3 Flash / Pro** (tiered routing), deployed on **Google Cloud Run**.
 
 ---
 
@@ -46,6 +48,40 @@ Momo is connected to [Granola](https://granola.ai) via MCP and can answer questi
 
 The Granola token is managed automatically — it's stored in Firestore and refreshed in the background. You authenticate once with `python granola_auth_setup.py` and never think about it again.
 
+### Cross-meeting knowledge graph
+
+Momo builds persistent institutional memory by extracting structured entities from every meeting debrief and important email:
+
+- **Decisions** — what was decided and when
+- **Commitments** — who promised what to whom, with status tracking
+- **Action items** — tasks that need to happen, with owners
+- **Blockers** — what's blocking progress
+- **Topics** — subjects discussed without a clear outcome
+- **Updates** — status reports on ongoing work
+
+Each entity is stored in Firestore with full provenance (source meeting/email, date, related people, related projects, tags). When you ask Momo a question that touches on history, commitments, or cross-meeting context, the knowledge graph is queried and injected alongside live data.
+
+Example queries:
+- *"what commitments have I made this week?"*
+- *"what's the full history of the pricing discussion with ClientA?"*
+- *"what blockers are outstanding?"*
+- *"what's changed since I last met with Sarah?"*
+- *"what decisions have we made about the Q2 launch?"*
+
+Extraction happens in the background (daemon threads) so it never blocks debrief or alert delivery. You can bootstrap the graph from existing data with `POST /knowledge-backfill`.
+
+### Tiered model routing
+
+Momo routes requests to the right Gemini model based on complexity:
+
+| Tier | Model | Used for |
+|---|---|---|
+| Light | Flash | Quick extractions, triage |
+| Standard | Flash | Normal chat, briefings, debriefs |
+| Deep | Pro | Knowledge graph queries requiring cross-meeting reasoning |
+
+If Pro fails, Momo automatically falls back to Flash so you always get a response.
+
 ---
 
 ## Architecture
@@ -54,52 +90,51 @@ The Granola token is managed automatically — it's stored in Firestore and refr
 Google Chat
     │
     ▼ POST /chat (webhook)
-┌───────────────────────────────────────────────────────┐
-│                   FastAPI (main.py)                   │
-│                                                       │
-│  ┌──────────────────────────────────────────────────┐ │
-│  │                  Event Parser                    │ │
-│  │      handles standard Chat + Workspace           │ │
-│  │      Add-on event formats                        │ │
-│  └─────────────────────┬────────────────────────────┘ │
-│                        │                              │
-│               ┌────────▼────────┐                     │
-│               │  _build_context │  fetches live data  │
-│               └────────┬────────┘                     │
-│                        │                              │
-│    ┌───────────┬────────┴────────┬──────────────┐     │
-│    ▼           ▼                 ▼              ▼     │
-│  Gmail     Calendar            Tasks         Granola  │
-│  Service   Service             Service        MCP     │
-│  (read)  (today+ended)       (read/write)  (notes,   │
-│    │           │                 │          transcripts│
-│    └───────────┴─────────────────┴──────────────┘     │
-│                        │                              │
-│               ┌────────▼────────┐                     │
-│               │  Gemini Service │  chat_response()    │
-│               │ (2.5 Flash Prev)│  conversation       │
-│               │                 │  history + context  │
-│               └────────┬────────┘                     │
-│                        │                              │
-│      ┌─────────────────▼─────────────────┐           │
-│      │        Task Action Extractor       │           │
-│      │  parses [CREATE_TASK],             │           │
-│      │  [UPDATE_TASK], etc. tags          │           │
-│      └─────────────────┬─────────────────┘           │
-│                        │ executes actions             │
-│               ┌────────▼────────┐                     │
-│               │  Tasks Service  │  create/update/     │
-│               │   (write ops)   │  complete/delete    │
-│               └────────┬────────┘                     │
-│                        │                              │
-│               ┌────────▼────────┐                     │
-│               │  Conversation   │  Firestore           │
-│               │  Store          │  (per-user turns)   │
-│               └────────┬────────┘                     │
-└────────────────────────┼──────────────────────────────┘
-                         │ formatted reply
-                         ▼
-                   Google Chat
+┌──────────────────────────────────────────────────────────────┐
+│                      FastAPI (main.py)                        │
+│                                                              │
+│  ┌─────────────────────────────────────────────────────────┐ │
+│  │                     Event Parser                        │ │
+│  │         handles standard Chat + Workspace               │ │
+│  │         Add-on event formats                            │ │
+│  └──────────────────────────┬──────────────────────────────┘ │
+│                              │                               │
+│                    ┌─────────▼─────────┐                     │
+│                    │   _build_context  │  fetches live data   │
+│                    └─────────┬─────────┘  (7 workers)        │
+│                              │                               │
+│    ┌──────────┬──────────┬───┴───┬──────────┬─────────┐      │
+│    ▼          ▼          ▼       ▼          ▼         ▼      │
+│  Gmail    Calendar     Tasks  Granola   Knowledge  Targeted  │
+│  Service  Service      Svc     MCP      Graph      Emails   │
+│  (read) (today+ended) (r/w) (notes)  (Firestore)  (search)  │
+│    └──────────┴──────────┴───────┴──────────┴─────────┘      │
+│                              │                               │
+│                    ┌─────────▼─────────┐                     │
+│                    │   Gemini Service  │  tiered routing:     │
+│                    │  Flash ◄──► Pro   │  Standard → Flash    │
+│                    │                   │  Deep → Pro          │
+│                    └─────────┬─────────┘                     │
+│                              │                               │
+│         ┌────────────────────▼──────────────────┐            │
+│         │          Task Action Extractor         │            │
+│         │    parses [CREATE_TASK],               │            │
+│         │    [UPDATE_TASK], etc. tags            │            │
+│         └────────────────────┬──────────────────┘            │
+│                              │ executes actions              │
+│                    ┌─────────▼─────────┐                     │
+│                    │   Tasks Service   │  create/update/      │
+│                    │    (write ops)    │  complete/delete     │
+│                    └─────────┬─────────┘                     │
+│                              │                               │
+│                    ┌─────────▼─────────┐                     │
+│                    │   Conversation    │  Firestore           │
+│                    │   Store           │  (per-user turns)    │
+│                    └─────────┬─────────┘                     │
+└──────────────────────────────┼───────────────────────────────┘
+                               │ formatted reply
+                               ▼
+                         Google Chat
 
 
 Cloud Scheduler ──► POST /briefing
@@ -121,18 +156,23 @@ Cloud Scheduler ──► POST /meeting-debrief
         Calendar Service             Granola MCP
       (recently ended mtgs)        (notes for mtg)
                 └────────┬────────────────┘
-                         ▼
-                  Gemini (debrief)
-                         ▼
-                   Google Chat
+                         │
+                   ┌─────┴──────┐
+                   ▼            ▼
+             Gemini         Knowledge
+            (debrief)     Graph Extract
+                │         (background)
+                ▼            ▼
+          Google Chat    Firestore
 ```
 
 ### Scheduled jobs (Cloud Scheduler)
 
 ```
-Cloud Scheduler ──► POST /briefing        (daily at 8 AM)
-Cloud Scheduler ──► POST /email-alerts    (every 5 minutes)
-Cloud Scheduler ──► POST /meeting-debrief (every 10 minutes, work hours)
+Cloud Scheduler ──► POST /briefing           (daily at 8 AM)
+Cloud Scheduler ──► POST /email-alerts       (every 5 minutes)
+Cloud Scheduler ──► POST /meeting-debrief    (every 10 minutes, work hours)
+One-time         ──► POST /knowledge-backfill (bootstrap knowledge graph)
 ```
 
 **`/briefing`** — orchestrated by `briefing.py`:
@@ -145,12 +185,21 @@ Cloud Scheduler ──► POST /meeting-debrief (every 10 minutes, work hours)
 2. Filters out any already sent (checked against Firestore)
 3. Batches up to 10 unseen emails → Gemini triage (returns JSON with `alert: true/false`, `priority`, `summary`)
 4. Posts alerts to Chat for emails that pass triage; marks each as sent in Firestore to prevent duplicates
+5. Triggers background knowledge graph extraction for each alerted email
 
 **`/meeting-debrief`** — also in `briefing.py`:
-1. Fetches today's calendar meetings whose end time falls within the last N minutes (default 15)
-2. Skips any already debriefed (checked against Firestore `meeting_debriefs` collection)
-3. For each new ending meeting, fetches Granola notes matching the meeting title
-4. Sends a short debrief to Chat with key decisions and action items; marks meeting as debriefed in Firestore
+1. Fetches today's calendar meetings whose end time falls within the lookback window (default 120 min)
+2. Builds a title-to-ID map from Granola (single API call), then batch-fetches notes
+3. Skips any already debriefed (checked against Firestore `meeting_debriefs` collection)
+4. Sends a short debrief to Chat with key decisions and action items; marks meeting as debriefed
+5. Triggers background knowledge graph extraction for meetings with notes
+
+**`/knowledge-backfill`** — in `main.py`:
+1. Fetches the last 30 days of Granola meetings and recent inbox emails
+2. Batch-extracts entities (decisions, commitments, blockers, etc.) via Gemini Flash
+3. Stores everything in the `knowledge_graph` Firestore collection
+4. Idempotent — skips sources that have already been processed
+5. Run once after first deploy to populate the graph with existing data
 
 ---
 
@@ -159,7 +208,8 @@ Cloud Scheduler ──► POST /meeting-debrief (every 10 minutes, work hours)
 ```
 momo/
 ├── main.py               # FastAPI app, endpoints, message handling, task action execution
-├── gemini_service.py     # Gemini API wrapper; system prompt; chat_response(); briefing/debrief generators
+├── gemini_service.py     # Gemini API wrapper; tiered model routing; system prompt; chat/briefing/debrief
+├── knowledge_graph.py    # Entity extraction, Firestore storage, and query functions for institutional memory
 ├── briefing.py           # Morning briefing, proactive email alerts, post-meeting debrief pipelines
 ├── gmail_service.py      # Gmail API: fetch unread emails, search, format for context
 ├── calendar_service.py   # Google Calendar API: fetch today's events, recently ended meetings
@@ -207,15 +257,17 @@ Parse event format (standard Chat vs. Workspace Add-on)
 Load conversation history from Firestore
     │
     ▼
-_build_context():
-  - always fetches: today's meetings + open tasks
-  - fetches emails if message contains email-related keywords or is a general query
+_build_context() — 7 concurrent workers:
+  - always: today's meetings + open tasks
+  - if email keywords: inbox emails + targeted search
+  - if meeting/notes keywords: Granola MCP query
+  - if history/commitment/decision keywords: knowledge graph query
     │
     ▼
-Gemini chat_response():
-  - injects date reference + context as first turn in history
-  - appends stored conversation history
-  - sends user message
+Gemini chat_response() — tiered model routing:
+  - Standard (Flash): normal queries
+  - Deep (Pro): when knowledge graph context is present
+  - Auto-fallback: Pro → Flash on failure
     │
     ▼
 Parse task action tags from response
@@ -239,10 +291,12 @@ format_for_google_chat() → send reply
 | Google Calendar API | Read today's events | `calendar.readonly` |
 | Google Tasks API | Read + write tasks | `tasks` |
 | Google Chat API | Receive webhooks, send messages | N/A (bot config) |
-| Cloud Firestore | Conversation history, email alert + debrief deduplication, Granola token storage | via ADC / service account |
+| Cloud Firestore | Conversation history, email/debrief dedup, knowledge graph, Granola token | via ADC / service account |
 | Cloud Run | Hosts the FastAPI server | N/A |
 | Cloud Scheduler | Triggers `/briefing`, `/email-alerts`, and `/meeting-debrief` | N/A |
 | Granola MCP | Fetch meeting notes, transcripts, action items | OAuth 2.0 (PKCE) |
+| Gemini Flash | Chat, briefings, debriefs, entity extraction, email triage | API key |
+| Gemini Pro | Deep reasoning for knowledge graph queries | API key |
 
 ---
 
@@ -366,6 +420,7 @@ After deploying:
    - `POST https://<url>/briefing` — daily at 8 AM (or your preferred time)
    - `POST https://<url>/email-alerts` — every 5 minutes
    - `POST https://<url>/meeting-debrief` — every 10 minutes during work hours (optional, requires Granola)
+4. (One-time) Bootstrap the knowledge graph: `curl -X POST https://<url>/knowledge-backfill`
 
 ---
 
@@ -376,6 +431,7 @@ After deploying:
 | `conversations` | sanitized user ID | Stores up to 50 conversation turns per user |
 | `email_alerts` | Gmail message ID | Tracks which emails have already triggered an alert |
 | `meeting_debriefs` | Google Calendar event ID | Tracks which meetings have already been debriefed |
+| `knowledge_graph` | auto-generated | Extracted entities (decisions, commitments, blockers, etc.) with provenance |
 | `granola_auth` | `token` | Stores the Granola OAuth token for Cloud Run (auto-refreshed) |
 
 ---
@@ -396,8 +452,12 @@ After deploying:
 | `IMPORTANT_EMAIL_KEYWORDS` | No | `urgent,asap,...` | Keywords that flag an email as important |
 | `CLIENT_EMAIL_KEYWORDS` | No | `client,customer` | Keywords that identify client emails |
 | `CLIENT_DOMAINS` | No | — | Comma-separated domains to treat as clients |
+| `KNOWLEDGE_GRAPH_ENABLED` | No | `true` | Toggle knowledge graph extraction and querying |
+| `GEMINI_MODEL_FLASH` | No | `gemini-3-flash-preview` | Model for standard/light tasks |
+| `GEMINI_MODEL_PRO` | No | `gemini-3.1-pro-preview` | Model for deep reasoning (knowledge graph queries) |
 | `GRANOLA_ENABLED` | No | `false` | Enable Granola meeting notes integration |
 | `GRANOLA_MCP_URL` | No | `https://mcp.granola.ai/mcp` | Granola MCP server URL |
 | `GRANOLA_TOKEN_JSON` | Cloud Run | — | Full Granola token JSON as a string (seeds Firestore on first boot) |
-| `MEETING_DEBRIEF_LOOKBACK_MINUTES` | No | `15` | How far back to look for recently ended meetings |
+| `MEETING_DEBRIEF_LOOKBACK_MINUTES` | No | `120` | How far back to look for recently ended meetings |
+| `MEETING_DEBRIEF_GRACE_MINUTES` | No | `45` | Grace period before sending debrief without notes |
 | `PORT` | No | `8080` | Server port |
