@@ -180,16 +180,23 @@ async def trigger_meeting_debrief():
 @app.post("/knowledge-backfill")
 async def trigger_knowledge_backfill():
     """Reprocess recent meetings and emails into the knowledge graph.
-    Useful for bootstrapping the graph with existing data."""
-    import time as _time
-
+    Returns immediately and processes in a background thread."""
     if not config.KNOWLEDGE_GRAPH_ENABLED:
         return {"status": "skipped", "reason": "knowledge graph disabled"}
 
+    thread = threading.Thread(target=_run_backfill, daemon=True)
+    thread.start()
+    return {"status": "started", "message": "backfill running in background, check logs for progress"}
+
+
+def _run_backfill():
+    import time as _time
+
     from knowledge_graph import extract_and_store
 
-    results = {"meetings_processed": 0, "meetings_failed": 0,
-               "emails_processed": 0, "emails_failed": 0}
+    print("Backfill: starting knowledge graph backfill...")
+    meetings_ok, meetings_fail = 0, 0
+    emails_ok, emails_fail = 0, 0
 
     if config.GRANOLA_ENABLED:
         try:
@@ -202,6 +209,8 @@ async def trigger_knowledge_backfill():
                 for match in _re.finditer(r'<meeting\s+id="([^"]+)"\s+title="([^"]+)"', xml):
                     meetings.append({"id": match.group(1), "title": match.group(2)})
 
+                print(f"Backfill: found {len(meetings)} meetings to process")
+
                 batch_size = 10
                 for i in range(0, len(meetings), batch_size):
                     batch = meetings[i:i + batch_size]
@@ -210,7 +219,7 @@ async def trigger_knowledge_backfill():
                         notes_by_id = fetch_meeting_notes_batch(ids)
                     except Exception as e:
                         print(f"  Backfill: batch fetch failed: {e}")
-                        results["meetings_failed"] += len(batch)
+                        meetings_fail += len(batch)
                         continue
 
                     for m in batch:
@@ -226,17 +235,20 @@ async def trigger_knowledge_backfill():
                                 content=notes,
                                 attendees=[],
                             )
-                            results["meetings_processed"] += 1
+                            meetings_ok += 1
                         except Exception as e:
                             print(f"  Backfill: extraction failed for '{m['title']}': {e}")
-                            results["meetings_failed"] += 1
+                            traceback.print_exc()
+                            meetings_fail += 1
                         _time.sleep(0.5)
         except Exception as e:
             print(f"  Backfill: Granola processing failed: {e}")
+            traceback.print_exc()
 
     try:
         from gmail_service import fetch_unread_client_emails
         emails = fetch_unread_client_emails(max_results=50)
+        print(f"Backfill: found {len(emails)} emails to process")
         for email in emails:
             try:
                 extract_and_store(
@@ -247,16 +259,18 @@ async def trigger_knowledge_backfill():
                     content=email.get("body", ""),
                     attendees=[email.get("from", "")],
                 )
-                results["emails_processed"] += 1
+                emails_ok += 1
             except Exception as e:
                 print(f"  Backfill: email extraction failed: {e}")
-                results["emails_failed"] += 1
+                traceback.print_exc()
+                emails_fail += 1
             _time.sleep(0.5)
     except Exception as e:
         print(f"  Backfill: email processing failed: {e}")
+        traceback.print_exc()
 
-    results["status"] = "completed"
-    return results
+    print(f"Backfill complete: meetings={meetings_ok} ok/{meetings_fail} fail, "
+          f"emails={emails_ok} ok/{emails_fail} fail")
 
 
 # ── Google Chat Webhook ──────────────────────────────────────
