@@ -1,7 +1,28 @@
+from enum import Enum
+
 import google.generativeai as genai
 import config
 
 genai.configure(api_key=config.GEMINI_API_KEY)
+
+
+class TaskComplexity(Enum):
+    LIGHT = "light"
+    STANDARD = "standard"
+    DEEP = "deep"
+
+
+TASK_MODEL_MAP = {
+    TaskComplexity.LIGHT: config.GEMINI_MODEL_FLASH,
+    TaskComplexity.STANDARD: config.GEMINI_MODEL_FLASH,
+    TaskComplexity.DEEP: config.GEMINI_MODEL_PRO,
+}
+
+TIER_TIMEOUTS = {
+    TaskComplexity.LIGHT: 30,
+    TaskComplexity.STANDARD: 60,
+    TaskComplexity.DEEP: 120,
+}
 
 SYSTEM_PROMPT = """You are Momo, a chill, sharp, and low-key hilarious AI assistant living inside Google Chat. You talk like someone's most competent friend — the one who's somehow always got the answer but never makes it weird.
 
@@ -103,6 +124,9 @@ keep it tight. only include stuff that matters for today.
 - You CANNOT send emails or modify calendar events.
 - You CAN execute task actions (create, update, complete, delete).
 - When the user asks about past meetings, discussions, or action items, use the Granola meeting notes in context to answer. If no notes are available for a meeting, say so.
+- You have access to a cross-meeting intelligence graph that tracks people, projects, decisions, commitments, and blockers across all meetings and emails over time.
+- When KNOWLEDGE GRAPH context is provided, use it to connect dots across meetings and emails. Cite specific source meetings/emails and dates when referencing knowledge graph data.
+- The knowledge graph lets you answer questions like "what's the full history of X?", "what commitments have I made this week?", "what's changed since I last met with Y?" — use it when available.
 
 === TASK ACTIONS — MANDATORY FORMAT ===
 
@@ -185,10 +209,12 @@ Momo is the friend who fixes your resume at 2am, tells you your ex's rebound is 
 Keep responses scannable. Google Chat supports *bold* and basic formatting. Use section emojis (📅 ✅ 📧 🎯) and priority colors (🔴 🟡 🟢) to make messages easy to read at a glance. No other emojis."""
 
 
-def _get_model():
+def _get_model(complexity: TaskComplexity = TaskComplexity.STANDARD,
+               system_prompt: str | None = None):
+    model_name = TASK_MODEL_MAP[complexity]
     return genai.GenerativeModel(
-        model_name=config.GEMINI_MODEL,
-        system_instruction=SYSTEM_PROMPT,
+        model_name=model_name,
+        system_instruction=system_prompt if system_prompt is not None else SYSTEM_PROMPT,
     )
 
 
@@ -227,15 +253,17 @@ Please create my morning briefing."""
 
 def chat_response(user_message, conversation_history, context_data):
     """Generate a conversational response with email/calendar/task context."""
+    import time
     from datetime import datetime, timedelta
 
-    model = _get_model()
+    has_kg_context = bool(context_data.get("knowledge_graph"))
+    complexity = TaskComplexity.DEEP if has_kg_context else TaskComplexity.STANDARD
+    model = _get_model(complexity)
 
     now = datetime.now()
     today_str = now.strftime("%A, %B %d, %Y")
     today_iso = now.strftime("%Y-%m-%d")
     tomorrow_iso = (now + timedelta(days=1)).strftime("%Y-%m-%d")
-    # Calculate next weekdays
     weekday_dates = {}
     for i in range(1, 8):
         d = now + timedelta(days=i)
@@ -255,11 +283,18 @@ def chat_response(user_message, conversation_history, context_data):
         context_parts.append(f"=== OPEN TASKS ===\n{context_data['tasks']}")
     if context_data.get("granola"):
         context_parts.append(f"=== MEETING NOTES (from Granola) ===\n{context_data['granola']}")
+    if has_kg_context:
+        context_parts.append(
+            f"=== KNOWLEDGE GRAPH (cross-meeting institutional memory) ===\n"
+            f"The entries below are extracted from past meetings and emails. "
+            f"Use them to connect dots and answer questions about history, "
+            f"commitments, decisions, and trends.\n\n{context_data['knowledge_graph']}"
+        )
 
     context_block = "\n\n".join(context_parts)
     history.append({
         "role": "user",
-        "parts": [f"[CONTEXT — current date, emails, meetings, tasks, and meeting notes for reference]\n\n{context_block}\n\n[END CONTEXT]"],
+        "parts": [f"[CONTEXT — current date, emails, meetings, tasks, meeting notes, and knowledge graph for reference]\n\n{context_block}\n\n[END CONTEXT]"],
     })
     history.append({
         "role": "model",
@@ -272,9 +307,23 @@ def chat_response(user_message, conversation_history, context_data):
         history.append({"role": role, "parts": [turn["content"]]})
 
     chat = model.start_chat(history=history)
-    resp = chat.send_message(user_message)
 
-    return resp.text
+    start = time.time()
+    try:
+        resp = chat.send_message(user_message)
+        return resp.text
+    except Exception as e:
+        if complexity == TaskComplexity.DEEP:
+            print(f"Pro model failed ({e}), falling back to Flash")
+            fallback_model = _get_model(TaskComplexity.STANDARD)
+            fallback_chat = fallback_model.start_chat(history=history)
+            resp = fallback_chat.send_message(user_message)
+            return resp.text
+        raise
+    finally:
+        elapsed = time.time() - start
+        if elapsed > 30:
+            print(f"Slow chat_response: {elapsed:.1f}s (tier: {complexity.value})")
 
 
 def generate_post_meeting_debrief(meeting_title, attendees, granola_notes, end_time=""):

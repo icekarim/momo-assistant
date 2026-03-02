@@ -116,6 +116,16 @@ def run_proactive_email_alerts():
         mark_email_alert_sent(email)
         sent_count += 1
 
+        from knowledge_graph import extract_and_store_background
+        extract_and_store_background(
+            source_type="email",
+            source_id=email["id"],
+            source_title=email.get("subject", ""),
+            source_date=email.get("date_human", ""),
+            content=email.get("body", ""),
+            attendees=[email.get("from", "")],
+        )
+
     return {
         "status": "sent" if sent_count else "no_alerts",
         "alerts_sent": sent_count,
@@ -291,12 +301,23 @@ def run_post_meeting_debrief():
 
         try:
             end_time = meeting.get("end_time", "")
+            event_id = meeting.get("id", "")
             debrief = generate_post_meeting_debrief(title, attendees, granola_notes, end_time)
             formatted = format_for_google_chat(debrief)
             send_chat_message(config.CHAT_SPACE_ID, formatted)
-            mark_debrief_sent(meeting.get("id", ""), title)
+            mark_debrief_sent(event_id, title)
             sent_count += 1
             print(f"    Debrief sent for: {title}")
+            if granola_notes:
+                from knowledge_graph import extract_and_store_background
+                extract_and_store_background(
+                    source_type="meeting",
+                    source_id=event_id,
+                    source_title=title,
+                    source_date=now.strftime("%Y-%m-%d"),
+                    content=granola_notes,
+                    attendees=attendees,
+                )
         except Exception as e:
             print(f"    Debrief generation/send failed for '{title}': {e}")
 
