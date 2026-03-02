@@ -7,9 +7,11 @@ functions for surfacing institutional memory in Momo's chat responses.
 
 import json
 import threading
+import traceback
 from datetime import datetime, timezone
 
 import google.generativeai as genai
+from google.cloud.firestore_v1.base_query import FieldFilter
 
 import config
 from conversation_store import get_db
@@ -17,13 +19,15 @@ from conversation_store import get_db
 genai.configure(api_key=config.GEMINI_API_KEY)
 
 # ── Extraction prompt ────────────────────────────────────────
+# Literal braces in the JSON example are doubled ({{ }}) so
+# str.format() doesn't treat them as placeholders.
 
 _EXTRACTION_PROMPT = """You are an entity extraction engine. Extract structured knowledge from the content below.
 
 Return a JSON array of objects. Each object represents one piece of knowledge:
 
-{
-  "type": "decision" | "commitment" | "action_item" | "blocker" | "topic" | "update",
+{{
+  "entity_type": "decision" | "commitment" | "action_item" | "blocker" | "topic" | "update",
   "name": "short label (2-8 words)",
   "content": "1-2 sentence description of what was said/decided/committed",
   "status": "open" | "completed" | "resolved" | null,
@@ -31,7 +35,7 @@ Return a JSON array of objects. Each object represents one piece of knowledge:
   "related_people": ["list of people mentioned or involved"],
   "related_projects": ["list of projects, clients, or initiatives mentioned"],
   "tags": ["lowercase keywords for search, 3-6 tags"]
-}
+}}
 
 Entity type guidelines:
 - "decision": something that was decided or agreed upon
@@ -64,14 +68,18 @@ CONTENT:
 
 def _already_extracted(source_id: str) -> bool:
     """Check if we've already extracted from this source (idempotency)."""
-    db = get_db()
-    existing = (
-        db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
-        .where("source_id", "==", source_id)
-        .limit(1)
-        .get()
-    )
-    return len(existing) > 0
+    try:
+        db = get_db()
+        docs = list(
+            db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
+            .where(filter=FieldFilter("source_id", "==", source_id))
+            .limit(1)
+            .stream()
+        )
+        return len(docs) > 0
+    except Exception as exc:
+        print(f"Knowledge graph: dedup check failed ({exc}), proceeding with extraction")
+        return False
 
 
 def _run_extraction(source_type: str, source_title: str, content: str,
@@ -97,7 +105,15 @@ def _run_extraction(source_type: str, source_title: str, content: str,
             text = text.split("\n", 1)[1] if "\n" in text else text[3:]
         if text.endswith("```"):
             text = text[: text.rfind("```")]
-        return json.loads(text.strip())
+        parsed = json.loads(text.strip())
+
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        if not isinstance(parsed, list):
+            print(f"Knowledge graph: unexpected response type {type(parsed)}, skipping")
+            return []
+
+        return [e for e in parsed if isinstance(e, dict)]
     except Exception as exc:
         print(f"Knowledge graph extraction failed: {exc}")
         return []
@@ -112,7 +128,7 @@ def _store_entries(entries: list[dict], source_type: str, source_id: str,
 
     for entry in entries:
         doc = {
-            "type": entry.get("type", "topic"),
+            "entity_type": entry.get("entity_type", "topic"),
             "name": entry.get("name", ""),
             "content": entry.get("content", ""),
             "status": entry.get("status"),
@@ -169,8 +185,9 @@ def _safe_extract(source_type, source_id, source_title, source_date, content, at
     try:
         extract_and_store(source_type, source_id, source_title, source_date,
                           content, attendees)
-    except Exception as exc:
-        print(f"  Knowledge graph background extraction failed: {exc}")
+    except Exception:
+        print("  Knowledge graph background extraction failed:")
+        traceback.print_exc()
 
 
 # ── Query functions ──────────────────────────────────────────
@@ -182,12 +199,12 @@ def query_by_person(name: str, since: str | None = None,
     db = get_db()
     query = (
         db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
-        .where("related_people", "array_contains", name)
+        .where(filter=FieldFilter("related_people", "array_contains", name))
         .order_by("source_date", direction="DESCENDING")
         .limit(limit)
     )
     if since:
-        query = query.where("source_date", ">=", since)
+        query = query.where(filter=FieldFilter("source_date", ">=", since))
     return [_doc_to_dict(doc) for doc in query.stream()]
 
 
@@ -197,12 +214,12 @@ def query_by_project(name: str, since: str | None = None,
     db = get_db()
     query = (
         db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
-        .where("related_projects", "array_contains", name)
+        .where(filter=FieldFilter("related_projects", "array_contains", name))
         .order_by("source_date", direction="DESCENDING")
         .limit(limit)
     )
     if since:
-        query = query.where("source_date", ">=", since)
+        query = query.where(filter=FieldFilter("source_date", ">=", since))
     return [_doc_to_dict(doc) for doc in query.stream()]
 
 
@@ -212,12 +229,12 @@ def query_by_type(entity_type: str, since: str | None = None,
     db = get_db()
     query = (
         db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
-        .where("type", "==", entity_type)
+        .where(filter=FieldFilter("entity_type", "==", entity_type))
         .order_by("source_date", direction="DESCENDING")
         .limit(limit)
     )
     if since:
-        query = query.where("source_date", ">=", since)
+        query = query.where(filter=FieldFilter("source_date", ">=", since))
     return [_doc_to_dict(doc) for doc in query.stream()]
 
 
@@ -227,13 +244,13 @@ def query_open_commitments(since: str | None = None,
     db = get_db()
     query = (
         db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
-        .where("type", "in", ["commitment", "action_item"])
-        .where("status", "==", "open")
+        .where(filter=FieldFilter("entity_type", "in", ["commitment", "action_item"]))
+        .where(filter=FieldFilter("status", "==", "open"))
         .order_by("source_date", direction="DESCENDING")
         .limit(limit)
     )
     if since:
-        query = query.where("source_date", ">=", since)
+        query = query.where(filter=FieldFilter("source_date", ">=", since))
     return [_doc_to_dict(doc) for doc in query.stream()]
 
 
@@ -247,7 +264,7 @@ def search_knowledge(keywords: list[str], limit: int = 50) -> list[dict]:
     primary = keywords[0].lower().strip()
     query = (
         db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
-        .where("tags", "array_contains", primary)
+        .where(filter=FieldFilter("tags", "array_contains", primary))
         .order_by("source_date", direction="DESCENDING")
         .limit(limit * 2)
     )
@@ -270,7 +287,7 @@ def query_recent(days: int = 7, limit: int = 50) -> list[dict]:
     db = get_db()
     query = (
         db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
-        .where("source_date", ">=", since)
+        .where(filter=FieldFilter("source_date", ">=", since))
         .order_by("source_date", direction="DESCENDING")
         .limit(limit)
     )
@@ -306,7 +323,7 @@ def format_knowledge_for_context(entries: list[dict]) -> str:
         ref_str = f" | {'; '.join(refs)}" if refs else ""
 
         lines.append(
-            f"- [{e.get('source_date', '?')}] [{e.get('type', '?')}]{status}{owner} "
+            f"- [{e.get('source_date', '?')}] [{e.get('entity_type', '?')}]{status}{owner} "
             f"{e.get('name', '')}: {e.get('content', '')}"
             f" (source: {e.get('source_title', '?')}{ref_str})"
         )
@@ -376,7 +393,6 @@ def query_knowledge_graph(user_message: str) -> str:
 def _extract_person_name(message: str) -> str | None:
     """Try to extract a person's name from the user message."""
     import re
-    lower = message.lower()
 
     patterns = [
         r"(?:with|from|about|by|to)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)",
