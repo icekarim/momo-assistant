@@ -222,37 +222,63 @@ def run_post_meeting_debrief():
     if not ended:
         return {"status": "no_meetings", "debriefs_sent": 0}
 
-    from granola_service import fetch_meeting_notes_for_context
+    from granola_service import build_meeting_id_map, match_meeting_id, fetch_meeting_notes_batch
     from datetime import datetime
 
     now = datetime.now().astimezone()
-    today_str = now.strftime("%Y-%m-%d")
     sent_count = 0
     deferred_count = 0
 
+    pending = []
     for meeting in ended:
         event_id = meeting.get("id", "")
         if not event_id or has_debrief_been_sent(event_id):
             continue
-
-        title = meeting["title"]
-        attendees = [a["name"] for a in meeting.get("attendees", [])]
-
         try:
             end_dt = datetime.fromisoformat(meeting["end_iso"])
             minutes_since_end = (now - end_dt).total_seconds() / 60
         except (ValueError, TypeError):
             minutes_since_end = 0
+        pending.append((meeting, minutes_since_end))
+
+    if not pending:
+        return {"status": "no_debriefs", "debriefs_sent": 0}
+
+    # Single list_meetings call → title-to-ID map
+    granola_error = None
+    id_map: dict[str, str] = {}
+    try:
+        id_map = build_meeting_id_map()
+    except Exception as e:
+        print(f"  Granola list_meetings failed: {e}")
+        granola_error = str(e)
+
+    # Match titles → IDs, then batch-fetch notes in one get_meetings call
+    id_to_meeting: dict[str, tuple] = {}
+    no_match: list[tuple] = []
+    for meeting, mins in pending:
+        title = meeting["title"]
+        mid = match_meeting_id(title, id_map) if id_map else None
+        if mid:
+            id_to_meeting[mid] = (meeting, mins)
+        else:
+            no_match.append((meeting, mins))
+
+    notes_by_id: dict[str, str] = {}
+    if id_to_meeting:
+        try:
+            notes_by_id = fetch_meeting_notes_batch(list(id_to_meeting.keys()))
+        except Exception as e:
+            print(f"  Granola get_meetings failed: {e}")
+            granola_error = str(e)
+
+    # Process meetings with matched IDs
+    for mid, (meeting, minutes_since_end) in id_to_meeting.items():
+        title = meeting["title"]
+        attendees = [a["name"] for a in meeting.get("attendees", [])]
+        granola_notes = notes_by_id.get(mid, "")
 
         print(f"  Checking debrief for: {title} (scheduled end was {minutes_since_end:.0f}m ago)")
-
-        granola_error = None
-        try:
-            granola_notes = fetch_meeting_notes_for_context(title, today_str)
-        except Exception as e:
-            print(f"    Granola fetch failed: {e}")
-            granola_error = str(e)
-            granola_notes = ""
 
         if not granola_notes:
             if granola_error and minutes_since_end >= grace:
@@ -268,11 +294,33 @@ def run_post_meeting_debrief():
             debrief = generate_post_meeting_debrief(title, attendees, granola_notes, end_time)
             formatted = format_for_google_chat(debrief)
             send_chat_message(config.CHAT_SPACE_ID, formatted)
-            mark_debrief_sent(event_id, title)
+            mark_debrief_sent(meeting.get("id", ""), title)
             sent_count += 1
             print(f"    Debrief sent for: {title}")
         except Exception as e:
             print(f"    Debrief generation/send failed for '{title}': {e}")
+
+    # Meetings with no Granola match — defer or send without notes
+    for meeting, minutes_since_end in no_match:
+        title = meeting["title"]
+        attendees = [a["name"] for a in meeting.get("attendees", [])]
+        print(f"  Checking debrief for: {title} (scheduled end was {minutes_since_end:.0f}m ago)")
+
+        if granola_error and minutes_since_end >= grace:
+            print(f"    Granola unavailable past grace window ({grace}m), sending without notes")
+            try:
+                end_time = meeting.get("end_time", "")
+                debrief = generate_post_meeting_debrief(title, attendees, "", end_time)
+                formatted = format_for_google_chat(debrief)
+                send_chat_message(config.CHAT_SPACE_ID, formatted)
+                mark_debrief_sent(meeting.get("id", ""), title)
+                sent_count += 1
+                print(f"    Debrief sent for: {title}")
+            except Exception as e:
+                print(f"    Debrief generation/send failed for '{title}': {e}")
+        else:
+            print(f"    No Granola match for '{title}', deferring to next run")
+            deferred_count += 1
 
     return {
         "status": "sent" if sent_count else ("deferred" if deferred_count else "no_debriefs"),
