@@ -286,7 +286,7 @@ def _is_auth_error(exc: Exception) -> bool:
     return False
 
 
-def _run(coro, timeout=50):
+def _run(coro, timeout=20):
     """Run an async coroutine from sync code with a timeout."""
     try:
         loop = asyncio.get_running_loop()
@@ -358,45 +358,50 @@ def fetch_yesterday_meeting_notes() -> str:
         return ""
 
 
-def _find_meeting_id(meeting_title: str) -> str | None:
-    """Match a calendar event title to a Granola meeting ID via list_meetings.
+def build_meeting_id_map() -> dict[str, str]:
+    """Fetch this week's Granola meetings and return a {lowercase_title: id} map.
 
-    Uses case-insensitive substring matching — Granola titles sometimes have
-    extra whitespace or slight variations from the calendar title.
+    Called once before processing meetings so we don't re-list per meeting.
     """
     import re
     xml = list_granola_meetings("this_week")
     if not xml:
-        return None
+        return {}
 
-    title_lower = meeting_title.strip().lower()
+    id_map: dict[str, str] = {}
     for match in re.finditer(r'<meeting\s+id="([^"]+)"\s+title="([^"]+)"', xml):
-        granola_title = match.group(2).strip().lower()
+        id_map[match.group(2).strip().lower()] = match.group(1)
+    return id_map
+
+
+def match_meeting_id(title: str, id_map: dict[str, str]) -> str | None:
+    """Fuzzy-match a calendar title against the pre-built Granola ID map."""
+    title_lower = title.strip().lower()
+    for granola_title, mid in id_map.items():
         if title_lower in granola_title or granola_title in title_lower:
-            return match.group(1)
+            return mid
     return None
 
 
-def fetch_meeting_notes_for_context(meeting_title: str, meeting_date: str | None = None) -> str:
-    """Find Granola notes matching a specific calendar event.
+def fetch_meeting_notes_batch(meeting_ids: list[str]) -> dict[str, str]:
+    """Fetch notes for multiple meetings in a single get_meetings call (max 10).
 
-    Two-step lookup: list_meetings to find the meeting ID by title, then
-    get_meetings to fetch the actual notes by ID.  This avoids the
-    query_granola_meetings tool which returns conversational answers
-    (including notes from unrelated meetings) rather than exact matches.
-
-    Returns the notes text (empty string if no matching meeting found).
-    Raises on transport / auth errors so callers can distinguish
-    "no notes yet" from "Granola is unreachable."
+    Returns {meeting_id: notes_text}. Raises on transport/auth errors.
     """
-    meeting_id = _find_meeting_id(meeting_title)
-    if not meeting_id:
-        print(f"    Granola: no meeting ID found for '{meeting_title}'")
-        return ""
+    if not meeting_ids:
+        return {}
 
-    result = _run(_call_tool("get_meetings", {"meeting_ids": [meeting_id]}))
-    notes = _extract_text(result)
-    return notes if notes else ""
+    result = _run(_call_tool("get_meetings", {"meeting_ids": meeting_ids[:10]}))
+    text = _extract_text(result)
+
+    import re
+    notes_by_id: dict[str, str] = {}
+    blocks = re.split(r'(?=<meeting\s+id=")', text)
+    for block in blocks:
+        m = re.match(r'<meeting\s+id="([^"]+)"', block)
+        if m:
+            notes_by_id[m.group(1)] = block
+    return notes_by_id
 
 
 def format_granola_notes_for_context(notes: str) -> str:
