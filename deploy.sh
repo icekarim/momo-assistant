@@ -8,7 +8,7 @@ set -e
 #   export CHAT_SPACE_ID="spaces/XXXXXXXXX"
 PROJECT_ID="${PROJECT_ID:?PROJECT_ID env var is required}"
 GEMINI_API_KEY="${GEMINI_API_KEY:?GEMINI_API_KEY env var is required}"
-CHAT_SPACE_ID="${CHAT_SPACE_ID:?CHAT_SPACE_ID env var is required}"
+CHAT_SPACE_ID="${CHAT_SPACE_ID:-}"
 REGION="us-central1"
 SERVICE_NAME="momo"
 # ─────────────────────────────────────────────────────────────

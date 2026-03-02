@@ -715,10 +715,10 @@ def _build_context(user_message):
         return "granola", query_granola(user_message)
 
     knowledge_keywords = [
-        "history", "discussed", "decided", "committed", "promised",
-        "blocker", "last time", "changed since", "full story",
-        "what happened with", "track", "follow up", "follow-up",
-        "commitment", "action item", "outstanding", "owe",
+        "history of", "full story", "what happened with", "changed since",
+        "last time we", "committed to", "promised to", "commitment",
+        "outstanding commitment", "blocker", "blocked on",
+        "what did we decide", "what was decided",
     ]
     wants_knowledge = config.KNOWLEDGE_GRAPH_ENABLED and any(kw in lower for kw in knowledge_keywords)
 

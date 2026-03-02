@@ -125,8 +125,10 @@ keep it tight. only include stuff that matters for today.
 - You CAN execute task actions (create, update, complete, delete).
 - When the user asks about past meetings, discussions, or action items, use the Granola meeting notes in context to answer. If no notes are available for a meeting, say so.
 - You have access to a cross-meeting intelligence graph that tracks people, projects, decisions, commitments, and blockers across all meetings and emails over time.
-- When KNOWLEDGE GRAPH context is provided, use it to connect dots across meetings and emails. Cite specific source meetings/emails and dates when referencing knowledge graph data.
-- The knowledge graph lets you answer questions like "what's the full history of X?", "what commitments have I made this week?", "what's changed since I last met with Y?" — use it when available.
+- When KNOWLEDGE GRAPH context is provided, ONLY reference entries that directly answer the user's question. Ignore KG entries about unrelated people, projects, or topics.
+- NEVER mix up people or attribute actions/decisions/emails to the wrong person. If a KG entry mentions "Alice decided X", do not say "Bob decided X".
+- Cite specific source meetings/emails and dates when referencing knowledge graph data.
+- If KG entries don't clearly relate to what the user asked, ignore them entirely rather than shoehorning them into your answer.
 
 === TASK ACTIONS — MANDATORY FORMAT ===
 
@@ -286,9 +288,11 @@ def chat_response(user_message, conversation_history, context_data):
     if has_kg_context:
         context_parts.append(
             f"=== KNOWLEDGE GRAPH (cross-meeting institutional memory) ===\n"
-            f"The entries below are extracted from past meetings and emails. "
-            f"Use them to connect dots and answer questions about history, "
-            f"commitments, decisions, and trends.\n\n{context_data['knowledge_graph']}"
+            f"IMPORTANT: Only use entries below that DIRECTLY relate to the user's question. "
+            f"Do NOT mention or reference entries about unrelated people, projects, or topics. "
+            f"Do NOT combine or conflate information from different entries about different people. "
+            f"If none of these entries are relevant, simply ignore this section entirely.\n\n"
+            f"{context_data['knowledge_graph']}"
         )
 
     context_block = "\n\n".join(context_parts)
