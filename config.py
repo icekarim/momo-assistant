@@ -6,6 +6,8 @@ load_dotenv()
 # ── Gemini ───────────────────────────────────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = "gemini-3-flash-preview"
+GEMINI_MODEL_FLASH = os.getenv("GEMINI_MODEL_FLASH", "gemini-3-flash-preview")
+GEMINI_MODEL_PRO = os.getenv("GEMINI_MODEL_PRO", "gemini-3.1-pro-preview")
 
 # ── Gmail ────────────────────────────────────────────────────
 GMAIL_QUERY = "is:unread in:inbox"
@@ -57,7 +59,11 @@ FIRESTORE_DATABASE = os.getenv("FIRESTORE_DATABASE", "testing")
 FIRESTORE_COLLECTION = "conversations"
 FIRESTORE_EMAIL_ALERTS_COLLECTION = "email_alerts"
 FIRESTORE_MEETING_DEBRIEFS_COLLECTION = "meeting_debriefs"
+FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION = "knowledge_graph"
 MAX_CONVERSATION_TURNS = 50
+
+# ── Knowledge Graph ──────────────────────────────────────────
+KNOWLEDGE_GRAPH_ENABLED = os.getenv("KNOWLEDGE_GRAPH_ENABLED", "true").lower() == "true"
 
 # ── Granola MCP ──────────────────────────────────────────────
 GRANOLA_ENABLED = os.getenv("GRANOLA_ENABLED", "false").lower() == "true"
