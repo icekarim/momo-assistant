@@ -6,6 +6,8 @@ Every morning it drops a briefing in Chat: what needs your attention in your inb
 
 Momo also builds a **cross-meeting knowledge graph** — it extracts decisions, commitments, action items, blockers, and topics from every meeting and email, then connects dots across them over time. Ask it *"what commitments have I made this week?"* or *"what's the full history of the pricing discussion?"* and it pulls from institutional memory, not just today's data.
 
+On top of that, Momo runs a **proactive intelligence engine** — it surfaces insights before you ask. Pre-meeting prep briefs, commitment follow-ups, pattern detection across meetings, and drift alerts for projects that have gone quiet. All delivered as nudges in your morning briefing or as standalone Chat messages for urgent items.
+
 Built with **FastAPI** + **Gemini 3 Flash / Pro** (tiered routing), deployed on **Google Cloud Run**.
 
 ---
@@ -68,7 +70,21 @@ Example queries:
 - *"what's changed since I last met with Sarah?"*
 - *"what decisions have we made about the Q2 launch?"*
 
-Extraction happens in the background (daemon threads) so it never blocks debrief or alert delivery. You can bootstrap the graph from existing data with `POST /knowledge-backfill`.
+Extraction happens in the background (daemon threads) so it never blocks debrief or alert delivery. Chat messages are also extracted into the knowledge graph automatically, so context from conversations is captured alongside meetings and emails. You can bootstrap the graph from existing data with `POST /knowledge-backfill`.
+
+### Proactive intelligence
+
+Momo doesn't just answer questions — it surfaces insights before you think to ask. Four engines run daily (during morning briefing) and throughout the day:
+
+**1. Pre-meeting prep** — Before each meeting, Momo pulls relevant context from the knowledge graph: past interactions with attendees, open commitments involving them, related project history, and outstanding blockers. Delivered as a brief to Chat ~1 hour before the meeting starts.
+
+**2. Commitment follow-up** — Scans the knowledge graph for open commitments older than 3 days (configurable). Cross-references Gmail and Google Tasks for evidence of completion — if a matching email was sent or a task was completed, the commitment is auto-resolved. Otherwise, it's flagged as a nudge with days elapsed and source context.
+
+**3. Pattern detection** — Analyzes the last 30 days of knowledge graph entries to spot recurring people, projects, and tags. Feeds the patterns into Gemini for interpretation — surfaces things like "pricing keeps coming up without resolution" or "you and Sarah have had 6 touchpoints this month."
+
+**4. Drift detection** — Flags open items (commitments, action items) and projects that haven't been mentioned in any meeting or email for 14+ days (configurable). Helps catch things that silently fell off the radar.
+
+Nudges are deduplicated via Firestore with a configurable cooldown (default 7 days) so you're never spammed with the same reminder.
 
 ### Tiered model routing
 
@@ -164,6 +180,19 @@ Cloud Scheduler ──► POST /meeting-debrief
                 │         (background)
                 ▼            ▼
           Google Chat    Firestore
+
+Cloud Scheduler ──► POST /meeting-prep
+                         │
+                ┌────────┴────────────────┐
+                ▼                         ▼
+        Calendar Service           Knowledge Graph
+      (upcoming meetings)         (people, projects,
+                │                  commitments)
+                └────────┬────────────────┘
+                         ▼
+                   Gemini (prep brief)
+                         ▼
+                   Google Chat
 ```
 
 ### Scheduled jobs (Cloud Scheduler)
@@ -172,6 +201,7 @@ Cloud Scheduler ──► POST /meeting-debrief
 Cloud Scheduler ──► POST /briefing           (daily at 8 AM)
 Cloud Scheduler ──► POST /email-alerts       (every 5 minutes)
 Cloud Scheduler ──► POST /meeting-debrief    (every 10 minutes, work hours)
+Cloud Scheduler ──► POST /meeting-prep       (every 10 minutes, work hours)
 One-time         ──► POST /knowledge-backfill (bootstrap knowledge graph)
 ```
 
@@ -194,6 +224,12 @@ One-time         ──► POST /knowledge-backfill (bootstrap knowledge graph)
 4. Sends a short debrief to Chat with key decisions and action items; marks meeting as debriefed
 5. Triggers background knowledge graph extraction for meetings with notes
 
+**`/meeting-prep`** — orchestrated by `proactive_intelligence.py`:
+1. Fetches upcoming meetings within the lookahead window (default 1 hour)
+2. For each unsent meeting, queries the knowledge graph for attendee history, open commitments, and related projects
+3. Generates a short prep brief via Gemini Flash with key context, open items, and talking points
+4. Posts the brief to Chat and marks it as sent in Firestore to prevent duplicates
+
 **`/knowledge-backfill`** — in `main.py`:
 1. Fetches the last 30 days of Granola meetings and recent inbox emails
 2. Batch-extracts entities (decisions, commitments, blockers, etc.) via Gemini Flash
@@ -210,6 +246,7 @@ momo/
 ├── main.py               # FastAPI app, endpoints, message handling, task action execution
 ├── gemini_service.py     # Gemini API wrapper; tiered model routing; system prompt; chat/briefing/debrief
 ├── knowledge_graph.py    # Entity extraction, Firestore storage, and query functions for institutional memory
+├── proactive_intelligence.py  # Proactive intelligence: pre-meeting prep, commitment follow-up, patterns, drift
 ├── briefing.py           # Morning briefing, proactive email alerts, post-meeting debrief pipelines
 ├── gmail_service.py      # Gmail API: fetch unread emails, search, format for context
 ├── calendar_service.py   # Google Calendar API: fetch today's events, recently ended meetings
@@ -258,10 +295,9 @@ Load conversation history from Firestore
     │
     ▼
 _build_context() — 7 concurrent workers:
-  - always: today's meetings + open tasks
+  - always: today's meetings + open tasks + knowledge graph
   - if email keywords: inbox emails + targeted search
-  - if meeting/notes keywords: Granola MCP query
-  - if history/commitment/decision keywords: knowledge graph query
+  - if meeting/notes keywords or specific entities detected: Granola MCP query
     │
     ▼
 Gemini chat_response() — tiered model routing:
@@ -420,6 +456,7 @@ After deploying:
    - `POST https://<url>/briefing` — daily at 8 AM (or your preferred time)
    - `POST https://<url>/email-alerts` — every 5 minutes
    - `POST https://<url>/meeting-debrief` — every 10 minutes during work hours (optional, requires Granola)
+   - `POST https://<url>/meeting-prep` — every 10 minutes during work hours (pre-meeting intelligence briefs)
 4. (One-time) Bootstrap the knowledge graph: `curl -X POST https://<url>/knowledge-backfill`
 
 ---
@@ -431,6 +468,8 @@ After deploying:
 | `conversations` | sanitized user ID | Stores up to 50 conversation turns per user |
 | `email_alerts` | Gmail message ID | Tracks which emails have already triggered an alert |
 | `meeting_debriefs` | Google Calendar event ID | Tracks which meetings have already been debriefed |
+| `meeting_prep_sent` | Google Calendar event ID | Tracks which meetings have had prep briefs sent |
+| `proactive_nudges_sent` | hashed nudge key | Deduplicates nudges with configurable cooldown window |
 | `knowledge_graph` | auto-generated | Extracted entities (decisions, commitments, blockers, etc.) with provenance |
 | `granola_auth` | `token` | Stores the Granola OAuth token for Cloud Run (auto-refreshed) |
 
@@ -453,6 +492,12 @@ After deploying:
 | `CLIENT_EMAIL_KEYWORDS` | No | `client,customer` | Keywords that identify client emails |
 | `CLIENT_DOMAINS` | No | — | Comma-separated domains to treat as clients |
 | `KNOWLEDGE_GRAPH_ENABLED` | No | `true` | Toggle knowledge graph extraction and querying |
+| `PROACTIVE_INTELLIGENCE_ENABLED` | No | `true` | Toggle proactive intelligence engines (nudges, prep, drift) |
+| `MEETING_PREP_ENABLED` | No | `true` | Toggle pre-meeting prep briefs |
+| `MEETING_PREP_LOOKAHEAD_HOURS` | No | `1` | How far ahead to look for upcoming meetings to prep |
+| `COMMITMENT_FOLLOWUP_DAYS` | No | `3` | Days before an open commitment triggers a follow-up nudge |
+| `DRIFT_THRESHOLD_DAYS` | No | `14` | Days of inactivity before flagging a project/item as stale |
+| `NUDGE_COOLDOWN_DAYS` | No | `7` | Minimum days between repeat nudges for the same item |
 | `GEMINI_MODEL_FLASH` | No | `gemini-3-flash-preview` | Model for standard/light tasks |
 | `GEMINI_MODEL_PRO` | No | `gemini-3.1-pro-preview` | Model for deep reasoning (knowledge graph queries) |
 | `GRANOLA_ENABLED` | No | `false` | Enable Granola meeting notes integration |
