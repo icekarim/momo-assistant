@@ -17,7 +17,6 @@ permissions:
   pull-requests: write
 
 jobs:
-  # Job for non-main branches - create PR and merge
   auto-pr-merge:
     runs-on: ubuntu-latest
     if: github.ref != 'refs/heads/main'
@@ -55,19 +54,23 @@ jobs:
         id: pr_content
         run: |
           BRANCH_NAME="${{ steps.branch.outputs.name }}"
-          
-          # Extract PR title from branch name
           TITLE=$(echo "$BRANCH_NAME" | sed 's/[-_]/ /g' | sed 's/\b\(.\)/\u\1/g')
-          
-          # Generate body from recent commits
-          BODY="## Changes\n\n"
-          BODY+="$(git log origin/main..HEAD --pretty=format:'- %s' 2>/dev/null || echo '- Initial changes')"
-          BODY+="\n\n---\n*Auto-generated PR by cloud agent*"
+          COMMITS=$(git log origin/main..HEAD --pretty=format:'- %s' 2>/dev/null || echo '- Initial changes')
           
           echo "title=$TITLE" >> $GITHUB_OUTPUT
-          echo "body<<EOF" >> $GITHUB_OUTPUT
-          echo -e "$BODY" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          
+          cat > /tmp/pr_body.md << 'PREOF'
+          ## Changes
+          
+          PREOF
+          echo "$COMMITS" >> /tmp/pr_body.md
+          cat >> /tmp/pr_body.md << 'PREOF'
+          
+          ---
+          *Auto-generated PR by cloud agent*
+          PREOF
+          
+          echo "body_file=/tmp/pr_body.md" >> $GITHUB_OUTPUT
 
       - name: Create Pull Request
         id: create_pr
@@ -77,7 +80,7 @@ jobs:
         run: |
           PR_URL=$(gh pr create \
             --title "${{ steps.pr_content.outputs.title }}" \
-            --body "${{ steps.pr_content.outputs.body }}" \
+            --body-file "${{ steps.pr_content.outputs.body_file }}" \
             --base main \
             --head "${{ steps.branch.outputs.name }}" \
             2>&1) || true
@@ -93,76 +96,6 @@ jobs:
             echo "Failed to create PR: $PR_URL"
           fi
 
-      # Notify PR Created - Slack
-      - name: Notify Slack - PR Created
-        if: steps.create_pr.outputs.created == 'true' && env.SLACK_WEBHOOK_URL != ''
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        run: |
-          curl -X POST "$SLACK_WEBHOOK_URL" \
-            -H 'Content-type: application/json' \
-            -d '{
-              "text": "🔀 *PR Created*",
-              "blocks": [
-                {
-                  "type": "section",
-                  "text": {
-                    "type": "mrkdwn",
-                    "text": "🔀 *New Pull Request Created*\n*Branch:* `${{ steps.branch.outputs.name }}`\n*PR:* #${{ steps.create_pr.outputs.number }}\n*Title:* ${{ steps.pr_content.outputs.title }}"
-                  }
-                },
-                {
-                  "type": "actions",
-                  "elements": [
-                    {
-                      "type": "button",
-                      "text": {"type": "plain_text", "text": "View PR"},
-                      "url": "${{ steps.create_pr.outputs.url }}"
-                    }
-                  ]
-                }
-              ]
-            }'
-
-      # Notify PR Created - Discord
-      - name: Notify Discord - PR Created
-        if: steps.create_pr.outputs.created == 'true' && env.DISCORD_WEBHOOK_URL != ''
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: |
-          curl -X POST "$DISCORD_WEBHOOK_URL" \
-            -H 'Content-type: application/json' \
-            -d '{
-              "embeds": [{
-                "title": "🔀 New Pull Request Created",
-                "color": 3447003,
-                "fields": [
-                  {"name": "Branch", "value": "`${{ steps.branch.outputs.name }}`", "inline": true},
-                  {"name": "PR Number", "value": "#${{ steps.create_pr.outputs.number }}", "inline": true},
-                  {"name": "Title", "value": "${{ steps.pr_content.outputs.title }}"}
-                ],
-                "url": "${{ steps.create_pr.outputs.url }}"
-              }]
-            }'
-
-      # Notify PR Created - Custom Webhook
-      - name: Notify Custom Webhook - PR Created
-        if: steps.create_pr.outputs.created == 'true' && env.CUSTOM_WEBHOOK_URL != ''
-        env:
-          CUSTOM_WEBHOOK_URL: ${{ secrets.CUSTOM_WEBHOOK_URL }}
-        run: |
-          curl -X POST "$CUSTOM_WEBHOOK_URL" \
-            -H 'Content-type: application/json' \
-            -d '{
-              "event": "pr_created",
-              "repository": "${{ github.repository }}",
-              "branch": "${{ steps.branch.outputs.name }}",
-              "pr_number": "${{ steps.create_pr.outputs.number }}",
-              "pr_url": "${{ steps.create_pr.outputs.url }}",
-              "title": "${{ steps.pr_content.outputs.title }}",
-              "timestamp": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"
-            }'
-
       - name: Wait for checks to pass
         id: wait_checks
         env:
@@ -177,7 +110,6 @@ jobs:
           
           echo "Waiting for checks on PR #$PR_NUMBER..."
           
-          # Wait up to 5 minutes for checks to complete
           for i in {1..30}; do
             STATUS=$(gh pr checks "$PR_NUMBER" --json state --jq '.[] | select(.state != "SUCCESS" and .state != "SKIPPED") | .state' 2>/dev/null | head -1 || echo "")
             
@@ -196,7 +128,7 @@ jobs:
 
       - name: Auto-merge PR
         id: merge_pr
-        if: (github.event_name == 'push' || github.event.inputs.auto_merge == 'true')
+        if: github.event_name == 'push' || github.event.inputs.auto_merge == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -209,75 +141,14 @@ jobs:
           
           echo "Merging PR #$PR_NUMBER..."
           
-          # Enable auto-merge or merge directly
           if gh pr merge "$PR_NUMBER" --squash --auto --delete-branch 2>/dev/null; then
             echo "merged=true" >> $GITHUB_OUTPUT
-            echo "method=auto-merge" >> $GITHUB_OUTPUT
           elif gh pr merge "$PR_NUMBER" --squash --delete-branch 2>/dev/null; then
             echo "merged=true" >> $GITHUB_OUTPUT
-            echo "method=direct" >> $GITHUB_OUTPUT
           else
             echo "merged=false" >> $GITHUB_OUTPUT
             echo "Could not merge PR (may need manual review)"
           fi
-
-      # Notify PR Merged - Slack
-      - name: Notify Slack - PR Merged
-        if: steps.merge_pr.outputs.merged == 'true' && env.SLACK_WEBHOOK_URL != ''
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        run: |
-          curl -X POST "$SLACK_WEBHOOK_URL" \
-            -H 'Content-type: application/json' \
-            -d '{
-              "text": "✅ *PR Merged*",
-              "blocks": [
-                {
-                  "type": "section",
-                  "text": {
-                    "type": "mrkdwn",
-                    "text": "✅ *Pull Request Merged*\n*Branch:* `${{ steps.branch.outputs.name }}`\n*PR:* #${{ steps.check_pr.outputs.number || steps.create_pr.outputs.number }}\n*Method:* ${{ steps.merge_pr.outputs.method }}"
-                  }
-                }
-              ]
-            }'
-
-      # Notify PR Merged - Discord
-      - name: Notify Discord - PR Merged
-        if: steps.merge_pr.outputs.merged == 'true' && env.DISCORD_WEBHOOK_URL != ''
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: |
-          curl -X POST "$DISCORD_WEBHOOK_URL" \
-            -H 'Content-type: application/json' \
-            -d '{
-              "embeds": [{
-                "title": "✅ Pull Request Merged",
-                "color": 5763719,
-                "fields": [
-                  {"name": "Branch", "value": "`${{ steps.branch.outputs.name }}`", "inline": true},
-                  {"name": "PR Number", "value": "#${{ steps.check_pr.outputs.number || steps.create_pr.outputs.number }}", "inline": true},
-                  {"name": "Method", "value": "${{ steps.merge_pr.outputs.method }}"}
-                ]
-              }]
-            }'
-
-      # Notify PR Merged - Custom Webhook
-      - name: Notify Custom Webhook - PR Merged
-        if: steps.merge_pr.outputs.merged == 'true' && env.CUSTOM_WEBHOOK_URL != ''
-        env:
-          CUSTOM_WEBHOOK_URL: ${{ secrets.CUSTOM_WEBHOOK_URL }}
-        run: |
-          curl -X POST "$CUSTOM_WEBHOOK_URL" \
-            -H 'Content-type: application/json' \
-            -d '{
-              "event": "pr_merged",
-              "repository": "${{ github.repository }}",
-              "branch": "${{ steps.branch.outputs.name }}",
-              "pr_number": "${{ steps.check_pr.outputs.number || steps.create_pr.outputs.number }}",
-              "merge_method": "${{ steps.merge_pr.outputs.method }}",
-              "timestamp": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"
-            }'
 
       - name: Summary
         run: |
@@ -288,7 +159,6 @@ jobs:
           echo "- **PR Number:** ${{ steps.check_pr.outputs.number || steps.create_pr.outputs.number }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Merged:** ${{ steps.merge_pr.outputs.merged || 'N/A' }}" >> $GITHUB_STEP_SUMMARY
 
-  # Job for main branch - detect changes, create branch, then PR
   main-branch-changes:
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
@@ -308,7 +178,6 @@ jobs:
       - name: Check for uncommitted changes
         id: check_changes
         run: |
-          # Check for uncommitted changes
           if [ -n "$(git status --porcelain)" ]; then
             echo "has_uncommitted=true" >> $GITHUB_OUTPUT
             echo "Uncommitted changes detected:"
@@ -317,7 +186,6 @@ jobs:
             echo "has_uncommitted=false" >> $GITHUB_OUTPUT
           fi
           
-          # Get the latest commit info
           COMMIT_SHA="${{ github.sha }}"
           COMMIT_MSG=$(git log -1 --pretty=format:'%s')
           echo "commit_sha=$COMMIT_SHA" >> $GITHUB_OUTPUT
@@ -334,15 +202,9 @@ jobs:
           BRANCH_NAME="auto/main-changes-${TIMESTAMP}"
           
           echo "Creating branch: $BRANCH_NAME"
-          
-          # Create new branch
           git checkout -b "$BRANCH_NAME"
-          
-          # Stage and commit all changes
           git add -A
           git commit -m "Auto: Capture uncommitted changes from main"
-          
-          # Push the branch
           git push -u origin "$BRANCH_NAME"
           
           echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
@@ -356,14 +218,18 @@ jobs:
         run: |
           BRANCH_NAME="${{ steps.create_branch.outputs.branch_name }}"
           
+          cat > /tmp/pr_body.md << 'PREOF'
+          ## Automated Changes
+          
+          This PR contains changes that were detected on the main branch and automatically branched for review.
+          
+          ---
+          *Auto-generated by cloud agent*
+          PREOF
+          
           PR_OUTPUT=$(gh pr create \
             --title "Auto: Changes captured from main" \
-            --body "## Automated Changes
-
-This PR contains changes that were detected on the main branch and automatically branched for review.
-
----
-*Auto-generated by cloud agent*" \
+            --body-file /tmp/pr_body.md \
             --base main \
             --head "$BRANCH_NAME" \
             2>&1) || true
@@ -376,57 +242,6 @@ This PR contains changes that were detected on the main branch and automatically
             echo "url=$PR_URL" >> $GITHUB_OUTPUT
             echo "created=true" >> $GITHUB_OUTPUT
           fi
-
-      # Notify PR Created from Main - Slack
-      - name: Notify Slack - Main Branch PR Created
-        if: steps.create_pr.outputs.created == 'true' && env.SLACK_WEBHOOK_URL != ''
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        run: |
-          curl -X POST "$SLACK_WEBHOOK_URL" \
-            -H 'Content-type: application/json' \
-            -d '{
-              "text": "🔀 *PR Created from Main*",
-              "blocks": [
-                {
-                  "type": "section",
-                  "text": {
-                    "type": "mrkdwn",
-                    "text": "🔀 *Changes Detected on Main - PR Created*\n*Branch:* `${{ steps.create_branch.outputs.branch_name }}`\n*PR:* #${{ steps.create_pr.outputs.number }}"
-                  }
-                },
-                {
-                  "type": "actions",
-                  "elements": [
-                    {
-                      "type": "button",
-                      "text": {"type": "plain_text", "text": "View PR"},
-                      "url": "${{ steps.create_pr.outputs.url }}"
-                    }
-                  ]
-                }
-              ]
-            }'
-
-      # Notify PR Created from Main - Discord
-      - name: Notify Discord - Main Branch PR Created
-        if: steps.create_pr.outputs.created == 'true' && env.DISCORD_WEBHOOK_URL != ''
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: |
-          curl -X POST "$DISCORD_WEBHOOK_URL" \
-            -H 'Content-type: application/json' \
-            -d '{
-              "embeds": [{
-                "title": "🔀 Changes Detected on Main - PR Created",
-                "color": 15105570,
-                "fields": [
-                  {"name": "Branch", "value": "`${{ steps.create_branch.outputs.branch_name }}`", "inline": true},
-                  {"name": "PR Number", "value": "#${{ steps.create_pr.outputs.number }}", "inline": true}
-                ],
-                "url": "${{ steps.create_pr.outputs.url }}"
-              }]
-            }'
 
       - name: Merge PR
         id: merge_pr
@@ -443,46 +258,6 @@ This PR contains changes that were detected on the main branch and automatically
           else
             echo "merged=false" >> $GITHUB_OUTPUT
           fi
-
-      # Notify PR Merged from Main - Slack
-      - name: Notify Slack - Main Branch PR Merged
-        if: steps.merge_pr.outputs.merged == 'true' && env.SLACK_WEBHOOK_URL != ''
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        run: |
-          curl -X POST "$SLACK_WEBHOOK_URL" \
-            -H 'Content-type: application/json' \
-            -d '{
-              "text": "✅ *Main Branch PR Merged*",
-              "blocks": [
-                {
-                  "type": "section",
-                  "text": {
-                    "type": "mrkdwn",
-                    "text": "✅ *Main Branch PR Merged*\n*Branch:* `${{ steps.create_branch.outputs.branch_name }}`\n*PR:* #${{ steps.create_pr.outputs.number }}"
-                  }
-                }
-              ]
-            }'
-
-      # Notify PR Merged from Main - Discord
-      - name: Notify Discord - Main Branch PR Merged
-        if: steps.merge_pr.outputs.merged == 'true' && env.DISCORD_WEBHOOK_URL != ''
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: |
-          curl -X POST "$DISCORD_WEBHOOK_URL" \
-            -H 'Content-type: application/json' \
-            -d '{
-              "embeds": [{
-                "title": "✅ Main Branch PR Merged",
-                "color": 5763719,
-                "fields": [
-                  {"name": "Branch", "value": "`${{ steps.create_branch.outputs.branch_name }}`", "inline": true},
-                  {"name": "PR Number", "value": "#${{ steps.create_pr.outputs.number }}", "inline": true}
-                ]
-              }]
-            }'
 
       - name: Summary
         run: |
