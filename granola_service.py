@@ -346,15 +346,42 @@ def query_granola(query: str) -> str:
 
 
 def fetch_yesterday_meeting_notes() -> str:
-    """Fetch notes for all of yesterday's meetings (used in morning briefings)."""
+    """Fetch notes for yesterday's meetings via list_meetings + batch fetch.
+
+    Uses the same reliable list→batch path as the debrief flow instead of
+    the flaky query_granola_meetings semantic search.
+    """
+    import re
     yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    weekday = datetime.now().weekday()
+
     try:
-        notes = get_granola_meeting_notes(
-            f"meetings from {yesterday} with action items and key decisions"
-        )
-        return notes if notes else ""
+        time_range = "last_week" if weekday == 0 else "this_week"
+        xml = list_granola_meetings(time_range)
+        if not xml:
+            return ""
+
+        all_ids = []
+        yesterday_ids = []
+        for tag in re.finditer(r'<meeting\s+([^>]+)>', xml):
+            attrs = dict(re.findall(r'(\w+)="([^"]*)"', tag.group(1)))
+            mid = attrs.get("id")
+            if not mid:
+                continue
+            all_ids.append(mid)
+            date_val = attrs.get("date", "") or attrs.get("start_date", "")
+            if yesterday in date_val:
+                yesterday_ids.append(mid)
+
+        target_ids = yesterday_ids if yesterday_ids else all_ids
+        if not target_ids:
+            return ""
+
+        notes_by_id = fetch_meeting_notes_batch(target_ids[:10])
+        return "\n\n".join(notes_by_id.values()).strip()
+
     except Exception as exc:
-        print(f"Granola: error fetching yesterday's notes: {exc}")
+        print(f"Granola: error fetching yesterday's notes via list+batch: {exc}")
         return ""
 
 
