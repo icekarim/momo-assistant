@@ -81,6 +81,7 @@ GRANOLA_MCP_URL = os.getenv("GRANOLA_MCP_URL", "https://mcp.granola.ai/mcp")
 GRANOLA_TOKEN = os.getenv("GRANOLA_TOKEN", "")
 MEETING_DEBRIEF_LOOKBACK_MINUTES = int(os.getenv("MEETING_DEBRIEF_LOOKBACK_MINUTES", "120"))
 MEETING_DEBRIEF_GRACE_MINUTES = int(os.getenv("MEETING_DEBRIEF_GRACE_MINUTES", "45"))
+MEETING_DEBRIEF_MIN_WAIT_MINUTES = int(os.getenv("MEETING_DEBRIEF_MIN_WAIT_MINUTES", "5"))
 
 # ── Server ───────────────────────────────────────────────────
 PORT = int(os.getenv("PORT", "8080"))

@@ -253,6 +253,7 @@ def run_post_meeting_debrief():
     sent_count = 0
     deferred_count = 0
 
+    min_wait = config.MEETING_DEBRIEF_MIN_WAIT_MINUTES
     pending = []
     for meeting in ended:
         event_id = meeting.get("id", "")
@@ -263,6 +264,9 @@ def run_post_meeting_debrief():
             minutes_since_end = (now - end_dt).total_seconds() / 60
         except (ValueError, TypeError):
             minutes_since_end = 0
+        if minutes_since_end < min_wait:
+            print(f"  Skipping {meeting['title']}: only {minutes_since_end:.0f}m since end, waiting at least {min_wait}m")
+            continue
         pending.append((meeting, minutes_since_end))
 
     if not pending:
@@ -301,6 +305,12 @@ def run_post_meeting_debrief():
         title = meeting["title"]
         attendees = [a["name"] for a in meeting.get("attendees", [])]
         granola_notes = notes_by_id.get(mid, "")
+
+        if granola_notes:
+            import re as _re
+            stripped = _re.sub(r'<[^>]+>', '', granola_notes).strip()
+            if len(stripped) < 20:
+                granola_notes = ""
 
         print(f"  Checking debrief for: {title} (scheduled end was {minutes_since_end:.0f}m ago)")
 
