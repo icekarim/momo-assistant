@@ -659,6 +659,7 @@ def _extract_search_terms(user_message):
         "whats", "hows", "anything", "give", "get", "got", "has", "have", "had",
         "been", "their", "there", "they", "this", "that", "those", "these",
         "up", "out", "all", "some", "just", "like", "know", "see", "want",
+        "right", "now", "currently", "latest", "recent", "recently", "so",
     }
     words = re.findall(r'\b[a-zA-Z0-9]+\b', user_message.lower())
     keywords = [w for w in words if w not in stopwords and len(w) > 1]
@@ -690,9 +691,11 @@ def _build_context(user_message):
         "debrief", "takeaways", "decisions", "follow up", "follow-up",
     ]
     wants_meeting_notes = any(kw in lower for kw in meeting_keywords)
-    wants_granola = config.GRANOLA_ENABLED and (wants_meeting_notes or is_general)
 
     search_terms = _extract_search_terms(user_message)
+    has_specific_entity = bool(search_terms)
+
+    wants_granola = config.GRANOLA_ENABLED and (wants_meeting_notes or is_general or has_specific_entity)
 
     def _fetch_meetings():
         meetings = fetch_todays_meetings()
@@ -720,7 +723,10 @@ def _build_context(user_message):
         "outstanding commitment", "blocker", "blocked on",
         "what did we decide", "what was decided",
     ]
-    wants_knowledge = config.KNOWLEDGE_GRAPH_ENABLED and any(kw in lower for kw in knowledge_keywords)
+    wants_knowledge = config.KNOWLEDGE_GRAPH_ENABLED and (
+        any(kw in lower for kw in knowledge_keywords)
+        or (has_specific_entity and is_general)
+    )
 
     def _fetch_knowledge():
         from knowledge_graph import query_knowledge_graph
