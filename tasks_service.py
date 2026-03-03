@@ -144,6 +144,39 @@ def delete_task(task_title):
     return {"title": title, "list_name": list_name, "status": "deleted"}
 
 
+def find_completed_task(title_query, days_back=30):
+    """Check if a task matching the title was recently completed.
+    Returns the task dict if found, else None."""
+    svc = get_tasks_service()
+    title_lower = title_query.lower().strip()
+
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).isoformat()
+
+    lists_resp = svc.tasklists().list(maxResults=100).execute()
+    for tl in lists_resp.get("items", []):
+        tasks_resp = svc.tasks().list(
+            tasklist=tl["id"],
+            showCompleted=True,
+            showHidden=True,
+            completedMin=cutoff,
+            maxResults=100,
+        ).execute()
+
+        for task in tasks_resp.get("items", []):
+            task_title = (task.get("title", "") or "").strip()
+            if not task_title or task.get("status") != "completed":
+                continue
+            if title_lower in task_title.lower() or task_title.lower() in title_lower:
+                return {
+                    "id": task["id"],
+                    "title": task_title,
+                    "list_name": tl["title"],
+                    "status": "completed",
+                }
+    return None
+
+
 def _find_task_by_title(svc, title_query):
     """Find a task by fuzzy title match. Returns (task_id, tasklist_id, list_name) or (None, None, None)."""
     title_lower = title_query.lower().strip()
