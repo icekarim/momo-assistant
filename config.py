@@ -65,6 +65,16 @@ MAX_CONVERSATION_TURNS = 50
 # ── Knowledge Graph ──────────────────────────────────────────
 KNOWLEDGE_GRAPH_ENABLED = os.getenv("KNOWLEDGE_GRAPH_ENABLED", "true").lower() == "true"
 
+# ── Proactive Intelligence ───────────────────────────────────
+PROACTIVE_INTELLIGENCE_ENABLED = os.getenv("PROACTIVE_INTELLIGENCE_ENABLED", "true").lower() == "true"
+MEETING_PREP_ENABLED = os.getenv("MEETING_PREP_ENABLED", "true").lower() == "true"
+MEETING_PREP_LOOKAHEAD_HOURS = int(os.getenv("MEETING_PREP_LOOKAHEAD_HOURS", "1"))
+COMMITMENT_FOLLOWUP_DAYS = int(os.getenv("COMMITMENT_FOLLOWUP_DAYS", "3"))
+DRIFT_THRESHOLD_DAYS = int(os.getenv("DRIFT_THRESHOLD_DAYS", "14"))
+NUDGE_COOLDOWN_DAYS = int(os.getenv("NUDGE_COOLDOWN_DAYS", "7"))
+FIRESTORE_MEETING_PREP_COLLECTION = "meeting_prep_sent"
+FIRESTORE_NUDGES_COLLECTION = "proactive_nudges_sent"
+
 # ── Granola MCP ──────────────────────────────────────────────
 GRANOLA_ENABLED = os.getenv("GRANOLA_ENABLED", "false").lower() == "true"
 GRANOLA_MCP_URL = os.getenv("GRANOLA_MCP_URL", "https://mcp.granola.ai/mcp")
