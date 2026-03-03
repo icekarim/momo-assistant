@@ -8,7 +8,10 @@ set -e
 #   export CHAT_SPACE_ID="spaces/XXXXXXXXX"
 PROJECT_ID="${PROJECT_ID:?PROJECT_ID env var is required}"
 GEMINI_API_KEY="${GEMINI_API_KEY:?GEMINI_API_KEY env var is required}"
-CHAT_SPACE_ID="${CHAT_SPACE_ID:-}"
+CHAT_SPACE_ID="${CHAT_SPACE_ID:-$(grep '^CHAT_SPACE_ID=' .env 2>/dev/null | cut -d= -f2)}"
+if [ -z "$CHAT_SPACE_ID" ]; then
+  echo "WARNING: CHAT_SPACE_ID is not set. Briefings will print to console only."
+fi
 REGION="us-central1"
 SERVICE_NAME="momo"
 # ─────────────────────────────────────────────────────────────
