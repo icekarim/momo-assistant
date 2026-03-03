@@ -294,6 +294,36 @@ def query_recent(days: int = 7, limit: int = 50) -> list[dict]:
     return [_doc_to_dict(doc) for doc in query.stream()]
 
 
+def query_open_by_age(min_days: int = 3, limit: int = 50) -> list[dict]:
+    """Open commitments/action items older than min_days."""
+    from datetime import timedelta
+    cutoff = (datetime.now() - timedelta(days=min_days)).strftime("%Y-%m-%d")
+    db = get_db()
+    query = (
+        db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
+        .where(filter=FieldFilter("entity_type", "in", ["commitment", "action_item"]))
+        .where(filter=FieldFilter("status", "==", "open"))
+        .order_by("source_date", direction="ASCENDING")
+        .limit(limit)
+    )
+    results = []
+    for doc in query.stream():
+        d = _doc_to_dict(doc)
+        if d.get("source_date", "9999") <= cutoff:
+            results.append(d)
+    return results
+
+
+def update_entity_status(doc_id: str, new_status: str):
+    """Update the status of a knowledge graph entity (e.g. open -> resolved)."""
+    db = get_db()
+    doc_ref = db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION).document(doc_id)
+    doc_ref.update({
+        "status": new_status,
+        "status_updated_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+
 def _doc_to_dict(doc) -> dict:
     d = doc.to_dict()
     d["id"] = doc.id

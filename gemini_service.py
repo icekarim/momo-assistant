@@ -112,6 +112,13 @@ keep it tight. only include stuff that matters for today.
 🎯 *momo's picks for today*
 3-5 most important actions. be opinionated. use priority colors. factor in yesterday's meeting action items.
 
+🔔 *momo's nudges*
+if proactive nudges are provided in context, include them as a section:
+- open commitments that haven't been followed up on — mention how many days ago and what was promised
+- patterns spotted across meetings (recurring topics, frequent collaborators)
+- stale projects or items that have gone quiet
+keep each nudge to 1-2 lines. use priority colors. if no nudges are provided, skip this section entirely.
+
 === CRITICAL RULES — NEVER BREAK THESE ===
 - NEVER fabricate, invent, or hallucinate emails, meetings, tasks, or any data.
 - ONLY reference emails, meetings, and tasks that appear in the CONTEXT provided to you.
@@ -221,7 +228,7 @@ def _get_model(complexity: TaskComplexity = TaskComplexity.STANDARD,
 
 
 def generate_morning_briefing(emails_context, meetings_context, tasks_context,
-                               granola_context=""):
+                               granola_context="", nudges_context=""):
     """Generate the morning briefing summary."""
     from datetime import datetime
 
@@ -235,6 +242,14 @@ def generate_morning_briefing(emails_context, meetings_context, tasks_context,
 {granola_context}
 """
 
+    nudges_section = ""
+    if nudges_context:
+        nudges_section = f"""
+
+=== MOMO'S PROACTIVE NUDGES (commitments, patterns, stale items) ===
+{nudges_context}
+"""
+
     prompt = f"""Today is {today}. Here's everything for my morning briefing:
 
 === TODAY'S MEETINGS ===
@@ -245,7 +260,7 @@ def generate_morning_briefing(emails_context, meetings_context, tasks_context,
 
 === UNREAD CLIENT EMAILS ===
 {emails_context}
-{granola_section}
+{granola_section}{nudges_section}
 Please create my morning briefing."""
 
     model = _get_model()

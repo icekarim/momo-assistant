@@ -51,7 +51,20 @@ def run_morning_briefing():
         except Exception as e:
             print(f"     Granola fetch failed: {e}")
 
-    if not emails and not meetings and not tasks and not granola_ctx:
+    nudges_ctx = ""
+    if config.PROACTIVE_INTELLIGENCE_ENABLED and config.KNOWLEDGE_GRAPH_ENABLED:
+        print("  Running proactive intelligence engines...")
+        try:
+            from proactive_intelligence import generate_daily_nudges
+            nudges_ctx = generate_daily_nudges()
+            if nudges_ctx:
+                print(f"     Nudges generated ({len(nudges_ctx)} chars)")
+            else:
+                print("     No nudges to report")
+        except Exception as e:
+            print(f"     Proactive intelligence failed: {e}")
+
+    if not emails and not meetings and not tasks and not granola_ctx and not nudges_ctx:
         print("  Nothing to report. Skipping.")
         return {"status": "skipped", "reason": "nothing to report"}
 
@@ -61,7 +74,8 @@ def run_morning_briefing():
 
     print("  Generating briefing with Gemini...")
     summary = generate_morning_briefing(
-        emails_ctx, meetings_ctx, tasks_ctx, granola_context=granola_ctx,
+        emails_ctx, meetings_ctx, tasks_ctx,
+        granola_context=granola_ctx, nudges_context=nudges_ctx,
     )
 
     if config.CHAT_SPACE_ID:
