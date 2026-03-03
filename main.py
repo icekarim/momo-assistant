@@ -6,6 +6,7 @@ Endpoints:
   POST /briefing           — Trigger morning briefing (called by Cloud Scheduler)
   POST /email-alerts       — Trigger proactive important email checks
   POST /meeting-debrief    — Post-meeting debrief with Granola notes (Cloud Scheduler)
+  POST /meeting-prep       — Pre-meeting prep briefs with KG context (Cloud Scheduler)
   POST /knowledge-backfill — Backfill knowledge graph from recent meetings/emails
   GET  /health             — Health check
 """
@@ -169,6 +170,21 @@ async def trigger_meeting_debrief():
     Sends short debriefs for recently ended meetings using Granola notes."""
     try:
         result = run_post_meeting_debrief()
+        return result
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Pre-Meeting Prep Trigger ─────────────────────────────────
+
+@app.post("/meeting-prep")
+async def trigger_meeting_prep():
+    """Called by Cloud Scheduler every ~10 min during work hours.
+    Sends pre-meeting prep briefs for upcoming meetings using KG context."""
+    try:
+        from proactive_intelligence import run_meeting_prep
+        result = run_meeting_prep()
         return result
     except Exception as e:
         traceback.print_exc()
@@ -399,6 +415,19 @@ def _process_message_background(text, user_id, space):
 
         add_turn(user_id, "user", text)
         add_turn(user_id, "assistant", clean_response)
+
+        if config.KNOWLEDGE_GRAPH_ENABLED:
+            from datetime import datetime as _dt
+            from knowledge_graph import extract_and_store_background
+            _now = _dt.now()
+            extract_and_store_background(
+                source_type="chat",
+                source_id=f"chat-{user_id}-{_now.strftime('%Y%m%d%H%M%S')}",
+                source_title="Chat message",
+                source_date=_now.strftime("%Y-%m-%d"),
+                content=text,
+                attendees=[],
+            )
 
         formatted = format_for_google_chat(full_response)
         send_chat_message(space, formatted)
@@ -717,16 +746,7 @@ def _build_context(user_message):
         from granola_service import query_granola
         return "granola", query_granola(user_message)
 
-    knowledge_keywords = [
-        "history of", "full story", "what happened with", "changed since",
-        "last time we", "committed to", "promised to", "commitment",
-        "outstanding commitment", "blocker", "blocked on",
-        "what did we decide", "what was decided",
-    ]
-    wants_knowledge = config.KNOWLEDGE_GRAPH_ENABLED and (
-        any(kw in lower for kw in knowledge_keywords)
-        or (has_specific_entity and is_general)
-    )
+    wants_knowledge = config.KNOWLEDGE_GRAPH_ENABLED
 
     def _fetch_knowledge():
         from knowledge_graph import query_knowledge_graph

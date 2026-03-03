@@ -99,3 +99,54 @@ def mark_debrief_sent(calendar_event_id, meeting_title):
             "sent_at": datetime.now(timezone.utc).isoformat(),
         }
     )
+
+
+def has_prep_been_sent(calendar_event_id):
+    """Return True if a pre-meeting prep was already sent for this event."""
+    db = get_db()
+    doc = db.collection(config.FIRESTORE_MEETING_PREP_COLLECTION).document(calendar_event_id).get()
+    return doc.exists
+
+
+def mark_prep_sent(calendar_event_id, meeting_title):
+    """Record that a meeting prep was sent so we don't send it again."""
+    db = get_db()
+    db.collection(config.FIRESTORE_MEETING_PREP_COLLECTION).document(calendar_event_id).set(
+        {
+            "event_id": calendar_event_id,
+            "title": meeting_title,
+            "sent_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+
+
+def has_nudge_been_sent(nudge_key):
+    """Return True if this nudge was already sent within the cooldown window."""
+    db = get_db()
+    doc = db.collection(config.FIRESTORE_NUDGES_COLLECTION).document(nudge_key).get()
+    if not doc.exists:
+        return False
+    data = doc.to_dict()
+    sent_at = data.get("sent_at", "")
+    if not sent_at:
+        return False
+    try:
+        sent_dt = datetime.fromisoformat(sent_at)
+        from datetime import timedelta
+        cooldown = timedelta(days=config.NUDGE_COOLDOWN_DAYS)
+        return (datetime.now(timezone.utc) - sent_dt) < cooldown
+    except (ValueError, TypeError):
+        return False
+
+
+def mark_nudge_sent(nudge_key, nudge_type, title):
+    """Record that a nudge was sent to enforce cooldown."""
+    db = get_db()
+    db.collection(config.FIRESTORE_NUDGES_COLLECTION).document(nudge_key).set(
+        {
+            "nudge_key": nudge_key,
+            "nudge_type": nudge_type,
+            "title": title,
+            "sent_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
