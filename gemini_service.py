@@ -377,6 +377,11 @@ Format:
 - action items as a bullet list with owner if known (use 🔴 for urgent, 🟡 for normal)
 - if no notes were captured, just mention the meeting ended and who attended — skip the summary and action items
 
+After the debrief text, suggest follow-up tasks using ONLY this tag format (one per line):
+[CREATE_TASK] title="Task title here" due="YYYY-MM-DD"
+Only suggest tasks that are clearly actionable from the meeting. Set due dates based on any mentioned deadlines, or default to one week from now.
+Do NOT include any other text on the same line as a [CREATE_TASK] tag.
+
 Keep it tight — this goes to Google Chat right after the meeting. No fluff."""
 
     model = _get_model()

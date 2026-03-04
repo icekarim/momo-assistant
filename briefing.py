@@ -253,6 +253,43 @@ def _gemini_triage_emails(emails):
     return flagged
 
 
+def _process_debrief_tasks(debrief_text, meeting_title=""):
+    """Parse [CREATE_TASK] tags from a debrief, store them as pending
+    proposals for user confirmation, and return cleaned text with a
+    nicely formatted suggestion section replacing the raw tags."""
+    import re
+    from conversation_store import store_pending_tasks
+
+    pattern = r'\[CREATE_TASK\]\s*title="([^"]+)"(?:\s*due="([^"]*)")?(?:\s*notes="([^"]*)")?'
+    matches = list(re.finditer(pattern, debrief_text))
+    if not matches:
+        return debrief_text
+
+    cleaned = re.sub(r'\[CREATE_TASK\][^\n]*\n?', '', debrief_text).rstrip()
+
+    pending = []
+    suggestion_lines = []
+    for match in matches:
+        title = match.group(1)
+        due = match.group(2) or None
+        notes = match.group(3) or ""
+        task = {"title": title}
+        if due:
+            task["due"] = due
+        if notes:
+            task["notes"] = notes
+        pending.append(task)
+        due_str = f" (due {due})" if due else ""
+        suggestion_lines.append(f"  • {title}{due_str}")
+
+    store_pending_tasks(pending, meeting_title=meeting_title)
+
+    cleaned += "\n\n📋 *Suggested tasks:*\n" + "\n".join(suggestion_lines)
+    cleaned += "\n\n_Reply *yes* to create these tasks_"
+
+    return cleaned
+
+
 def run_post_meeting_debrief():
     """Check for recently ended meetings and send short debriefs with Granola notes.
 
@@ -358,6 +395,7 @@ def run_post_meeting_debrief():
             end_time = meeting.get("end_time", "")
             event_id = meeting.get("id", "")
             debrief = generate_post_meeting_debrief(title, attendees, granola_notes, end_time)
+            debrief = _process_debrief_tasks(debrief, meeting_title=title)
             formatted = format_for_google_chat(debrief)
             send_chat_message(config.CHAT_SPACE_ID, formatted)
             mark_debrief_sent(event_id, title)
@@ -387,6 +425,7 @@ def run_post_meeting_debrief():
             try:
                 end_time = meeting.get("end_time", "")
                 debrief = generate_post_meeting_debrief(title, attendees, "", end_time)
+                debrief = _process_debrief_tasks(debrief, meeting_title=title)
                 formatted = format_for_google_chat(debrief)
                 send_chat_message(config.CHAT_SPACE_ID, formatted)
                 mark_debrief_sent(meeting.get("id", ""), title)

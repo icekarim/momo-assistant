@@ -74,6 +74,7 @@ DRIFT_THRESHOLD_DAYS = int(os.getenv("DRIFT_THRESHOLD_DAYS", "14"))
 NUDGE_COOLDOWN_DAYS = int(os.getenv("NUDGE_COOLDOWN_DAYS", "7"))
 FIRESTORE_MEETING_PREP_COLLECTION = "meeting_prep_sent"
 FIRESTORE_NUDGES_COLLECTION = "proactive_nudges_sent"
+FIRESTORE_PENDING_TASKS_COLLECTION = "pending_task_proposals"
 
 # ── Granola MCP ──────────────────────────────────────────────
 GRANOLA_ENABLED = os.getenv("GRANOLA_ENABLED", "false").lower() == "true"
