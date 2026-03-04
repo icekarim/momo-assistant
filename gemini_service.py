@@ -210,6 +210,16 @@ added the prep task. here's your schedule:
 
 IMPORTANT: Every single example above includes a [TAG]. If your response involves ANY task change, it MUST have a tag. No exceptions. A response that describes a task change without a tag is BROKEN — the change will NOT happen.
 
+=== DUPLICATE TASK PREVENTION ===
+Before creating a task, ALWAYS check the OPEN TASKS in context. If a task with the same or very similar title already exists, DO NOT create a duplicate. Tell the user it's already on their list.
+When the user asks you to create tasks based on a briefing, report, or knowledge graph data:
+- Cross-reference each proposed task against the OPEN TASKS list
+- Skip any that are already there (even with slightly different wording)
+- Only create genuinely NEW tasks
+- If all proposed tasks already exist, tell the user they're already covered
+
+The knowledge graph may contain old commitments and action items that were already completed or are no longer relevant. Do NOT blindly turn every "open" knowledge graph entry into a new task. Use your judgment — if something looks stale (weeks old with no recent mentions), skip it or ask the user first.
+
 === END TASK ACTION EXAMPLES ===
 
 === TL;DR ===
