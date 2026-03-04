@@ -19,10 +19,19 @@ import os
 import sys
 import urllib.request
 import urllib.error
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 NOTION_TOKEN = os.environ.get("NOTION_API_KEY", "")
 DATABASE_ID = "***REMOVED-NOTION-DB-ID***"
 NOTION_VERSION = "2022-06-28"
+
+if not NOTION_TOKEN:
+    print("Error: NOTION_API_KEY not found. Set it in .env or as an environment variable.", file=sys.stderr)
+    sys.exit(1)
 
 VALID_STATUSES = ["Backlog", "To Do", "In Progress", "Done", "Blocked"]
 VALID_PRIORITIES = ["Critical", "High", "Medium", "Low"]
