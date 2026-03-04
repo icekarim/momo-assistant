@@ -37,16 +37,19 @@ def fetch_email_alert_candidates():
 
 
 def _search_emails(query, max_results):
-    """Internal: execute a Gmail search and return parsed emails."""
+    """Internal: execute a Gmail search and return parsed emails.
+    Fetches individual messages in parallel to avoid N+1 latency."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     svc = get_gmail_service()
-    results = []
+    msg_refs = []
     page_token = None
 
-    while len(results) < max_results:
+    while len(msg_refs) < max_results:
         resp = svc.users().messages().list(
             userId="me",
             q=query,
-            maxResults=min(max_results - len(results), 50),
+            maxResults=min(max_results - len(msg_refs), 50),
             pageToken=page_token,
         ).execute()
 
@@ -54,17 +57,30 @@ def _search_emails(query, max_results):
         if not messages:
             break
 
-        for msg_ref in messages:
-            msg = svc.users().messages().get(
-                userId="me", id=msg_ref["id"], format="full"
-            ).execute()
-            results.append(_parse_message(msg))
-
+        msg_refs.extend(messages)
         page_token = resp.get("nextPageToken")
         if not page_token:
             break
 
-    return results
+    msg_refs = msg_refs[:max_results]
+
+    def _fetch_one(msg_id):
+        msg = svc.users().messages().get(
+            userId="me", id=msg_id, format="full"
+        ).execute()
+        return msg_id, _parse_message(msg)
+
+    results_by_id = {}
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futures = {pool.submit(_fetch_one, ref["id"]): ref["id"] for ref in msg_refs}
+        for future in as_completed(futures):
+            try:
+                msg_id, parsed = future.result()
+                results_by_id[msg_id] = parsed
+            except Exception as e:
+                print(f"Failed to fetch message {futures[future]}: {e}")
+
+    return [results_by_id[ref["id"]] for ref in msg_refs if ref["id"] in results_by_id]
 
 
 def _parse_message(msg):

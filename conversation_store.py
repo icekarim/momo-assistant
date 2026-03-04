@@ -1,10 +1,15 @@
 """Persistent conversation memory using Firestore."""
 
+import threading
 from datetime import datetime, timezone
 from google.cloud import firestore
+from cachetools import TTLCache
 import config
 
 _db = None
+
+_conversation_cache = TTLCache(maxsize=64, ttl=60)
+_cache_lock = threading.Lock()
 
 
 def _safe_doc_id(user_id):
@@ -21,21 +26,28 @@ def get_db():
 
 
 def get_conversation(user_id):
-    """Get conversation history for a user."""
+    """Get conversation history for a user. Cached for 60s to avoid
+    redundant Firestore reads during rapid back-and-forth exchanges."""
+    cache_key = _safe_doc_id(user_id)
+    with _cache_lock:
+        cached = _conversation_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     db = get_db()
-    doc = db.collection(config.FIRESTORE_COLLECTION).document(_safe_doc_id(user_id)).get()
+    doc = db.collection(config.FIRESTORE_COLLECTION).document(cache_key).get()
 
-    if doc.exists:
-        data = doc.to_dict()
-        return data.get("turns", [])
-
-    return []
+    turns = doc.to_dict().get("turns", []) if doc.exists else []
+    with _cache_lock:
+        _conversation_cache[cache_key] = turns
+    return turns
 
 
 def add_turn(user_id, role, content):
     """Add a conversation turn and trim to max length."""
     db = get_db()
-    doc_ref = db.collection(config.FIRESTORE_COLLECTION).document(_safe_doc_id(user_id))
+    cache_key = _safe_doc_id(user_id)
+    doc_ref = db.collection(config.FIRESTORE_COLLECTION).document(cache_key)
 
     doc = doc_ref.get()
     turns = doc.to_dict().get("turns", []) if doc.exists else []
@@ -54,11 +66,18 @@ def add_turn(user_id, role, content):
         "updated_at": datetime.now(timezone.utc).isoformat(),
     })
 
+    with _cache_lock:
+        _conversation_cache[cache_key] = turns
+
 
 def clear_conversation(user_id):
     """Clear conversation history for a user."""
     db = get_db()
-    db.collection(config.FIRESTORE_COLLECTION).document(_safe_doc_id(user_id)).delete()
+    cache_key = _safe_doc_id(user_id)
+    db.collection(config.FIRESTORE_COLLECTION).document(cache_key).delete()
+
+    with _cache_lock:
+        _conversation_cache.pop(cache_key, None)
 
 
 def has_email_alert_been_sent(message_id):

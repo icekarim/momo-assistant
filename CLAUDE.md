@@ -1,0 +1,36 @@
+# Momo Project Rules
+
+## Notion Project Tracker — ALWAYS UPDATE
+
+After completing any code change, bug fix, new feature, or planned task, you MUST update the Notion project tracker using the helper script:
+
+```bash
+# Add a new task when planning work
+python scripts/update_notion_tracker.py add "Task description" --status "To Do" --priority "High" --component "Gmail" --type "Feature" --effort "Small"
+
+# Mark a task as in progress when starting
+python scripts/update_notion_tracker.py update "Task description" --status "In Progress"
+
+# Mark a task as done when finished
+python scripts/update_notion_tracker.py update "Task description" --status "Done"
+```
+
+### When to update:
+- **Starting work**: set task to "In Progress" (create it first if it doesn't exist)
+- **Finishing work**: set task to "Done"
+- **Planning work**: create task as "To Do" or "Backlog"
+- **Hit a blocker**: set task to "Blocked"
+
+### Valid values:
+- Status: Backlog, To Do, In Progress, Done, Blocked
+- Priority: Critical, High, Medium, Low
+- Component: Briefing, Gmail, Calendar, Tasks, Knowledge Graph, Granola, Gemini, Chat, Proactive Intelligence, Infrastructure
+- Type: Feature, Bug Fix, Performance, Refactor, DevOps
+- Effort: Small, Medium, Large
+
+## Project context
+- Stack: Python, FastAPI, Gemini, Google Workspace APIs, Firestore, Cloud Run
+- Config loads from .env via dotenv (config.py)
+- Tiered model routing: Flash for standard, Pro for deep reasoning
+- Knowledge graph in Firestore with entity extraction
+- Granola MCP for meeting notes
