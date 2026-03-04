@@ -82,6 +82,27 @@ def detect_type(msg):
     return "Feature"
 
 
+def detect_priority(msg, num_files):
+    """Estimate priority from commit message and scope."""
+    msg_lower = msg.lower()
+    if any(w in msg_lower for w in ["critical", "urgent", "hotfix", "breaking"]):
+        return "Critical"
+    if any(w in msg_lower for w in ["fix", "bug", "security"]) or num_files >= 5:
+        return "High"
+    if num_files >= 3:
+        return "Medium"
+    return "Low"
+
+
+def detect_effort(num_files):
+    """Estimate effort from number of files changed."""
+    if num_files >= 6:
+        return "Large"
+    if num_files >= 3:
+        return "Medium"
+    return "Small"
+
+
 def find_existing_task(name):
     """Check if a task with this name already exists."""
     data = notion_request("POST", f"databases/{DATABASE_ID}/query", {
@@ -92,11 +113,10 @@ def find_existing_task(name):
     return None
 
 
-def create_task(name, component, task_type):
+def create_task(name, component, task_type, priority, effort):
     """Create a task marked as Done (it was just committed)."""
     existing = find_existing_task(name)
     if existing:
-        # Update to Done
         notion_request("PATCH", f"pages/{existing['id']}", {
             "properties": {"Status": {"select": {"name": "Done"}}}
         })
@@ -110,9 +130,11 @@ def create_task(name, component, task_type):
             "Status": {"select": {"name": "Done"}},
             "Component": {"select": {"name": component}},
             "Type": {"select": {"name": task_type}},
+            "Priority": {"select": {"name": priority}},
+            "Effort": {"select": {"name": effort}},
         }
     })
-    print(f"  Notion: Created '{name}' [Done]")
+    print(f"  Notion: Created '{name}' [Done, {priority}, {effort}]")
 
 
 def main():
@@ -131,15 +153,16 @@ def main():
         return
 
     task_type = detect_type(msg)
+    priority = detect_priority(msg, len(files))
+    effort = detect_effort(len(files))
     comp_str = ", ".join(sorted(components))
 
-    # Use commit message as task name, pick first component
-    task_name = msg[:100]  # Truncate long messages
+    task_name = msg[:100]
     primary_component = sorted(components)[0]
 
     print(f"Post-commit: {task_name}")
     print(f"  Components: {comp_str}")
-    create_task(task_name, primary_component, task_type)
+    create_task(task_name, primary_component, task_type, priority, effort)
 
 
 if __name__ == "__main__":
