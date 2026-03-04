@@ -31,7 +31,7 @@ from calendar_service import (
 from tasks_service import fetch_open_tasks, format_tasks_for_context, create_task, update_task, complete_task, delete_task
 from gemini_service import chat_response
 from chat_service import format_for_google_chat, send_chat_message
-from conversation_store import get_conversation, add_turn, clear_conversation
+from conversation_store import get_conversation, add_turn, clear_conversation, get_pending_tasks, clear_pending_tasks
 
 app = FastAPI(title="Momo")
 
@@ -362,6 +362,33 @@ async def handle_message(ev: dict) -> dict:
         except Exception as e:
             return _make_response(f"Error generating briefing: {str(e)}", is_addon)
 
+    _CONFIRM_PHRASES = {
+        "yes", "yep", "yeah", "yea", "y", "sure", "do it", "go ahead",
+        "create them", "create those", "create those tasks", "create tasks",
+        "add them", "add those", "add those tasks", "go for it", "please",
+        "yes please", "yep do it", "sounds good", "let's do it",
+    }
+    _DECLINE_PHRASES = {
+        "no", "nah", "nope", "n", "skip", "skip those", "no thanks",
+        "don't create", "never mind", "nevermind", "cancel",
+    }
+    if lower in _CONFIRM_PHRASES:
+        pending, meeting_title = get_pending_tasks()
+        if pending:
+            target_space = space or config.CHAT_SPACE_ID
+            thread = threading.Thread(
+                target=_create_pending_tasks_background,
+                args=(pending, meeting_title, target_space),
+                daemon=True,
+            )
+            thread.start()
+            return _make_response("", is_addon)
+    if lower in _DECLINE_PHRASES:
+        pending, _ = get_pending_tasks()
+        if pending:
+            clear_pending_tasks()
+            return _make_response("Got it — skipped those tasks.", is_addon)
+
     target_space = space or config.CHAT_SPACE_ID
     thread = threading.Thread(
         target=_process_message_background,
@@ -371,6 +398,52 @@ async def handle_message(ev: dict) -> dict:
     thread.start()
 
     return _make_response("", is_addon)
+
+
+def _create_pending_tasks_background(pending_tasks, meeting_title, space):
+    """Create confirmed pending tasks from a debrief and report back."""
+    try:
+        results = []
+        skipped = []
+        errors = []
+        for task in pending_tasks:
+            try:
+                result = create_task(
+                    title=task["title"],
+                    notes=task.get("notes", ""),
+                    due_date=task.get("due"),
+                )
+                status = result.get("status", "error")
+                if "error" in result:
+                    errors.append(f"{task['title']}: {result['error']}")
+                elif status in ("already_exists", "already_completed"):
+                    skipped.append(f"*{result['title']}* — {status.replace('_', ' ')}")
+                else:
+                    results.append(f"*{result['title']}* — {status}")
+            except Exception as e:
+                errors.append(f"{task['title']}: {str(e)}")
+
+        lines = []
+        if results:
+            lines.append(f"✅ *{len(results)} task(s) created:*")
+            lines.extend(f"  • {r}" for r in results)
+        if skipped:
+            lines.append(f"🟡 *{len(skipped)} skipped (already existed):*")
+            lines.extend(f"  • {s}" for s in skipped)
+        if errors:
+            lines.append(f"🔴 *{len(errors)} failed:*")
+            lines.extend(f"  • {e}" for e in errors)
+
+        reply = "\n".join(lines) if lines else "No tasks to create."
+        formatted = format_for_google_chat(reply)
+        send_chat_message(space, formatted)
+        clear_pending_tasks()
+    except Exception as e:
+        traceback.print_exc()
+        try:
+            send_chat_message(space, f"sorry, something went wrong creating those tasks: {str(e)}")
+        except Exception:
+            print(f"Failed to send error message: {e}")
 
 
 def _process_message_background(text, user_id, space):

@@ -169,3 +169,42 @@ def mark_nudge_sent(nudge_key, nudge_type, title):
             "sent_at": datetime.now(timezone.utc).isoformat(),
         }
     )
+
+
+def store_pending_tasks(tasks, meeting_title=""):
+    """Store proposed tasks from a debrief so the user can confirm later.
+    Each task is a dict with 'title' and optional 'due', 'notes' keys.
+    Only one pending proposal set is kept at a time (latest wins)."""
+    db = get_db()
+    db.collection(config.FIRESTORE_PENDING_TASKS_COLLECTION).document("latest").set(
+        {
+            "tasks": tasks,
+            "meeting_title": meeting_title,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+
+
+def get_pending_tasks():
+    """Retrieve pending task proposals. Returns (tasks_list, meeting_title) or ([], '')."""
+    db = get_db()
+    doc = db.collection(config.FIRESTORE_PENDING_TASKS_COLLECTION).document("latest").get()
+    if not doc.exists:
+        return [], ""
+    data = doc.to_dict()
+    created = data.get("created_at", "")
+    if created:
+        try:
+            created_dt = datetime.fromisoformat(created)
+            age_hours = (datetime.now(timezone.utc) - created_dt).total_seconds() / 3600
+            if age_hours > 24:
+                return [], ""
+        except (ValueError, TypeError):
+            pass
+    return data.get("tasks", []), data.get("meeting_title", "")
+
+
+def clear_pending_tasks():
+    """Remove pending task proposals after they've been acted on."""
+    db = get_db()
+    db.collection(config.FIRESTORE_PENDING_TASKS_COLLECTION).document("latest").delete()
