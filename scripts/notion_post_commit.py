@@ -5,12 +5,17 @@ tasks in the Notion project tracker based on the components affected.
 """
 
 import json
+import os
 import subprocess
 import sys
 import urllib.request
 import urllib.error
+from pathlib import Path
 
-import os
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
 NOTION_TOKEN = os.environ.get("NOTION_API_KEY", "")
 DATABASE_ID = "***REMOVED-NOTION-DB-ID***"
 NOTION_VERSION = "2022-06-28"
