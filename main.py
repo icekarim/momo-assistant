@@ -390,12 +390,15 @@ def _process_message_background(text, user_id, space):
         task_summary = ""
         if task_actions:
             results = []
+            skipped = []
             errors = []
             for action_item in task_actions:
                 try:
                     result = _execute_task_action(action_item)
                     if "error" in result:
                         errors.append(f"{action_item.get('title', action_item.get('find', '?'))}: {result['error']}")
+                    elif result.get("status") in ("already_exists", "already_completed"):
+                        skipped.append(f"*{result['title']}* — {result['status'].replace('_', ' ')}")
                     else:
                         results.append(f"*{result['title']}* — {result['status']}")
                 except Exception as e:
@@ -405,6 +408,9 @@ def _process_message_background(text, user_id, space):
             if results:
                 lines.append(f"\n✅ *done — {len(results)} task(s):*")
                 lines.extend(f"  - {r}" for r in results)
+            if skipped:
+                lines.append(f"\n🟡 *skipped — {len(skipped)} already existed:*")
+                lines.extend(f"  - {s}" for s in skipped)
             if errors:
                 lines.append(f"\n🔴 *couldn't do {len(errors)}:*")
                 lines.extend(f"  - {e}" for e in errors)

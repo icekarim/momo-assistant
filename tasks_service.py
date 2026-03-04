@@ -68,18 +68,46 @@ def create_task(title, notes="", due_date=None, task_list_name=None):
     """
     svc = get_tasks_service()
 
-    # Find the target task list
     lists_resp = svc.tasklists().list(maxResults=100).execute()
     task_lists = lists_resp.get("items", [])
     if not task_lists:
         return {"error": "No task lists found"}
 
-    target_list = task_lists[0]  # default to first list
+    target_list = task_lists[0]
     if task_list_name:
         for tl in task_lists:
             if tl["title"].lower() == task_list_name.lower():
                 target_list = tl
                 break
+
+    title_lower = title.lower().strip()
+    for tl in task_lists:
+        tasks_resp = svc.tasks().list(
+            tasklist=tl["id"],
+            showCompleted=False,
+            showHidden=False,
+            maxResults=100,
+        ).execute()
+        for existing in tasks_resp.get("items", []):
+            existing_title = (existing.get("title", "") or "").strip()
+            if not existing_title:
+                continue
+            if existing_title.lower() == title_lower or _titles_match(title_lower, existing_title.lower()):
+                return {
+                    "id": existing["id"],
+                    "title": existing_title,
+                    "list_name": tl["title"],
+                    "status": "already_exists",
+                }
+
+    completed = find_completed_task(title, days_back=14)
+    if completed:
+        return {
+            "id": completed["id"],
+            "title": completed["title"],
+            "list_name": completed["list_name"],
+            "status": "already_completed",
+        }
 
     body = {"title": title, "status": "needsAction"}
     if notes:
@@ -95,6 +123,24 @@ def create_task(title, notes="", due_date=None, task_list_name=None):
         "list_name": target_list["title"],
         "status": "created",
     }
+
+
+def _titles_match(a: str, b: str) -> bool:
+    """Fuzzy match: true if one title is a substantial substring of the other,
+    filtering out trivial word overlaps."""
+    if a == b:
+        return True
+    if len(a) < 5 or len(b) < 5:
+        return a == b
+    if a in b or b in a:
+        return True
+    a_words = set(a.split())
+    b_words = set(b.split())
+    if not a_words or not b_words:
+        return False
+    overlap = a_words & b_words
+    smaller = min(len(a_words), len(b_words))
+    return smaller >= 2 and len(overlap) / smaller >= 0.7
 
 
 def update_task(task_title, new_title=None, new_notes=None, new_due=None):
@@ -209,18 +255,53 @@ def _find_task_by_title(svc, title_query):
     return None, None, None
 
 
-def format_tasks_for_context(tasks):
+def fetch_recently_completed_tasks(days_back=14):
+    """Fetch tasks completed in the last N days so Gemini knows what's already done."""
+    svc = get_tasks_service()
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).isoformat()
+
+    completed = []
+    lists_resp = svc.tasklists().list(maxResults=100).execute()
+    for tl in lists_resp.get("items", []):
+        tasks_resp = svc.tasks().list(
+            tasklist=tl["id"],
+            showCompleted=True,
+            showHidden=True,
+            completedMin=cutoff,
+            maxResults=100,
+        ).execute()
+        for task in tasks_resp.get("items", []):
+            title = (task.get("title", "") or "").strip()
+            if not title or task.get("status") != "completed":
+                continue
+            completed.append({"title": title, "list_name": tl["title"]})
+    return completed
+
+
+def format_tasks_for_context(tasks, include_completed=True):
     """Format tasks into a text block for Gemini."""
     if not tasks:
-        return "No open tasks."
+        lines_text = "No open tasks."
+    else:
+        lines = []
+        for i, t in enumerate(tasks, 1):
+            overdue = " ⚠️ OVERDUE" if t["is_overdue"] else ""
+            due = f" (Due: {t['due']}{overdue})" if t["due"] else " (No due date)"
+            line = f"{i}. [{t['list_name']}] {t['title']}{due}"
+            if t["notes"]:
+                line += f"\n   Notes: {t['notes']}"
+            lines.append(line)
+        lines_text = "\n\n".join(lines)
 
-    lines = []
-    for i, t in enumerate(tasks, 1):
-        overdue = " ⚠️ OVERDUE" if t["is_overdue"] else ""
-        due = f" (Due: {t['due']}{overdue})" if t["due"] else " (No due date)"
-        line = f"{i}. [{t['list_name']}] {t['title']}{due}"
-        if t["notes"]:
-            line += f"\n   Notes: {t['notes']}"
-        lines.append(line)
+    if include_completed:
+        try:
+            completed = fetch_recently_completed_tasks(days_back=14)
+            if completed:
+                lines_text += "\n\n--- Recently completed (do NOT re-create these) ---\n"
+                for c in completed:
+                    lines_text += f"- [DONE] {c['title']}\n"
+        except Exception as e:
+            print(f"Warning: couldn't fetch completed tasks: {e}")
 
-    return "\n\n".join(lines)
+    return lines_text
