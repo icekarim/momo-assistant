@@ -11,10 +11,14 @@ import traceback
 from datetime import datetime, timezone
 
 import google.generativeai as genai
+from cachetools import TTLCache
 from google.cloud.firestore_v1.base_query import FieldFilter
 
 import config
 from conversation_store import get_db
+
+_kg_cache = TTLCache(maxsize=128, ttl=300)
+_kg_cache_lock = threading.Lock()
 
 genai.configure(api_key=config.GEMINI_API_KEY)
 
@@ -121,7 +125,7 @@ def _run_extraction(source_type: str, source_title: str, content: str,
 
 def _store_entries(entries: list[dict], source_type: str, source_id: str,
                    source_title: str, source_date: str):
-    """Persist extracted entries to Firestore."""
+    """Persist extracted entries to Firestore and invalidate query cache."""
     db = get_db()
     collection = db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -143,6 +147,9 @@ def _store_entries(entries: list[dict], source_type: str, source_id: str,
             "extracted_at": now_iso,
         }
         collection.add(doc)
+
+    with _kg_cache_lock:
+        _kg_cache.clear()
 
 
 def extract_and_store(source_type: str, source_id: str, source_title: str,
@@ -196,6 +203,12 @@ def _safe_extract(source_type, source_id, source_title, source_date, content, at
 def query_by_person(name: str, since: str | None = None,
                     limit: int = 50) -> list[dict]:
     """All knowledge nodes mentioning a person (array-contains on related_people)."""
+    cache_key = ("person", name, since, limit)
+    with _kg_cache_lock:
+        cached = _kg_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     db = get_db()
     query = (
         db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
@@ -205,12 +218,21 @@ def query_by_person(name: str, since: str | None = None,
     )
     if since:
         query = query.where(filter=FieldFilter("source_date", ">=", since))
-    return [_doc_to_dict(doc) for doc in query.stream()]
+    results = [_doc_to_dict(doc) for doc in query.stream()]
+    with _kg_cache_lock:
+        _kg_cache[cache_key] = results
+    return results
 
 
 def query_by_project(name: str, since: str | None = None,
                      limit: int = 50) -> list[dict]:
     """All knowledge nodes related to a project/client."""
+    cache_key = ("project", name, since, limit)
+    with _kg_cache_lock:
+        cached = _kg_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     db = get_db()
     query = (
         db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
@@ -220,12 +242,21 @@ def query_by_project(name: str, since: str | None = None,
     )
     if since:
         query = query.where(filter=FieldFilter("source_date", ">=", since))
-    return [_doc_to_dict(doc) for doc in query.stream()]
+    results = [_doc_to_dict(doc) for doc in query.stream()]
+    with _kg_cache_lock:
+        _kg_cache[cache_key] = results
+    return results
 
 
 def query_by_type(entity_type: str, since: str | None = None,
                   limit: int = 50) -> list[dict]:
     """All nodes of a given type (decision, commitment, blocker, etc.)."""
+    cache_key = ("type", entity_type, since, limit)
+    with _kg_cache_lock:
+        cached = _kg_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     db = get_db()
     query = (
         db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
@@ -235,12 +266,21 @@ def query_by_type(entity_type: str, since: str | None = None,
     )
     if since:
         query = query.where(filter=FieldFilter("source_date", ">=", since))
-    return [_doc_to_dict(doc) for doc in query.stream()]
+    results = [_doc_to_dict(doc) for doc in query.stream()]
+    with _kg_cache_lock:
+        _kg_cache[cache_key] = results
+    return results
 
 
 def query_open_commitments(since: str | None = None,
                            limit: int = 50) -> list[dict]:
     """Commitments and action items that haven't been completed."""
+    cache_key = ("open_commitments", since, limit)
+    with _kg_cache_lock:
+        cached = _kg_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     db = get_db()
     query = (
         db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
@@ -251,7 +291,10 @@ def query_open_commitments(since: str | None = None,
     )
     if since:
         query = query.where(filter=FieldFilter("source_date", ">=", since))
-    return [_doc_to_dict(doc) for doc in query.stream()]
+    results = [_doc_to_dict(doc) for doc in query.stream()]
+    with _kg_cache_lock:
+        _kg_cache[cache_key] = results
+    return results
 
 
 def search_knowledge(keywords: list[str], limit: int = 50) -> list[dict]:
@@ -259,6 +302,12 @@ def search_knowledge(keywords: list[str], limit: int = 50) -> list[dict]:
     so we query the first keyword and filter the rest in-memory."""
     if not keywords:
         return []
+
+    cache_key = ("search", tuple(keywords), limit)
+    with _kg_cache_lock:
+        cached = _kg_cache.get(cache_key)
+    if cached is not None:
+        return cached
 
     db = get_db()
     primary = keywords[0].lower().strip()
@@ -277,7 +326,10 @@ def search_knowledge(keywords: list[str], limit: int = 50) -> list[dict]:
             if extra.intersection(set(r.get("tags", [])))
         ]
 
-    return results[:limit]
+    results = results[:limit]
+    with _kg_cache_lock:
+        _kg_cache[cache_key] = results
+    return results
 
 
 def query_recent(days: int = 7, limit: int = 50) -> list[dict]:
@@ -322,6 +374,8 @@ def update_entity_status(doc_id: str, new_status: str):
         "status": new_status,
         "status_updated_at": datetime.now(timezone.utc).isoformat(),
     })
+    with _kg_cache_lock:
+        _kg_cache.clear()
 
 
 def _doc_to_dict(doc) -> dict:

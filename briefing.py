@@ -25,44 +25,75 @@ import config
 
 
 def run_morning_briefing():
-    """Full morning briefing pipeline."""
+    """Full morning briefing pipeline.
+    Fetches emails, meetings, tasks, Granola notes, and nudges in parallel."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     print("Momo is preparing the morning briefing...")
 
-    print("  Fetching emails...")
-    emails = fetch_unread_client_emails()
-    print(f"     Found {len(emails)} unread client email(s)")
+    def _fetch_emails():
+        emails = fetch_unread_client_emails()
+        print(f"     Found {len(emails)} unread client email(s)")
+        return "emails", emails
 
-    print("  Fetching meetings...")
-    meetings = fetch_todays_meetings()
-    print(f"     Found {len(meetings)} meeting(s)")
+    def _fetch_meetings():
+        meetings = fetch_todays_meetings()
+        print(f"     Found {len(meetings)} meeting(s)")
+        return "meetings", meetings
 
-    print("  Fetching tasks...")
-    tasks = fetch_open_tasks()
-    print(f"     Found {len(tasks)} open task(s)")
+    def _fetch_tasks():
+        tasks = fetch_open_tasks()
+        print(f"     Found {len(tasks)} open task(s)")
+        return "tasks", tasks
 
-    granola_ctx = ""
-    if config.GRANOLA_ENABLED:
-        print("  Fetching yesterday's meeting notes from Granola...")
+    def _fetch_granola():
         try:
             from granola_service import fetch_yesterday_meeting_notes, format_granola_notes_for_context
             raw_notes = fetch_yesterday_meeting_notes()
-            granola_ctx = format_granola_notes_for_context(raw_notes)
-            print(f"     Granola notes loaded ({len(granola_ctx)} chars)")
+            ctx = format_granola_notes_for_context(raw_notes)
+            print(f"     Granola notes loaded ({len(ctx)} chars)")
+            return "granola", ctx
         except Exception as e:
             print(f"     Granola fetch failed: {e}")
+            return "granola", ""
 
-    nudges_ctx = ""
-    if config.PROACTIVE_INTELLIGENCE_ENABLED and config.KNOWLEDGE_GRAPH_ENABLED:
-        print("  Running proactive intelligence engines...")
+    def _fetch_nudges():
         try:
             from proactive_intelligence import generate_daily_nudges
-            nudges_ctx = generate_daily_nudges()
-            if nudges_ctx:
-                print(f"     Nudges generated ({len(nudges_ctx)} chars)")
+            ctx = generate_daily_nudges()
+            if ctx:
+                print(f"     Nudges generated ({len(ctx)} chars)")
             else:
                 print("     No nudges to report")
+            return "nudges", ctx or ""
         except Exception as e:
             print(f"     Proactive intelligence failed: {e}")
+            return "nudges", ""
+
+    futures = {}
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures["emails"] = pool.submit(_fetch_emails)
+        futures["meetings"] = pool.submit(_fetch_meetings)
+        futures["tasks"] = pool.submit(_fetch_tasks)
+        if config.GRANOLA_ENABLED:
+            futures["granola"] = pool.submit(_fetch_granola)
+        if config.PROACTIVE_INTELLIGENCE_ENABLED and config.KNOWLEDGE_GRAPH_ENABLED:
+            futures["nudges"] = pool.submit(_fetch_nudges)
+
+    data = {}
+    for key, future in futures.items():
+        try:
+            label, value = future.result(timeout=120)
+            data[label] = value
+        except Exception as e:
+            print(f"  Error fetching {key}: {e}")
+            data[key] = [] if key in ("emails", "meetings", "tasks") else ""
+
+    emails = data.get("emails", [])
+    meetings = data.get("meetings", [])
+    tasks = data.get("tasks", [])
+    granola_ctx = data.get("granola", "")
+    nudges_ctx = data.get("nudges", "")
 
     if not emails and not meetings and not tasks and not granola_ctx and not nudges_ctx:
         print("  Nothing to report. Skipping.")
