@@ -52,7 +52,7 @@ gcloud run deploy $SERVICE_NAME \
   --memory=1Gi \
   --timeout=300 \
   --no-cpu-throttling \
-  --min-instances=1 \
+  --min-instances=0 \
   --max-instances=3
 
 # Get the URL
