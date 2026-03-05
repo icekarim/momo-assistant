@@ -108,6 +108,7 @@ def run_morning_briefing():
         emails_ctx, meetings_ctx, tasks_ctx,
         granola_context=granola_ctx, nudges_context=nudges_ctx,
     )
+    summary = _process_debrief_tasks(summary, meeting_title="Morning Briefing")
 
     if config.CHAT_SPACE_ID:
         print("  Sending to Google Chat...")
