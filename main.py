@@ -831,6 +831,15 @@ def _build_context(user_message):
         from knowledge_graph import query_knowledge_graph
         return "knowledge_graph", query_knowledge_graph(user_message)
 
+    per_source_timeout = {
+        "meetings": 10,
+        "tasks": 10,
+        "emails": 15,
+        "targeted_emails": 15,
+        "granola": 12,
+        "knowledge_graph": 10,
+    }
+
     pool = ThreadPoolExecutor(max_workers=7)
     futures = {}
     futures["meetings"] = pool.submit(_fetch_meetings)
@@ -844,11 +853,11 @@ def _build_context(user_message):
     if wants_knowledge:
         futures["knowledge_graph"] = pool.submit(_fetch_knowledge)
 
-    deadline = time.time() + 90
+    timed_out_sources = []
     for key, future in futures.items():
-        remaining = max(0.1, deadline - time.time())
+        timeout = per_source_timeout.get(key, 10)
         try:
-            ctx_key, value = future.result(timeout=remaining)
+            ctx_key, value = future.result(timeout=timeout)
             if value:
                 if ctx_key == "targeted_emails" and "emails" in context:
                     context["emails"] = context["emails"] + "\n\n--- Targeted search results ---\n\n" + value
@@ -856,8 +865,22 @@ def _build_context(user_message):
                     context["emails"] = value
                 else:
                     context[ctx_key] = value
+        except TimeoutError:
+            timed_out_sources.append(key)
+            print(f"Source '{key}' timed out after {timeout}s — proceeding without it")
+            future.cancel()
         except Exception as e:
             print(f"Error fetching {key}: {e}")
+
+    if timed_out_sources:
+        human_names = {"meetings": "calendar", "tasks": "tasks", "emails": "email",
+                       "targeted_emails": "email search", "granola": "meeting notes",
+                       "knowledge_graph": "knowledge graph"}
+        names = [human_names.get(s, s) for s in timed_out_sources]
+        context["_unavailable_sources"] = (
+            f"Note: I couldn't reach your {', '.join(names)} right now (timed out). "
+            "The rest of the info below is still up to date."
+        )
 
     pool.shutdown(wait=False)
     return context
