@@ -500,6 +500,9 @@ def _transcribe_voice_message(audio_attachments, existing_text, space):
 
 def _process_message_background(text, user_id, space, audio_attachments=None):
     """Heavy processing in background thread — no 30s webhook pressure."""
+    import time
+    _t0 = time.time()
+    print(f"[perf] processing message ({len(text or '')} chars)")
     try:
         if audio_attachments:
             text = _transcribe_voice_message(audio_attachments, text, space)
@@ -507,8 +510,16 @@ def _process_message_background(text, user_id, space, audio_attachments=None):
                 return
 
         history = get_conversation(user_id)
+        _t1 = time.time()
+        print(f"[perf] get_conversation: {_t1 - _t0:.2f}s (history={len(history)} turns)")
+
         context_data = _build_context(text)
+        _t2 = time.time()
+        print(f"[perf] build_context: {_t2 - _t1:.2f}s (sources={list(context_data.keys())})")
+
         response = chat_response(text, history, context_data)
+        _t3 = time.time()
+        print(f"[perf] chat_response: {_t3 - _t2:.2f}s (response={len(response or '')} chars)")
 
         task_actions = _extract_all_task_proposals(response, text)
 
@@ -566,7 +577,11 @@ def _process_message_background(text, user_id, space, audio_attachments=None):
             )
 
         formatted = format_for_google_chat(full_response)
+        _t4 = time.time()
         send_chat_message(space, formatted)
+        _t5 = time.time()
+        print(f"[perf] send_chat_message: {_t5 - _t4:.2f}s")
+        print(f"[perf] TOTAL: {_t5 - _t0:.2f}s")
 
     except Exception as e:
         traceback.print_exc()
@@ -862,6 +877,12 @@ def _build_context(user_message):
 
     wants_granola = config.GRANOLA_ENABLED and (wants_meeting_notes or is_general or has_specific_entity)
 
+    def _timed_fetch(name, fn):
+        t = time.time()
+        result = fn()
+        print(f"[perf]   source '{name}': {time.time() - t:.2f}s")
+        return result
+
     def _fetch_meetings():
         meetings = fetch_todays_meetings()
         return "meetings", format_meetings_for_context(meetings)
@@ -899,16 +920,16 @@ def _build_context(user_message):
 
     pool = ThreadPoolExecutor(max_workers=7)
     futures = {}
-    futures["meetings"] = pool.submit(_fetch_meetings)
-    futures["tasks"] = pool.submit(_fetch_tasks)
+    futures["meetings"] = pool.submit(_timed_fetch, "meetings", _fetch_meetings)
+    futures["tasks"] = pool.submit(_timed_fetch, "tasks", _fetch_tasks)
     if wants_emails or is_general:
-        futures["emails"] = pool.submit(_fetch_unread_emails)
+        futures["emails"] = pool.submit(_timed_fetch, "emails", _fetch_unread_emails)
     if search_terms:
-        futures["targeted_emails"] = pool.submit(_fetch_targeted_emails)
+        futures["targeted_emails"] = pool.submit(_timed_fetch, "targeted_emails", _fetch_targeted_emails)
     if wants_granola:
-        futures["granola"] = pool.submit(_fetch_granola)
+        futures["granola"] = pool.submit(_timed_fetch, "granola", _fetch_granola)
     if wants_knowledge:
-        futures["knowledge_graph"] = pool.submit(_fetch_knowledge)
+        futures["knowledge_graph"] = pool.submit(_timed_fetch, "knowledge_graph", _fetch_knowledge)
 
     timed_out_sources = []
     for key, future in futures.items():
