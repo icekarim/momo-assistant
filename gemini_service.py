@@ -319,6 +319,8 @@ def chat_response(user_message, conversation_history, context_data):
             f"If none of these entries are relevant, simply ignore this section entirely.\n\n"
             f"{context_data['knowledge_graph']}"
         )
+    if context_data.get("_unavailable_sources"):
+        context_parts.append(f"=== DATA SOURCE NOTICE ===\n{context_data['_unavailable_sources']}")
 
     context_block = "\n\n".join(context_parts)
     history.append({

@@ -1,4 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+
 from googleapiclient.discovery import build
 from google_auth import get_credentials
 
@@ -9,21 +11,22 @@ def get_tasks_service():
 
 
 def fetch_open_tasks():
-    """Fetch all incomplete tasks across all task lists."""
+    """Fetch all incomplete tasks across all task lists (parallel per list)."""
     svc = get_tasks_service()
-    all_tasks = []
 
     lists_resp = svc.tasklists().list(maxResults=100).execute()
     task_lists = lists_resp.get("items", [])
 
-    for tl in task_lists:
-        tasks_resp = svc.tasks().list(
+    def _fetch_list(tl):
+        list_svc = get_tasks_service()
+        tasks_resp = list_svc.tasks().list(
             tasklist=tl["id"],
             showCompleted=False,
             showHidden=False,
             maxResults=100,
         ).execute()
 
+        results = []
         for task in tasks_resp.get("items", []):
             if not task.get("title", "").strip():
                 continue
@@ -37,7 +40,7 @@ def fetch_open_tasks():
                 due = due_dt.strftime("%b %d, %Y")
                 is_overdue = due_dt < datetime.now(timezone.utc)
 
-            all_tasks.append({
+            results.append({
                 "id": task["id"],
                 "title": task["title"],
                 "notes": (task.get("notes", "") or "")[:300],
@@ -46,6 +49,16 @@ def fetch_open_tasks():
                 "list_name": tl["title"],
                 "status": task.get("status", ""),
             })
+        return results
+
+    all_tasks = []
+    with ThreadPoolExecutor(max_workers=min(len(task_lists), 5)) as pool:
+        futures = {pool.submit(_fetch_list, tl): tl["title"] for tl in task_lists}
+        for future in as_completed(futures):
+            try:
+                all_tasks.extend(future.result())
+            except Exception as e:
+                print(f"Error fetching task list '{futures[future]}': {e}")
 
     all_tasks.sort(key=lambda t: (
         not t["is_overdue"],
@@ -224,34 +237,53 @@ def find_completed_task(title_query, days_back=30):
 
 
 def _find_task_by_title(svc, title_query):
-    """Find a task by fuzzy title match. Returns (task_id, tasklist_id, list_name) or (None, None, None)."""
+    """Find a task by fuzzy title match (parallel per list).
+    Returns (task_id, tasklist_id, list_name) or (None, None, None)."""
     title_lower = title_query.lower().strip()
 
     lists_resp = svc.tasklists().list(maxResults=100).execute()
     task_lists = lists_resp.get("items", [])
 
-    best_match = None
-    for tl in task_lists:
-        tasks_resp = svc.tasks().list(
+    def _search_list(tl):
+        list_svc = get_tasks_service()
+        tasks_resp = list_svc.tasks().list(
             tasklist=tl["id"],
             showCompleted=False,
             showHidden=False,
             maxResults=100,
         ).execute()
 
+        exact = None
+        partial = None
         for task in tasks_resp.get("items", []):
             task_title = (task.get("title", "") or "").strip()
-            if not task_title:
-                continue
-            if task.get("status") == "completed":
+            if not task_title or task.get("status") == "completed":
                 continue
             if task_title.lower() == title_lower:
-                return task["id"], tl["id"], tl["title"]
+                exact = (task["id"], tl["id"], tl["title"])
+                break
             if title_lower in task_title.lower() or task_title.lower() in title_lower:
-                best_match = (task["id"], tl["id"], tl["title"])
+                partial = (task["id"], tl["id"], tl["title"])
+        return exact, partial
 
-    if best_match:
-        return best_match
+    exact_match = None
+    best_partial = None
+    with ThreadPoolExecutor(max_workers=min(len(task_lists), 5)) as pool:
+        futures = [pool.submit(_search_list, tl) for tl in task_lists]
+        for future in as_completed(futures):
+            try:
+                exact, partial = future.result()
+                if exact:
+                    exact_match = exact
+                if partial and not best_partial:
+                    best_partial = partial
+            except Exception:
+                pass
+
+    if exact_match:
+        return exact_match
+    if best_partial:
+        return best_partial
     return None, None, None
 
 
