@@ -77,6 +77,32 @@ def find_task(name):
     return results[0]
 
 
+def add_page_content(page_id, text):
+    """Add a description as content blocks inside a Notion page."""
+    blocks = []
+    for paragraph in text.split("\n\n"):
+        paragraph = paragraph.strip()
+        if not paragraph:
+            continue
+        if paragraph.startswith("# "):
+            blocks.append({"object": "block", "type": "heading_2", "heading_2": {
+                "rich_text": [{"type": "text", "text": {"content": paragraph[2:]}}]
+            }})
+        elif paragraph.startswith("- "):
+            for line in paragraph.split("\n"):
+                line = line.strip().lstrip("- ")
+                if line:
+                    blocks.append({"object": "block", "type": "bulleted_list_item",
+                        "bulleted_list_item": {"rich_text": [{"type": "text", "text": {"content": line}}]}
+                    })
+        else:
+            blocks.append({"object": "block", "type": "paragraph", "paragraph": {
+                "rich_text": [{"type": "text", "text": {"content": paragraph}}]
+            }})
+    if blocks:
+        notion_request("PATCH", f"blocks/{page_id}/children", {"children": blocks})
+
+
 def add_task(args):
     props = {
         "Task": {"title": [{"text": {"content": args.name}}]},
@@ -95,6 +121,10 @@ def add_task(args):
         "parent": {"database_id": DATABASE_ID},
         "properties": props,
     })
+
+    if result and hasattr(args, "description") and args.description:
+        add_page_content(result["id"], args.description)
+
     print(f"Created: {args.name} [{args.status or 'To Do'}]")
     return result
 
@@ -157,6 +187,7 @@ def main():
     add_p.add_argument("--component", choices=VALID_COMPONENTS)
     add_p.add_argument("--type", choices=VALID_TYPES)
     add_p.add_argument("--effort", choices=VALID_EFFORTS)
+    add_p.add_argument("--description", help="Description to add inside the task page")
 
     # Update
     upd_p = sub.add_parser("update", help="Update a task")
