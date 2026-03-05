@@ -29,8 +29,8 @@ from calendar_service import (
     format_meetings_for_context,
 )
 from tasks_service import fetch_open_tasks, format_tasks_for_context, create_task, update_task, complete_task, delete_task
-from gemini_service import chat_response
-from chat_service import format_for_google_chat, send_chat_message
+from gemini_service import chat_response, transcribe_audio
+from chat_service import format_for_google_chat, send_chat_message, download_attachment, _SUPPORTED_AUDIO_TYPES
 from conversation_store import get_conversation, add_turn, clear_conversation, get_pending_tasks, clear_pending_tasks
 
 app = FastAPI(title="Momo")
@@ -57,15 +57,16 @@ async def startup_warmup():
 
 def _parse_event(body: dict) -> dict:
     """Parse both standard Chat events and Workspace Add-on events into a
-    normalized dict with keys: event_type, text, user_id, user_name, space, is_addon."""
+    normalized dict with keys: event_type, text, user_id, user_name, space,
+    is_addon, attachments."""
     is_addon = "commonEventObject" in body or "chat" in body
 
-    # Standard Chat app format
     event_type = body.get("type")
     text = ""
     user_id = "unknown"
     user_name = "there"
     space = ""
+    attachments = []
 
     if is_addon:
         chat_payload = body.get("chat", {})
@@ -82,6 +83,7 @@ def _parse_event(body: dict) -> dict:
         msg_payload = chat_payload.get("messagePayload", {})
         msg = msg_payload.get("message", {})
         text = msg.get("argumentText", msg.get("text", "")).strip()
+        attachments = msg.get("attachment", [])
 
         chat_user = chat_payload.get("user", {})
         user_id = chat_user.get("name", "unknown")
@@ -92,6 +94,7 @@ def _parse_event(body: dict) -> dict:
     else:
         msg = body.get("message", {})
         text = msg.get("argumentText", msg.get("text", "")).strip()
+        attachments = msg.get("attachment", [])
         user = body.get("user", {})
         user_id = user.get("name", "unknown")
         user_name = user.get("displayName", "there")
@@ -104,6 +107,7 @@ def _parse_event(body: dict) -> dict:
         "user_name": user_name,
         "space": space,
         "is_addon": is_addon,
+        "attachments": attachments,
     }
 
 
@@ -332,67 +336,80 @@ async def chat_webhook(request: Request):
 
 
 async def handle_message(ev: dict) -> dict:
-    """Process an incoming chat message.
+    """Process an incoming chat message (text and/or voice).
     Returns an immediate ack and processes the real response in a background
     thread, sending it via the Chat API when ready."""
     text = ev["text"]
     user_id = ev["user_id"]
     space = ev["space"]
     is_addon = ev["is_addon"]
+    attachments = ev.get("attachments", [])
+
+    audio_attachments = [
+        a for a in attachments
+        if a.get("contentType", "").startswith("audio/")
+    ]
+    has_non_audio_attachments = len(attachments) > len(audio_attachments) and not audio_attachments
 
     if space and not config.CHAT_SPACE_ID:
         print(f"Detected space ID: {space}")
         print(f"   Set CHAT_SPACE_ID={space} in your environment variables")
 
-    if not text:
+    if not text and not audio_attachments:
+        if has_non_audio_attachments:
+            return _make_response(
+                "i can only handle voice messages for now — try sending an audio clip or just type it out",
+                is_addon,
+            )
         return _make_response(
             "Hmm, I got nothing there. Try asking about your emails, meetings, or tasks",
             is_addon,
         )
 
-    lower = text.lower().strip()
-    if lower in ("clear", "reset", "start over"):
-        clear_conversation(user_id)
-        return _make_response("Slate wiped. What can Momo do for you?", is_addon)
+    if text and not audio_attachments:
+        lower = text.lower().strip()
+        if lower in ("clear", "reset", "start over"):
+            clear_conversation(user_id)
+            return _make_response("Slate wiped. What can Momo do for you?", is_addon)
 
-    if lower in ("briefing", "morning briefing", "daily briefing"):
-        try:
-            run_morning_briefing()
-            return _make_response("Morning briefing sent!", is_addon)
-        except Exception as e:
-            return _make_response(f"Error generating briefing: {str(e)}", is_addon)
+        if lower in ("briefing", "morning briefing", "daily briefing"):
+            try:
+                run_morning_briefing()
+                return _make_response("Morning briefing sent!", is_addon)
+            except Exception as e:
+                return _make_response(f"Error generating briefing: {str(e)}", is_addon)
 
-    _CONFIRM_PHRASES = {
-        "yes", "yep", "yeah", "yea", "y", "sure", "do it", "go ahead",
-        "create them", "create those", "create those tasks", "create tasks",
-        "add them", "add those", "add those tasks", "go for it", "please",
-        "yes please", "yep do it", "sounds good", "let's do it",
-    }
-    _DECLINE_PHRASES = {
-        "no", "nah", "nope", "n", "skip", "skip those", "no thanks",
-        "don't create", "never mind", "nevermind", "cancel",
-    }
-    if lower in _CONFIRM_PHRASES:
-        pending, meeting_title = get_pending_tasks()
-        if pending:
-            target_space = space or config.CHAT_SPACE_ID
-            thread = threading.Thread(
-                target=_create_pending_tasks_background,
-                args=(pending, meeting_title, target_space),
-                daemon=True,
-            )
-            thread.start()
-            return _make_response("", is_addon)
-    if lower in _DECLINE_PHRASES:
-        pending, _ = get_pending_tasks()
-        if pending:
-            clear_pending_tasks()
-            return _make_response("Got it — skipped those tasks.", is_addon)
+        _CONFIRM_PHRASES = {
+            "yes", "yep", "yeah", "yea", "y", "sure", "do it", "go ahead",
+            "create them", "create those", "create those tasks", "create tasks",
+            "add them", "add those", "add those tasks", "go for it", "please",
+            "yes please", "yep do it", "sounds good", "let's do it",
+        }
+        _DECLINE_PHRASES = {
+            "no", "nah", "nope", "n", "skip", "skip those", "no thanks",
+            "don't create", "never mind", "nevermind", "cancel",
+        }
+        if lower in _CONFIRM_PHRASES:
+            pending, meeting_title = get_pending_tasks()
+            if pending:
+                target_space = space or config.CHAT_SPACE_ID
+                thread = threading.Thread(
+                    target=_create_pending_tasks_background,
+                    args=(pending, meeting_title, target_space),
+                    daemon=True,
+                )
+                thread.start()
+                return _make_response("", is_addon)
+        if lower in _DECLINE_PHRASES:
+            pending, _ = get_pending_tasks()
+            if pending:
+                clear_pending_tasks()
+                return _make_response("Got it — skipped those tasks.", is_addon)
 
     target_space = space or config.CHAT_SPACE_ID
     thread = threading.Thread(
         target=_process_message_background,
-        args=(text, user_id, target_space),
+        args=(text, user_id, target_space, audio_attachments),
         daemon=True,
     )
     thread.start()
@@ -446,9 +463,49 @@ def _create_pending_tasks_background(pending_tasks, meeting_title, space):
             print(f"Failed to send error message: {e}")
 
 
-def _process_message_background(text, user_id, space):
+def _transcribe_voice_message(audio_attachments, existing_text, space):
+    """Download and transcribe audio attachments. Returns the final text to
+    process, or None if transcription fails entirely (error already sent)."""
+    for attachment in audio_attachments:
+        content_type = attachment.get("contentType", "")
+        if content_type not in _SUPPORTED_AUDIO_TYPES:
+            print(f"Unsupported audio type: {content_type}")
+            continue
+
+        resource_name = attachment.get("attachmentDataRef", {}).get("resourceName")
+        if not resource_name:
+            resource_name = attachment.get("name", "")
+        if not resource_name:
+            print("Attachment missing resource name, skipping")
+            continue
+
+        result = download_attachment(resource_name)
+        if result is None:
+            continue
+
+        audio_bytes, detected_type = result
+        mime = detected_type if detected_type.startswith("audio/") else content_type
+
+        transcription = transcribe_audio(audio_bytes, mime)
+        if transcription:
+            if existing_text:
+                return f"{existing_text}\n\n[voice message]: {transcription}"
+            return transcription
+
+    if not existing_text:
+        send_chat_message(space, "couldn't process that voice message — try typing it out?")
+        return None
+    return existing_text
+
+
+def _process_message_background(text, user_id, space, audio_attachments=None):
     """Heavy processing in background thread — no 30s webhook pressure."""
     try:
+        if audio_attachments:
+            text = _transcribe_voice_message(audio_attachments, text, space)
+            if text is None:
+                return
+
         history = get_conversation(user_id)
         context_data = _build_context(text)
         response = chat_response(text, history, context_data)
