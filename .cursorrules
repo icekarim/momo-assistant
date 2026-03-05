@@ -5,8 +5,8 @@
 After completing any code change, bug fix, new feature, or planned task, you MUST update the Notion project tracker using the helper script:
 
 ```bash
-# Add a new task when planning work
-python scripts/update_notion_tracker.py add "Task description" --status "To Do" --priority "High" --component "Gmail" --type "Feature" --effort "Small"
+# Add a new task when planning work — ALWAYS include --description
+python scripts/update_notion_tracker.py add "Task description" --status "To Do" --priority "High" --component "Gmail" --type "Feature" --effort "Small" --description "Detailed explanation of what this task involves, why it's needed, and what files/components are affected."
 
 # Mark a task as in progress when starting
 python scripts/update_notion_tracker.py update "Task description" --status "In Progress"
@@ -17,6 +17,13 @@ python scripts/update_notion_tracker.py update "Task description" --status "Done
 # List current tasks
 python scripts/update_notion_tracker.py list --status "In Progress"
 ```
+
+### IMPORTANT: Always include --description
+When creating a task, you MUST provide a `--description` with a clear explanation of:
+- What the task involves
+- Why it's needed
+- Which files/components are affected
+- Any relevant technical details
 
 ### When to update:
 - **Starting work**: set task to "In Progress" (create it first if it doesn't exist)
