@@ -291,13 +291,22 @@ def _process_debrief_tasks(debrief_text, meeting_title=""):
     return cleaned
 
 
+def _notes_are_substantive(granola_notes: str) -> bool:
+    """Return True if the notes contain enough actual content for a useful debrief.
+    Catches partial/in-progress notes from meetings that are still running overtime."""
+    import re
+    stripped = re.sub(r'<[^>]+>', '', granola_notes).strip()
+    word_count = len(stripped.split())
+    return word_count >= config.MEETING_DEBRIEF_MIN_NOTE_WORDS
+
+
 def run_post_meeting_debrief():
     """Check for recently ended meetings and send short debriefs with Granola notes.
 
-    Notes-gated: a debrief is only sent once Granola notes are available.
-    Meetings that run over their scheduled time are handled naturally — the
-    lookback window is wide enough to keep retrying on subsequent scheduler
-    runs until the notes appear.
+    Notes-gated: a debrief is only sent once Granola notes are available AND
+    substantive (enough words to indicate the meeting actually finished).
+    This prevents firing debriefs with partial/in-progress notes when meetings
+    run over their scheduled time.
 
     If Granola itself is erroring (auth, network, etc.) the debrief is sent
     without notes after MEETING_DEBRIEF_GRACE_MINUTES so the user isn't left
@@ -391,6 +400,10 @@ def run_post_meeting_debrief():
                 print(f"    {reason}, deferring to next run")
                 deferred_count += 1
                 continue
+        elif not _notes_are_substantive(granola_notes):
+            print(f"    Notes too thin ({len(granola_notes.split())} words) — meeting may still be in progress, deferring")
+            deferred_count += 1
+            continue
 
         try:
             end_time = meeting.get("end_time", "")

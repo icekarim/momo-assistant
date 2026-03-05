@@ -288,26 +288,40 @@ def _find_task_by_title(svc, title_query):
 
 
 def fetch_recently_completed_tasks(days_back=14):
-    """Fetch tasks completed in the last N days so Gemini knows what's already done."""
+    """Fetch tasks completed in the last N days so Gemini knows what's already done.
+    Fetches all task lists in parallel."""
     svc = get_tasks_service()
     from datetime import timedelta
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).isoformat()
 
-    completed = []
     lists_resp = svc.tasklists().list(maxResults=100).execute()
-    for tl in lists_resp.get("items", []):
-        tasks_resp = svc.tasks().list(
+    task_lists = lists_resp.get("items", [])
+
+    def _fetch_completed_from_list(tl):
+        list_svc = get_tasks_service()
+        tasks_resp = list_svc.tasks().list(
             tasklist=tl["id"],
             showCompleted=True,
             showHidden=True,
             completedMin=cutoff,
             maxResults=100,
         ).execute()
+        results = []
         for task in tasks_resp.get("items", []):
             title = (task.get("title", "") or "").strip()
             if not title or task.get("status") != "completed":
                 continue
-            completed.append({"title": title, "list_name": tl["title"]})
+            results.append({"title": title, "list_name": tl["title"]})
+        return results
+
+    completed = []
+    with ThreadPoolExecutor(max_workers=min(len(task_lists), 5)) as pool:
+        futures = {pool.submit(_fetch_completed_from_list, tl): tl["title"] for tl in task_lists}
+        for future in as_completed(futures):
+            try:
+                completed.extend(future.result())
+            except Exception as e:
+                print(f"Error fetching completed tasks from '{futures[future]}': {e}")
     return completed
 
 
