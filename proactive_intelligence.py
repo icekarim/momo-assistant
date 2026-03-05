@@ -14,6 +14,7 @@ Coordinator functions:
 import hashlib
 import traceback
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 import google.generativeai as genai
@@ -79,33 +80,54 @@ def _build_meeting_prep(meeting: dict) -> str | None:
     all_entries = []
     seen_ids = set()
 
-    for name in attendee_names:
-        first_name = name.split()[0] if name else name
-        for entry in query_by_person(first_name, limit=8):
-            if entry["id"] not in seen_ids:
-                seen_ids.add(entry["id"])
-                all_entries.append(entry)
+    first_names = [name.split()[0] if name else name for name in attendee_names]
 
-    commitments = query_open_commitments(limit=15)
-    attendee_names_lower = {n.lower() for n in attendee_names}
-    attendee_first_lower = {n.split()[0].lower() for n in attendee_names if n}
-    for c in commitments:
-        if c["id"] in seen_ids:
-            continue
-        people = {p.lower() for p in c.get("related_people", [])}
-        owner = (c.get("owner") or "").lower()
-        if people & attendee_first_lower or owner in attendee_first_lower:
-            seen_ids.add(c["id"])
-            all_entries.append(c)
+    with ThreadPoolExecutor(max_workers=max(len(first_names) + 1, 4)) as pool:
+        person_futures = {
+            pool.submit(query_by_person, fn, 8): fn for fn in first_names
+        }
+        commitment_future = pool.submit(query_open_commitments, 15)
+
+        for future in as_completed(person_futures):
+            try:
+                for entry in future.result():
+                    if entry["id"] not in seen_ids:
+                        seen_ids.add(entry["id"])
+                        all_entries.append(entry)
+            except Exception as exc:
+                print(f"    KG person query failed: {exc}")
+
+        attendee_first_lower = {n.lower() for n in first_names if n}
+        try:
+            for c in commitment_future.result():
+                if c["id"] in seen_ids:
+                    continue
+                people = {p.lower() for p in c.get("related_people", [])}
+                owner = (c.get("owner") or "").lower()
+                if people & attendee_first_lower or owner in attendee_first_lower:
+                    seen_ids.add(c["id"])
+                    all_entries.append(c)
+        except Exception as exc:
+            print(f"    KG commitments query failed: {exc}")
 
     projects = set()
     for e in all_entries:
         projects.update(e.get("related_projects", []))
-    for proj in list(projects)[:3]:
-        for entry in query_by_project(proj, limit=5):
-            if entry["id"] not in seen_ids:
-                seen_ids.add(entry["id"])
-                all_entries.append(entry)
+    project_list = list(projects)[:3]
+
+    if project_list:
+        with ThreadPoolExecutor(max_workers=len(project_list)) as pool:
+            proj_futures = {
+                pool.submit(query_by_project, proj, 5): proj for proj in project_list
+            }
+            for future in as_completed(proj_futures):
+                try:
+                    for entry in future.result():
+                        if entry["id"] not in seen_ids:
+                            seen_ids.add(entry["id"])
+                            all_entries.append(entry)
+                except Exception as exc:
+                    print(f"    KG project query failed: {exc}")
 
     if not all_entries:
         return None
@@ -451,26 +473,22 @@ def generate_daily_nudges() -> str:
 
     all_nudges = []
 
-    print("  Proactive intelligence: running commitment engine...")
-    try:
-        all_nudges.extend(_run_commitment_engine())
-    except Exception as exc:
-        print(f"    Commitment engine failed: {exc}")
-        traceback.print_exc()
+    engines = {
+        "commitment": _run_commitment_engine,
+        "pattern": _run_pattern_engine,
+        "drift": _run_drift_engine,
+    }
 
-    print("  Proactive intelligence: running pattern engine...")
-    try:
-        all_nudges.extend(_run_pattern_engine())
-    except Exception as exc:
-        print(f"    Pattern engine failed: {exc}")
-        traceback.print_exc()
-
-    print("  Proactive intelligence: running drift engine...")
-    try:
-        all_nudges.extend(_run_drift_engine())
-    except Exception as exc:
-        print(f"    Drift engine failed: {exc}")
-        traceback.print_exc()
+    print("  Proactive intelligence: running all engines in parallel...")
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        future_to_name = {pool.submit(fn): name for name, fn in engines.items()}
+        for future in as_completed(future_to_name):
+            name = future_to_name[future]
+            try:
+                all_nudges.extend(future.result())
+            except Exception as exc:
+                print(f"    {name} engine failed: {exc}")
+                traceback.print_exc()
 
     if not all_nudges:
         print("  Proactive intelligence: no nudges to report")
