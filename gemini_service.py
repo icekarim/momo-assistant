@@ -237,6 +237,32 @@ def _get_model(complexity: TaskComplexity = TaskComplexity.STANDARD,
     )
 
 
+def transcribe_audio(audio_bytes: bytes, mime_type: str) -> str | None:
+    """Transcribe audio using Gemini's native multimodal capabilities.
+
+    Returns the transcription text, or None if transcription fails.
+    """
+    try:
+        model = _get_model(
+            TaskComplexity.LIGHT,
+            system_prompt="You are a precise speech-to-text transcriber. Return only the spoken words, nothing else.",
+        )
+        response = model.generate_content([
+            "Transcribe this voice message exactly as spoken. "
+            "Return only the transcription text with no preamble, labels, or formatting.",
+            {"mime_type": mime_type, "data": audio_bytes},
+        ])
+        text = response.text.strip()
+        if text:
+            print(f"Audio transcribed ({len(audio_bytes)} bytes → {len(text)} chars)")
+            return text
+        print("Transcription returned empty text")
+        return None
+    except Exception as e:
+        print(f"Audio transcription failed: {e}")
+        return None
+
+
 def generate_morning_briefing(emails_context, meetings_context, tasks_context,
                                granola_context="", nudges_context=""):
     """Generate the morning briefing summary."""
