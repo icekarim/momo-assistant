@@ -10,6 +10,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application
 COPY . .
 
+# Ensure print() output appears immediately in Cloud Run logs
+ENV PYTHONUNBUFFERED=1
 # Cloud Run sets PORT env var
 ENV PORT=8080
 

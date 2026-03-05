@@ -1,3 +1,6 @@
+import threading
+import time
+
 import google.auth
 from google.auth.transport.requests import AuthorizedSession
 import config
@@ -9,10 +12,20 @@ _SUPPORTED_AUDIO_TYPES = frozenset([
     "audio/webm", "audio/aac", "audio/x-m4a", "audio/mp3",
 ])
 
+_chat_session = None
+_chat_session_lock = threading.Lock()
+
 
 def _get_chat_session():
-    creds, _ = google.auth.default(scopes=_CHAT_SCOPES)
-    return AuthorizedSession(creds)
+    global _chat_session
+    if _chat_session is not None:
+        return _chat_session
+    with _chat_session_lock:
+        if _chat_session is not None:
+            return _chat_session
+        creds, _ = google.auth.default(scopes=_CHAT_SCOPES)
+        _chat_session = AuthorizedSession(creds)
+        return _chat_session
 
 
 def download_attachment(resource_name: str) -> tuple[bytes, str] | None:
@@ -43,18 +56,34 @@ def download_attachment(resource_name: str) -> tuple[bytes, str] | None:
 
 
 def send_chat_message(space_id, text):
-    """Send a message to a Google Chat space as the bot (app credentials)."""
+    """Send a message to a Google Chat space as the bot (app credentials).
+    Retries up to 3 times on transient network/SSL errors."""
     session = _get_chat_session()
     url = f"https://chat.googleapis.com/v1/{space_id}/messages"
 
     chunks = _split_message(text, max_len=4000)
 
     for chunk in chunks:
-        resp = session.post(url, json={"text": chunk})
-        if resp.status_code != 200:
-            print(f"Chat API error ({resp.status_code}): {resp.text}")
-        else:
-            print(f"Momo sent message to {space_id}")
+        _send_with_retry(session, url, chunk, space_id)
+
+
+def _send_with_retry(session, url, text, space_id, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            resp = session.post(url, json={"text": text})
+            if resp.status_code != 200:
+                print(f"Chat API error ({resp.status_code}): {resp.text}")
+            else:
+                print(f"Momo sent message to {space_id}")
+            return
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait = 1.0 * (attempt + 1)
+                print(f"Chat API send failed (attempt {attempt + 1}/{max_retries}): {e} — retrying in {wait}s")
+                time.sleep(wait)
+            else:
+                print(f"Chat API send failed after {max_retries} attempts: {e}")
+                raise
 
 
 def format_for_google_chat(markdown_text):
