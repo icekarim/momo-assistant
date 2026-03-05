@@ -113,17 +113,98 @@ def find_existing_task(name):
     return None
 
 
-def create_task(name, component, task_type, priority, effort):
+def add_page_content(page_id, blocks):
+    """Append content blocks to a Notion page."""
+    notion_request("PATCH", f"blocks/{page_id}/children", {"children": blocks})
+
+
+def build_commit_content(msg, files, components):
+    """Build Notion blocks describing what was done in this commit."""
+    blocks = []
+
+    # Commit message as a callout
+    blocks.append({
+        "object": "block", "type": "callout",
+        "callout": {
+            "icon": {"type": "emoji", "emoji": "📝"},
+            "rich_text": [{"type": "text", "text": {"content": msg}}],
+        }
+    })
+
+    # Commit hash + timestamp
+    commit_hash = subprocess.check_output(
+        ["git", "log", "-1", "--pretty=%H"], text=True
+    ).strip()[:8]
+    commit_date = subprocess.check_output(
+        ["git", "log", "-1", "--pretty=%ci"], text=True
+    ).strip()
+    blocks.append({
+        "object": "block", "type": "paragraph",
+        "paragraph": {"rich_text": [
+            {"type": "text", "text": {"content": f"Commit: {commit_hash} | {commit_date}"}, "annotations": {"code": True}},
+        ]}
+    })
+
+    # Components affected
+    blocks.append({
+        "object": "block", "type": "heading_3",
+        "heading_3": {"rich_text": [{"type": "text", "text": {"content": "Components affected"}}]}
+    })
+    for comp in sorted(components):
+        blocks.append({
+            "object": "block", "type": "bulleted_list_item",
+            "bulleted_list_item": {"rich_text": [{"type": "text", "text": {"content": comp}}]}
+        })
+
+    # Files changed
+    blocks.append({
+        "object": "block", "type": "heading_3",
+        "heading_3": {"rich_text": [{"type": "text", "text": {"content": "Files changed"}}]}
+    })
+    for f in files:
+        blocks.append({
+            "object": "block", "type": "bulleted_list_item",
+            "bulleted_list_item": {"rich_text": [
+                {"type": "text", "text": {"content": f}, "annotations": {"code": True}}
+            ]}
+        })
+
+    # Diff summary
+    try:
+        diff_stat = subprocess.check_output(
+            ["git", "log", "-1", "--pretty=", "--stat"], text=True
+        ).strip()
+        if diff_stat:
+            blocks.append({
+                "object": "block", "type": "heading_3",
+                "heading_3": {"rich_text": [{"type": "text", "text": {"content": "Diff summary"}}]}
+            })
+            blocks.append({
+                "object": "block", "type": "code",
+                "code": {
+                    "rich_text": [{"type": "text", "text": {"content": diff_stat}}],
+                    "language": "plain text",
+                }
+            })
+    except Exception:
+        pass
+
+    return blocks
+
+
+def create_task(name, component, task_type, priority, effort, content_blocks=None):
     """Create a task marked as Done (it was just committed)."""
     existing = find_existing_task(name)
     if existing:
         notion_request("PATCH", f"pages/{existing['id']}", {
             "properties": {"Status": {"select": {"name": "Done"}}}
         })
+        if content_blocks:
+            add_page_content(existing["id"], content_blocks)
         print(f"  Notion: Updated '{name}' -> Done")
         return
 
-    notion_request("POST", "pages", {
+    result = notion_request("POST", "pages", {
         "parent": {"database_id": DATABASE_ID},
         "properties": {
             "Task": {"title": [{"text": {"content": name}}]},
@@ -134,6 +215,8 @@ def create_task(name, component, task_type, priority, effort):
             "Effort": {"select": {"name": effort}},
         }
     })
+    if result and content_blocks:
+        add_page_content(result["id"], content_blocks)
     print(f"  Notion: Created '{name}' [Done, {priority}, {effort}]")
 
 
@@ -160,9 +243,11 @@ def main():
     task_name = msg[:100]
     primary_component = sorted(components)[0]
 
+    content_blocks = build_commit_content(msg, files, components)
+
     print(f"Post-commit: {task_name}")
     print(f"  Components: {comp_str}")
-    create_task(task_name, primary_component, task_type, priority, effort)
+    create_task(task_name, primary_component, task_type, priority, effort, content_blocks)
 
 
 if __name__ == "__main__":
