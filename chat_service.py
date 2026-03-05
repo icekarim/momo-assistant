@@ -2,14 +2,49 @@ import google.auth
 from google.auth.transport.requests import AuthorizedSession
 import config
 
+_CHAT_SCOPES = ["https://www.googleapis.com/auth/chat.bot"]
+_MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024  # 10 MB
+_SUPPORTED_AUDIO_TYPES = frozenset([
+    "audio/ogg", "audio/mp4", "audio/mpeg", "audio/wav",
+    "audio/webm", "audio/aac", "audio/x-m4a", "audio/mp3",
+])
+
+
+def _get_chat_session():
+    creds, _ = google.auth.default(scopes=_CHAT_SCOPES)
+    return AuthorizedSession(creds)
+
+
+def download_attachment(resource_name: str) -> tuple[bytes, str] | None:
+    """Download an attachment from Google Chat.
+
+    Returns (raw_bytes, content_type) on success, None on failure.
+    """
+    session = _get_chat_session()
+    url = f"https://chat.googleapis.com/v1/media/{resource_name}?alt=media"
+    try:
+        resp = session.get(url)
+        if resp.status_code != 200:
+            print(f"Attachment download failed ({resp.status_code}): {resp.text}")
+            return None
+
+        content_type = resp.headers.get("Content-Type", "application/octet-stream")
+        data = resp.content
+
+        if len(data) > _MAX_ATTACHMENT_BYTES:
+            print(f"Attachment too large ({len(data)} bytes), skipping")
+            return None
+
+        print(f"Downloaded attachment: {len(data)} bytes, type={content_type}")
+        return data, content_type
+    except Exception as e:
+        print(f"Attachment download error: {e}")
+        return None
+
 
 def send_chat_message(space_id, text):
     """Send a message to a Google Chat space as the bot (app credentials)."""
-    creds, _ = google.auth.default(
-        scopes=["https://www.googleapis.com/auth/chat.bot"]
-    )
-    session = AuthorizedSession(creds)
-
+    session = _get_chat_session()
     url = f"https://chat.googleapis.com/v1/{space_id}/messages"
 
     chunks = _split_message(text, max_len=4000)
