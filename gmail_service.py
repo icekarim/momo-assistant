@@ -65,7 +65,8 @@ def _search_emails(query, max_results):
     msg_refs = msg_refs[:max_results]
 
     def _fetch_one(msg_id):
-        msg = svc.users().messages().get(
+        thread_svc = get_gmail_service()
+        msg = thread_svc.users().messages().get(
             userId="me", id=msg_id, format="full"
         ).execute()
         return msg_id, _parse_message(msg)

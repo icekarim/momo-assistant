@@ -307,6 +307,7 @@ Please create my morning briefing."""
 def chat_response(user_message, conversation_history, context_data):
     """Generate a conversational response with email/calendar/task context."""
     import time
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
     from datetime import datetime, timedelta
 
     has_kg_context = bool(context_data.get("knowledge_graph"))
@@ -364,18 +365,44 @@ def chat_response(user_message, conversation_history, context_data):
         history.append({"role": role, "parts": [turn["content"]]})
 
     chat = model.start_chat(history=history)
+    timeout_s = TIER_TIMEOUTS[complexity]
 
     start = time.time()
+    print(f"[perf] gemini: model={TASK_MODEL_MAP[complexity]} tier={complexity.value} timeout={timeout_s}s context={len(context_block)} chars")
+
+    def _do_send():
+        return chat.send_message(user_message)
+
     try:
-        resp = chat.send_message(user_message)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_do_send)
+            resp = future.result(timeout=timeout_s)
+        print(f"[perf] gemini response: {time.time() - start:.2f}s ({len(resp.text)} chars)")
         return resp.text
+    except FuturesTimeoutError:
+        print(f"Gemini {complexity.value} timed out after {timeout_s}s")
+        if complexity == TaskComplexity.DEEP:
+            fallback_model = _get_model(TaskComplexity.STANDARD)
+            fallback_chat = fallback_model.start_chat(history=history)
+            fallback_timeout = TIER_TIMEOUTS[TaskComplexity.STANDARD]
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(lambda: fallback_chat.send_message(user_message))
+                resp = future.result(timeout=fallback_timeout)
+            return resp.text
+        return "sorry, that took way too long — try again in a sec? (gemini was slow)"
     except Exception as e:
         if complexity == TaskComplexity.DEEP:
             print(f"Pro model failed ({e}), falling back to Flash")
             fallback_model = _get_model(TaskComplexity.STANDARD)
             fallback_chat = fallback_model.start_chat(history=history)
-            resp = fallback_chat.send_message(user_message)
-            return resp.text
+            fallback_timeout = TIER_TIMEOUTS[TaskComplexity.STANDARD]
+            try:
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(lambda: fallback_chat.send_message(user_message))
+                    resp = future.result(timeout=fallback_timeout)
+                return resp.text
+            except FuturesTimeoutError:
+                return "sorry, that took way too long — try again in a sec?"
         raise
     finally:
         elapsed = time.time() - start
