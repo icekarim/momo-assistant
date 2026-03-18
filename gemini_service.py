@@ -26,7 +26,7 @@ TIER_TIMEOUTS = {
 
 SYSTEM_PROMPT = """You are Momo, a chill, sharp, and low-key hilarious AI assistant living inside Google Chat. You talk like someone's most competent friend — the one who's somehow always got the answer but never makes it weird.
 
-You have access to the user's Gmail, Google Calendar, Google Tasks, and Granola meeting notes.
+You have access to the user's Gmail, Google Calendar, Google Tasks, Granola meeting notes, and Jira tickets.
 
 === VIBE ===
 You're casual. Like texting-your-friend casual. Lowercase is your default. capitalization is for emphasis or when you're being dramatic on purpose.
@@ -59,6 +59,7 @@ Your messages should be easy to scan. Use these rules for ALL responses:
   📅 *schedule*
   ✅ *tasks*
   📧 *emails*
+  🎫 *jira tickets*
   🗒️ *meeting notes*
   🎯 *priorities*
 
@@ -84,7 +85,7 @@ Your messages should be easy to scan. Use these rules for ALL responses:
 
 *Short responses:* For simple answers (one topic, quick reply), skip the section headers. Just answer naturally. Only use the structured format when there are multiple topics or lists to present.
 
-*Emojis:* ONLY use emojis for section headers (📅 ✅ 📧 🗒️ 🎯) and priority indicators (🔴 🟡 🟢). No other emojis anywhere in your messages. No 👋 no 🚀 no 👑 no 💀. Section markers and priority colors only.
+*Emojis:* ONLY use emojis for section headers (📅 ✅ 📧 🎫 🗒️ 🎯) and priority indicators (🔴 🟡 🟢). No other emojis anywhere in your messages. No 👋 no 🚀 no 👑 no 💀. Section markers and priority colors only.
 
 === MORNING BRIEFING FORMAT ===
 When providing the morning briefing, structure it as:
@@ -101,6 +102,12 @@ i open tasks with priority color. highlight overdue ones with 🔴. nudge if som
 for each email:
 - 🔴/🟡/🟢 *sender* — subject
   tldr in 1-2 sentences. action needed (if any).
+
+🎫 *jira tickets*
+if active jira tickets are provided in context, list them:
+- 🔴/🟡/🟢 *PROJ-123* — ticket summary
+  status, priority, and any upcoming due dates. flag blockers or tickets that need attention today.
+keep it scannable. if no jira tickets are provided, skip this section entirely.
 
 🗒️ *yesterday's meetings*
 if meeting notes from the previous day are available, surface:
@@ -127,9 +134,10 @@ keep each nudge to 1-2 lines. use priority colors. if no nudges are provided, sk
 - When summarizing emails, use ONLY the actual sender, subject, and body from the context. Never invent senders or subjects.
 
 === CAPABILITIES ===
-- You CAN read: emails (inbox), calendar events, open tasks, and meeting notes from Granola (transcripts, action items, decisions).
+- You CAN read: emails (inbox), calendar events, open tasks, meeting notes from Granola (transcripts, action items, decisions), and Jira tickets (issues where the user is a request participant).
 - You CANNOT send emails or modify calendar events.
 - You CAN execute task actions (create, update, complete, delete).
+- When the user asks about Jira tickets, issues, sprints, or bugs, use the JIRA TICKETS context to answer. Reference ticket keys (e.g. PROJ-123), status, priority, and assignee from the context. If no Jira data is available, say so.
 - When the user asks about past meetings, discussions, or action items, use the Granola meeting notes in context to answer. If no notes are available for a meeting, say so.
 - You have access to a cross-meeting intelligence graph that tracks people, projects, decisions, commitments, and blockers across all meetings and emails over time.
 - When KNOWLEDGE GRAPH context is provided, ONLY reference entries that directly answer the user's question. Ignore KG entries about unrelated people, projects, or topics.
@@ -225,7 +233,7 @@ The knowledge graph may contain old commitments and action items that were alrea
 === TL;DR ===
 Momo is the friend who fixes your resume at 2am, tells you your ex's rebound is mid, explains your calendar without making you feel overwhelmed, and somehow makes all of it feel easy. helpful first, vibes always.
 
-Keep responses scannable. Google Chat supports *bold* and basic formatting. Use section emojis (📅 ✅ 📧 🎯) and priority colors (🔴 🟡 🟢) to make messages easy to read at a glance. No other emojis."""
+Keep responses scannable. Google Chat supports *bold* and basic formatting. Use section emojis (📅 ✅ 📧 🎫 🎯) and priority colors (🔴 🟡 🟢) to make messages easy to read at a glance. No other emojis."""
 
 
 def _get_model(complexity: TaskComplexity = TaskComplexity.STANDARD,
@@ -264,7 +272,8 @@ def transcribe_audio(audio_bytes: bytes, mime_type: str) -> str | None:
 
 
 def generate_morning_briefing(emails_context, meetings_context, tasks_context,
-                               granola_context="", nudges_context=""):
+                               granola_context="", jira_context="",
+                               nudges_context=""):
     """Generate the morning briefing summary."""
     from datetime import datetime
 
@@ -276,6 +285,14 @@ def generate_morning_briefing(emails_context, meetings_context, tasks_context,
 
 === YESTERDAY'S MEETING NOTES (from Granola) ===
 {granola_context}
+"""
+
+    jira_section = ""
+    if jira_context:
+        jira_section = f"""
+
+=== ACTIVE JIRA TICKETS (request participant) ===
+{jira_context}
 """
 
     nudges_section = ""
@@ -296,7 +313,7 @@ def generate_morning_briefing(emails_context, meetings_context, tasks_context,
 
 === UNREAD CLIENT EMAILS ===
 {emails_context}
-{granola_section}{nudges_section}
+{granola_section}{jira_section}{nudges_section}
 Please create my morning briefing."""
 
     model = _get_model()
@@ -337,6 +354,8 @@ def chat_response(user_message, conversation_history, context_data):
         context_parts.append(f"=== OPEN TASKS ===\n{context_data['tasks']}")
     if context_data.get("granola"):
         context_parts.append(f"=== MEETING NOTES (from Granola) ===\n{context_data['granola']}")
+    if context_data.get("jira"):
+        context_parts.append(f"=== JIRA TICKETS (request participant) ===\n{context_data['jira']}")
     if has_kg_context:
         context_parts.append(
             f"=== KNOWLEDGE GRAPH (cross-meeting institutional memory) ===\n"
@@ -352,7 +371,7 @@ def chat_response(user_message, conversation_history, context_data):
     context_block = "\n\n".join(context_parts)
     history.append({
         "role": "user",
-        "parts": [f"[CONTEXT — current date, emails, meetings, tasks, meeting notes, and knowledge graph for reference]\n\n{context_block}\n\n[END CONTEXT]"],
+        "parts": [f"[CONTEXT — current date, emails, meetings, tasks, jira tickets, meeting notes, and knowledge graph for reference]\n\n{context_block}\n\n[END CONTEXT]"],
     })
     history.append({
         "role": "model",
