@@ -57,6 +57,17 @@ def run_morning_briefing():
             print(f"     Granola fetch failed: {e}")
             return "granola", ""
 
+    def _fetch_jira_tickets():
+        try:
+            from jira_service import fetch_active_jira_tickets, format_jira_tickets_for_context
+            raw = fetch_active_jira_tickets()
+            ctx = format_jira_tickets_for_context(raw)
+            print(f"     Jira tickets loaded ({len(ctx)} chars)")
+            return "jira", ctx
+        except Exception as e:
+            print(f"     Jira fetch failed: {e}")
+            return "jira", ""
+
     def _fetch_nudges():
         try:
             from proactive_intelligence import generate_daily_nudges
@@ -71,12 +82,14 @@ def run_morning_briefing():
             return "nudges", ""
 
     futures = {}
-    with ThreadPoolExecutor(max_workers=5) as pool:
+    with ThreadPoolExecutor(max_workers=6) as pool:
         futures["emails"] = pool.submit(_fetch_emails)
         futures["meetings"] = pool.submit(_fetch_meetings)
         futures["tasks"] = pool.submit(_fetch_tasks)
         if config.GRANOLA_ENABLED:
             futures["granola"] = pool.submit(_fetch_granola)
+        if config.JIRA_ENABLED:
+            futures["jira"] = pool.submit(_fetch_jira_tickets)
         if config.PROACTIVE_INTELLIGENCE_ENABLED and config.KNOWLEDGE_GRAPH_ENABLED:
             futures["nudges"] = pool.submit(_fetch_nudges)
 
@@ -93,9 +106,10 @@ def run_morning_briefing():
     meetings = data.get("meetings", [])
     tasks = data.get("tasks", [])
     granola_ctx = data.get("granola", "")
+    jira_ctx = data.get("jira", "")
     nudges_ctx = data.get("nudges", "")
 
-    if not emails and not meetings and not tasks and not granola_ctx and not nudges_ctx:
+    if not emails and not meetings and not tasks and not granola_ctx and not jira_ctx and not nudges_ctx:
         print("  Nothing to report. Skipping.")
         return {"status": "skipped", "reason": "nothing to report"}
 
@@ -106,7 +120,8 @@ def run_morning_briefing():
     print("  Generating briefing with Gemini...")
     summary = generate_morning_briefing(
         emails_ctx, meetings_ctx, tasks_ctx,
-        granola_context=granola_ctx, nudges_context=nudges_ctx,
+        granola_context=granola_ctx, jira_context=jira_ctx,
+        nudges_context=nudges_ctx,
     )
     summary = _process_debrief_tasks(summary, meeting_title="Morning Briefing")
 

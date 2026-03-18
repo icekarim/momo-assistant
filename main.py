@@ -877,6 +877,12 @@ def _build_context(user_message):
 
     wants_granola = config.GRANOLA_ENABLED and (wants_meeting_notes or is_general or has_specific_entity)
 
+    jira_keywords = [
+        "jira", "ticket", "issue", "sprint", "backlog",
+        "story", "bug", "epic", "kanban", "board",
+    ]
+    wants_jira = config.JIRA_ENABLED and (any(kw in lower for kw in jira_keywords) or is_general)
+
     def _timed_fetch(name, fn):
         t = time.time()
         result = fn()
@@ -903,6 +909,12 @@ def _build_context(user_message):
         from granola_service import query_granola
         return "granola", query_granola(user_message)
 
+    def _fetch_jira():
+        from jira_service import search_jira_tickets, fetch_active_jira_tickets
+        if any(kw in lower for kw in jira_keywords):
+            return "jira", search_jira_tickets(user_message)
+        return "jira", fetch_active_jira_tickets()
+
     wants_knowledge = config.KNOWLEDGE_GRAPH_ENABLED
 
     def _fetch_knowledge():
@@ -915,10 +927,11 @@ def _build_context(user_message):
         "emails": 15,
         "targeted_emails": 15,
         "granola": 12,
+        "jira": 12,
         "knowledge_graph": 10,
     }
 
-    pool = ThreadPoolExecutor(max_workers=7)
+    pool = ThreadPoolExecutor(max_workers=8)
     futures = {}
     futures["meetings"] = pool.submit(_timed_fetch, "meetings", _fetch_meetings)
     futures["tasks"] = pool.submit(_timed_fetch, "tasks", _fetch_tasks)
@@ -928,6 +941,8 @@ def _build_context(user_message):
         futures["targeted_emails"] = pool.submit(_timed_fetch, "targeted_emails", _fetch_targeted_emails)
     if wants_granola:
         futures["granola"] = pool.submit(_timed_fetch, "granola", _fetch_granola)
+    if wants_jira:
+        futures["jira"] = pool.submit(_timed_fetch, "jira", _fetch_jira)
     if wants_knowledge:
         futures["knowledge_graph"] = pool.submit(_timed_fetch, "knowledge_graph", _fetch_knowledge)
 
@@ -953,7 +968,7 @@ def _build_context(user_message):
     if timed_out_sources:
         human_names = {"meetings": "calendar", "tasks": "tasks", "emails": "email",
                        "targeted_emails": "email search", "granola": "meeting notes",
-                       "knowledge_graph": "knowledge graph"}
+                       "jira": "jira tickets", "knowledge_graph": "knowledge graph"}
         names = [human_names.get(s, s) for s in timed_out_sources]
         context["_unavailable_sources"] = (
             f"Note: I couldn't reach your {', '.join(names)} right now (timed out). "
