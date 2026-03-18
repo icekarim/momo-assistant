@@ -42,12 +42,18 @@ GOOGLE_TOKEN_JSON=$(cat token.json)
 GRANOLA_TOKEN_JSON=$(cat granola_token.json 2>/dev/null || echo "")
 
 # Build and deploy in one step
+JIRA_ENABLED="${JIRA_ENABLED:-$(grep '^JIRA_ENABLED=' .env 2>/dev/null | cut -d= -f2)}"
+JIRA_SITE_URL="${JIRA_SITE_URL:-$(grep '^JIRA_SITE_URL=' .env 2>/dev/null | cut -d= -f2)}"
+JIRA_USER_EMAIL="${JIRA_USER_EMAIL:-$(grep '^JIRA_USER_EMAIL=' .env 2>/dev/null | cut -d= -f2)}"
+JIRA_API_TOKEN="${JIRA_API_TOKEN:-$(grep '^JIRA_API_TOKEN=' .env 2>/dev/null | cut -d= -f2)}"
+
 gcloud run deploy $SERVICE_NAME \
   --source . \
   --region $REGION \
   --platform managed \
   --allow-unauthenticated \
   --set-env-vars="GEMINI_API_KEY=${GEMINI_API_KEY},GCP_PROJECT_ID=$PROJECT_ID,CHAT_SPACE_ID=${CHAT_SPACE_ID},GRANOLA_ENABLED=true" \
+  --set-env-vars="JIRA_ENABLED=${JIRA_ENABLED:-false},JIRA_SITE_URL=${JIRA_SITE_URL},JIRA_USER_EMAIL=${JIRA_USER_EMAIL},JIRA_API_TOKEN=${JIRA_API_TOKEN}" \
   --set-env-vars="^##^GOOGLE_TOKEN_JSON=${GOOGLE_TOKEN_JSON}##GRANOLA_TOKEN_JSON=${GRANOLA_TOKEN_JSON}" \
   --memory=1Gi \
   --timeout=300 \
