@@ -910,10 +910,20 @@ def _build_context(user_message):
         return "granola", query_granola(user_message)
 
     def _fetch_jira():
-        from jira_service import search_jira_tickets, fetch_active_jira_tickets
-        if any(kw in lower for kw in jira_keywords):
-            return "jira", search_jira_tickets(user_message)
-        return "jira", fetch_active_jira_tickets()
+        import re as _re
+        from jira_service import fetch_active_jira_tickets, get_jira_issue
+
+        # Always fetch active tickets as the base context
+        result = fetch_active_jira_tickets()
+
+        # If a specific issue key is mentioned (e.g. OSD-106548), fetch its details too
+        issue_keys = _re.findall(r'\b[A-Z]{2,10}-\d+\b', user_message)
+        for key in issue_keys[:3]:
+            detail = get_jira_issue(key)
+            if detail and key not in result:
+                result = result + "\n\n" + detail if result else detail
+
+        return "jira", result
 
     wants_knowledge = config.KNOWLEDGE_GRAPH_ENABLED
 
