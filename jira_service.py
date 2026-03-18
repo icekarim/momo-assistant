@@ -1,124 +1,112 @@
-"""Jira MCP client — fetches tickets via the Atlassian Remote MCP Server.
+"""Jira REST API client — fetches tickets via Jira Cloud REST API v3.
 
-Auth: static API token from JIRA_API_TOKEN env var, sent as Bearer auth.
-Generate one at:
-  https://id.atlassian.com/manage-profile/security/api-tokens?autofillToken&expiryDays=max&appId=mcp&selectedScopes=all
+Auth: Basic auth with email + API token.
+Generate a token at: https://id.atlassian.com/manage-profile/security/api-tokens
 """
 
-import asyncio
+import base64
 
 import httpx
-from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
 
 import config
 
-
-# ── MCP transport ────────────────────────────────────────────
-
-
-class _BearerAuth(httpx.Auth):
-    def __init__(self, token: str):
-        self.token = token
-
-    def auth_flow(self, request):
-        request.headers["Authorization"] = f"Bearer {self.token}"
-        yield request
+_TIMEOUT = 15
 
 
-async def _call_tool(tool_name: str, arguments: dict | None = None):
-    """Open a short-lived MCP session and call a single tool."""
-    token = config.JIRA_API_TOKEN
-    if not token:
-        print("Jira: no API token configured. Set JIRA_API_TOKEN in .env")
-        return None
+def _get_auth_header() -> dict[str, str]:
+    """Build Basic auth header from email + API token."""
+    raw = f"{config.JIRA_USER_EMAIL}:{config.JIRA_API_TOKEN}"
+    encoded = base64.b64encode(raw.encode()).decode()
+    return {
+        "Authorization": f"Basic {encoded}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
 
-    auth = _BearerAuth(token)
+
+def _base_url() -> str:
+    site = config.JIRA_SITE_URL.rstrip("/")
+    if not site.startswith("http"):
+        site = f"https://{site}"
+    return f"{site}/rest/api/3"
+
+
+def _search(jql: str, max_results: int = 50, fields: list[str] | None = None) -> list[dict]:
+    """Run a JQL search via POST /search/jql and return the list of issues."""
+    url = f"{_base_url()}/search/jql"
+    body: dict = {"jql": jql, "maxResults": max_results}
+    if fields:
+        body["fields"] = fields
 
     try:
-        async with streamablehttp_client(config.JIRA_MCP_URL, auth=auth) as (
-            read_stream,
-            write_stream,
-            _,
-        ):
-            async with ClientSession(read_stream, write_stream) as session:
-                await session.initialize()
-                result = await session.call_tool(tool_name, arguments=arguments or {})
-                return result
+        resp = httpx.post(url, headers=_get_auth_header(), json=body, timeout=_TIMEOUT)
+        resp.raise_for_status()
+        return resp.json().get("issues", [])
     except Exception as exc:
-        print(f"Jira MCP call '{tool_name}' failed: {exc}")
-        raise
-
-
-def _run(coro, timeout=20):
-    """Run an async coroutine from sync code with a timeout."""
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-
-    if loop and loop.is_running():
-        import concurrent.futures
-
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            return pool.submit(asyncio.run, coro).result(timeout=timeout)
-    return asyncio.run(coro)
-
-
-def _extract_text(result) -> str:
-    """Pull plain text out of an MCP tool result."""
-    if result is None:
-        return ""
-    if hasattr(result, "content"):
-        parts = []
-        for block in result.content:
-            if hasattr(block, "text"):
-                parts.append(block.text)
-        return "\n".join(parts)
-    return str(result)
+        print(f"Jira: search failed — {exc}")
+        return []
 
 
 # ── Public helpers ───────────────────────────────────────────
 
 
-def fetch_active_jira_tickets() -> str:
-    """Fetch active Jira tickets using the configured JQL filter.
+_ISSUE_FIELDS = ["summary", "status", "priority", "assignee", "reporter", "updated", "created", "issuetype"]
 
-    Default JQL targets tickets where the user is a request participant
-    with status category != Done.
-    """
-    try:
-        result = _run(_call_tool("search_issues", {
-            "jql": config.JIRA_JQL_FILTER,
-        }))
-        return _extract_text(result)
-    except Exception as exc:
-        print(f"Jira: fetch_active_jira_tickets failed: {exc}")
-        return ""
+
+def fetch_active_jira_tickets() -> str:
+    """Fetch active Jira tickets using the configured JQL filter."""
+    issues = _search(config.JIRA_JQL_FILTER, fields=_ISSUE_FIELDS)
+    return _format_issues(issues)
 
 
 def search_jira_tickets(query: str) -> str:
-    """Search Jira tickets with a natural-language or JQL query."""
-    try:
-        result = _run(_call_tool("search_issues", {
-            "query": query,
-        }))
-        return _extract_text(result)
-    except Exception as exc:
-        print(f"Jira: search_jira_tickets failed: {exc}")
-        return ""
+    """Search Jira tickets with a text query (wrapped in JQL text search)."""
+    jql = f'text ~ "{query}" ORDER BY updated DESC'
+    issues = _search(jql, max_results=20, fields=_ISSUE_FIELDS)
+    return _format_issues(issues)
 
 
 def get_jira_issue(issue_key: str) -> str:
     """Fetch details for a specific Jira issue by key (e.g. PROJ-123)."""
+    url = f"{_base_url()}/issue/{issue_key}"
     try:
-        result = _run(_call_tool("get_issue", {
-            "issue_key": issue_key,
-        }))
-        return _extract_text(result)
+        resp = httpx.get(url, headers=_get_auth_header(), timeout=_TIMEOUT)
+        resp.raise_for_status()
+        return _format_issues([resp.json()])
     except Exception as exc:
-        print(f"Jira: get_jira_issue({issue_key}) failed: {exc}")
+        print(f"Jira: get_issue({issue_key}) failed — {exc}")
         return ""
+
+
+def _format_issues(issues: list[dict]) -> str:
+    """Format a list of Jira issue dicts into a text block for Gemini context."""
+    if not issues:
+        return ""
+
+    lines = []
+    for issue in issues:
+        key = issue.get("key", "?")
+        fields = issue.get("fields", {})
+        summary = fields.get("summary", "(no summary)")
+
+        status = (fields.get("status") or {}).get("name", "Unknown")
+        priority = (fields.get("priority") or {}).get("name", "")
+        issue_type = (fields.get("issuetype") or {}).get("name", "")
+        assignee = (fields.get("assignee") or {}).get("displayName", "Unassigned")
+        reporter = (fields.get("reporter") or {}).get("displayName", "")
+        updated = fields.get("updated", "")[:10]
+
+        parts = [f"- {key}: {summary}"]
+        parts.append(f"  Type: {issue_type} | Status: {status} | Priority: {priority}")
+        parts.append(f"  Assignee: {assignee}")
+        if reporter:
+            parts.append(f"  Reporter: {reporter}")
+        if updated:
+            parts.append(f"  Updated: {updated}")
+
+        lines.append("\n".join(parts))
+
+    return "\n\n".join(lines)
 
 
 def format_jira_tickets_for_context(tickets_text: str) -> str:

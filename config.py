@@ -85,13 +85,15 @@ MEETING_DEBRIEF_GRACE_MINUTES = int(os.getenv("MEETING_DEBRIEF_GRACE_MINUTES", "
 MEETING_DEBRIEF_MIN_WAIT_MINUTES = int(os.getenv("MEETING_DEBRIEF_MIN_WAIT_MINUTES", "15"))
 MEETING_DEBRIEF_MIN_NOTE_WORDS = int(os.getenv("MEETING_DEBRIEF_MIN_NOTE_WORDS", "50"))
 
-# ── Jira MCP ────────────────────────────────────────────────
+# ── Jira ─────────────────────────────────────────────────────
 JIRA_ENABLED = os.getenv("JIRA_ENABLED", "false").lower() == "true"
-JIRA_MCP_URL = os.getenv("JIRA_MCP_URL", "https://mcp.atlassian.com/v1/mcp")
+JIRA_SITE_URL = os.getenv("JIRA_SITE_URL", "")          # e.g. yourcompany.atlassian.net
+JIRA_USER_EMAIL = os.getenv("JIRA_USER_EMAIL", "")
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN", "")
 JIRA_JQL_FILTER = os.getenv(
     "JIRA_JQL_FILTER",
-    '"request-participants" = currentUser() AND statusCategory != Done ORDER BY updated DESC',
+    "(assignee = currentUser() OR reporter = currentUser() OR watcher = currentUser()) "
+    "AND statusCategory != Done ORDER BY updated DESC",
 )
 
 # ── Server ───────────────────────────────────────────────────
