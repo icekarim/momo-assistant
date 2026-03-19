@@ -4,11 +4,13 @@ Momo is a personal AI chief of staff that lives in Google Chat. It knows your in
 
 Every morning it drops a briefing in Chat: what needs your attention in your inbox, what's on your calendar, what's open in your task list, and what came out of yesterday's meetings. Throughout the day you can message it like a colleague — ask questions, get summaries, delegate tasks, or dig into what was decided in a meeting last week.
 
-Momo builds a **cross-meeting knowledge graph** — it extracts decisions, commitments, action items, blockers, and topics from every meeting, email, and chat conversation, then connects dots across them over time. The knowledge graph is queried on every message, so Momo always has institutional memory alongside live data.
+Momo is **agentic** — when you send a message, Gemini decides which tools to call (Gmail, Calendar, Tasks, Knowledge Graph, Granola, Jira), executes them, observes the results, and iterates until it has enough information to respond. No pre-fetching everything on every message. No keyword gating. Momo pulls exactly the data it needs, when it needs it.
+
+Momo builds a **cross-meeting knowledge graph** with **vector embeddings** — it extracts decisions, commitments, action items, blockers, and topics from every meeting, email, calendar event, task, and chat conversation, then embeds them for semantic search. Ask about anything in natural language and Momo finds the relevant context across all sources.
 
 On top of that, Momo runs a **proactive intelligence engine** — it surfaces insights before you ask. Pre-meeting prep briefs, commitment follow-ups with auto-resolution, pattern detection across meetings, and drift alerts for projects that have gone quiet. All delivered as nudges in your morning briefing or as standalone Chat messages for urgent items.
 
-Built with **FastAPI** + **Gemini Flash / Pro** (tiered routing), deployed on **Google Cloud Run**.
+Built with **FastAPI** + **Gemini Flash** (agentic tool-use loop), deployed on **Google Cloud Run**.
 
 ---
 
@@ -31,18 +33,35 @@ Within minutes of a calendar meeting ending, Momo pulls the Granola notes for th
 ### Pre-meeting prep briefs
 Before each meeting (configurable, default 1 hour ahead), Momo queries the knowledge graph for context about the attendees — past interactions, open commitments involving them, related project history, and outstanding blockers — then sends a short prep brief to Chat. Each prep fires once per calendar event.
 
-### Conversational assistant
-Ask Momo anything about your work context in plain language:
-- *"what's on my calendar today?"*
-- *"any urgent emails from clients?"*
-- *"what did we decide in the product standup?"*
-- *"pull up the action items from yesterday's investor call"*
-- *"push all my tasks to Friday"*
-- *"draft a reply to [person] about [topic]"*
-- *"what commitments have I made this week?"*
-- *"what's the full history of the pricing discussion?"*
+### Agentic conversational assistant
+Momo uses a **Gemini-powered agent loop with tool calling**. When you send a message, Gemini autonomously decides which tools to invoke — Gmail, Calendar, Tasks, Knowledge Graph, Granola, Jira — executes them, observes the results, and iterates (up to 6 rounds) until it has enough data to respond. Each tool has its own timeout (10-15s) and runs in a thread pool.
 
-Momo fetches live data on every message using up to 7 concurrent workers (Gmail, Calendar, Tasks, Granola, knowledge graph, targeted email search) with a 90-second timeout per source. Context is assembled and sent to Gemini alongside conversation history (up to 50 turns per user, stored in Firestore).
+Ask Momo anything about your work context in plain language:
+- *"what's on my calendar today?"* → calls `get_todays_calendar`
+- *"any urgent emails from clients?"* → calls `get_recent_emails`
+- *"what did we decide in the product standup?"* → calls `search_knowledge_graph`
+- *"pull up the action items from yesterday's call"* → calls `get_meeting_notes` + `search_knowledge_graph`
+- *"push all my tasks to Friday"* → calls `get_open_tasks` then `update_task` for each
+- *"what commitments have I made this week?"* → calls `search_knowledge_graph`
+- *"create a task to follow up with Sarah by Friday"* → calls `create_task`
+
+The agent has access to **13 tools**:
+
+| Tool | Description |
+|---|---|
+| `get_todays_calendar` | Today's meetings with times, attendees, details |
+| `get_calendar_for_date` | Meetings for a specific date |
+| `get_open_tasks` | All open tasks across task lists |
+| `create_task` | Create a new task (with dedup) |
+| `update_task` | Update task title, due date, or notes |
+| `complete_task` | Mark a task as done |
+| `delete_task` | Delete a task |
+| `get_recent_emails` | Recent unread inbox emails |
+| `search_emails` | Search emails by query, person, or topic |
+| `search_knowledge_graph` | Semantic search across all institutional memory |
+| `get_meeting_notes` | Search Granola meeting notes and transcripts |
+| `get_jira_tickets` | Active Jira tickets for the user |
+| `search_jira_tickets` | Search Jira by text query |
 
 Chat messages are also extracted into the knowledge graph in the background, so context from conversations is captured alongside meetings and emails.
 
@@ -50,16 +69,7 @@ Chat messages are also extracted into the knowledge graph in the background, so 
 Momo is casual and concise — lowercase by default, minimal formatting, no corporate filler. It uses structured sections with emoji headers for briefings and priority colors for items. Responses are designed to be scannable, not verbose.
 
 ### Task management
-Full CRUD over Google Tasks via natural language. Momo emits structured action tags in its response that the backend parses and executes automatically:
-
-```
-[CREATE_TASK] title="Call Sarah" due="2026-02-18" notes="Re: Q2 plan"
-[UPDATE_TASK] find="Review proposal" due="2026-02-21"
-[COMPLETE_TASK] find="Send deck"
-[DELETE_TASK] find="test task"
-```
-
-Tags are parsed with regex, executed against the Google Tasks API, stripped from the user-visible response, and a summary of what was done is appended. A prose fallback parser catches cases where Gemini describes an action in natural language without emitting a tag (e.g. *"I moved your tasks to Friday"* is detected and executed). Bulk operations like *"push all my tasks to Friday"* are also supported.
+Full CRUD over Google Tasks via the agent's tool-use loop. Gemini calls task tools directly — `create_task`, `update_task`, `complete_task`, `delete_task` — with automatic dedup checking and fuzzy title matching. Bulk operations like *"push all my tasks to Friday"* work naturally since the agent can call `get_open_tasks` and then `update_task` for each one in a single loop.
 
 ### Meeting intelligence (via Granola)
 Momo is connected to [Granola](https://granola.ai) via the Model Context Protocol (MCP) and can answer questions about any recorded meeting:
@@ -72,9 +82,9 @@ The Granola token is managed automatically — it's stored in Firestore and refr
 
 Calendar meetings are matched to Granola notes using fuzzy title matching, and notes are batch-fetched (up to 10 at a time) to minimize API calls.
 
-### Cross-meeting knowledge graph
+### Cross-meeting knowledge graph with semantic search
 
-Momo builds persistent institutional memory by extracting structured entities from every meeting debrief, important email, and chat conversation:
+Momo builds persistent institutional memory by extracting structured entities from **every meeting debrief, email, calendar event, task, Granola meeting note, and chat conversation**:
 
 - **Decisions** — what was decided and when
 - **Commitments** — who promised what to whom, with status tracking
@@ -83,16 +93,22 @@ Momo builds persistent institutional memory by extracting structured entities fr
 - **Topics** — subjects discussed without a clear outcome
 - **Updates** — status reports on ongoing work
 
-Each entity is stored in Firestore with full provenance (source type, source ID, source title, date, related people, related projects, tags). The knowledge graph is queried on every chat message — no keyword gating — so Momo always has access to institutional memory. Queries are routed intelligently: by person, by project, by entity type (commitments, blockers, decisions), or by tag-based search.
+Each entity is stored in Firestore with full provenance (source type, source ID, source title, date, related people, related projects, tags) **plus a vector embedding** generated by Gemini's text-embedding-004 model.
 
-Example queries:
-- *"what commitments have I made this week?"*
-- *"what's the full history of the pricing discussion?"*
-- *"what blockers are outstanding?"*
-- *"what's changed since I last met with [person]?"*
-- *"what decisions have we made about the launch?"*
+**Semantic search** — The knowledge graph is searched using vector cosine similarity, not keyword matching. The agent embeds the user's query and compares it against all stored entity embeddings, returning the most relevant results above a configurable similarity threshold (default 0.60). This means queries like *"what happened with the Petco rollout?"* find relevant entities even when the exact words don't match.
 
-Extraction happens in the background (daemon threads) so it never blocks debrief or alert delivery. You can bootstrap the graph from existing data with `POST /knowledge-backfill`.
+**Six source types feed the knowledge graph:**
+
+| Source | Trigger | source_type |
+|---|---|---|
+| Emails | Proactive email alerts | `email` |
+| Meetings | Post-meeting debriefs via Granola | `meeting` |
+| Calendar events | Morning briefing + backfill | `calendar` |
+| Tasks | Morning briefing + backfill (daily snapshot) | `tasks` |
+| Granola notes | Morning briefing (catches notes debrief missed) | `meeting_notes` |
+| Chat messages | Every user message | `chat` |
+
+Extraction happens in the background (daemon threads) so it never blocks debrief or alert delivery. Bootstrap the graph with `POST /knowledge-backfill`, then add embeddings to existing entities with `POST /knowledge-embed-backfill`.
 
 ### Proactive intelligence
 
@@ -110,17 +126,15 @@ All nudges are deduplicated via Firestore with a configurable cooldown (default 
 - **Briefing** — included as a section in the morning briefing (default for medium/low priority)
 - **Standalone** — sent as immediate Chat messages (for high-priority items like severely overdue commitments)
 
-### Tiered model routing
+### Model usage
 
-Momo routes requests to the right Gemini model based on complexity:
-
-| Tier | Model | Used for |
-|---|---|---|
-| Light | Flash | Quick extractions, triage, entity extraction |
-| Standard | Flash | Normal chat, briefings, debriefs, meeting prep |
-| Deep | Pro | Knowledge graph queries requiring cross-meeting reasoning |
-
-Each tier has its own timeout (Light: 30s, Standard: 60s, Deep: 120s). If Pro fails, Momo automatically falls back to Flash so you always get a response.
+| Use case | Model |
+|---|---|
+| Agentic chat (tool-use loop) | Gemini Flash |
+| Entity extraction | Gemini Flash |
+| Email triage | Gemini Flash |
+| Briefings, debriefs, meeting prep | Gemini Flash |
+| Vector embeddings | text-embedding-004 |
 
 ---
 
@@ -140,31 +154,17 @@ Google Chat
 │  └──────────────────────────┬──────────────────────────────┘ │
 │                              │                               │
 │                    ┌─────────▼─────────┐                     │
-│                    │   _build_context  │  fetches live data   │
-│                    └─────────┬─────────┘  (7 workers, 90s)   │
+│                    │   Agent Loop      │  Gemini decides      │
+│                    │   (agent.py)      │  which tools to call │
+│                    └─────────┬─────────┘                     │
 │                              │                               │
+│              Gemini calls tools iteratively:                  │
 │    ┌──────────┬──────────┬───┴───┬──────────┬─────────┐      │
 │    ▼          ▼          ▼       ▼          ▼         ▼      │
-│  Gmail    Calendar     Tasks  Granola   Knowledge  Targeted  │
-│  Service  Service      Svc     MCP      Graph      Emails   │
-│  (read) (today+ended) (r/w) (notes)  (Firestore)  (search)  │
+│  Gmail    Calendar     Tasks  Granola   Knowledge   Jira     │
+│ (read/   (today/      (CRUD)  (notes)   Graph      (read)   │
+│  search)  by date)                    (semantic)             │
 │    └──────────┴──────────┴───────┴──────────┴─────────┘      │
-│                              │                               │
-│                    ┌─────────▼─────────┐                     │
-│                    │   Gemini Service  │  tiered routing:     │
-│                    │  Flash ◄──► Pro   │  Standard → Flash    │
-│                    │                   │  Deep → Pro          │
-│                    └─────────┬─────────┘                     │
-│                              │                               │
-│         ┌────────────────────▼──────────────────┐            │
-│         │          Task Action Extractor         │            │
-│         │    regex + prose fallback parser        │            │
-│         └────────────────────┬──────────────────┘            │
-│                              │ executes actions              │
-│                    ┌─────────▼─────────┐                     │
-│                    │   Tasks Service   │  create/update/      │
-│                    │    (write ops)    │  complete/delete     │
-│                    └─────────┬─────────┘                     │
 │                              │                               │
 │              ┌───────────────┼───────────────┐               │
 │              ▼               ▼               ▼               │
@@ -181,8 +181,12 @@ Cloud Scheduler ──► POST /briefing
     Gmail/Calendar   Granola MCP   Proactive
     /Tasks           (yesterday)   Intelligence
           └──────────────┼──────────────┘
-                         ▼
-                   Gemini (briefing)
+                         │
+              ┌──────────┼──────────┐
+              ▼          ▼          ▼
+        Gemini       Knowledge   Knowledge
+       (briefing)   Graph Feed   Graph Feed
+                   (cal+tasks)   (granola)
                          ▼
                    Google Chat
 
@@ -197,7 +201,7 @@ Cloud Scheduler ──► POST /email-alerts
                    ▼            ▼
              Google Chat    Knowledge
             (send alert)  Graph Extract
-                          (background)
+                          (+ embedding)
 
 Cloud Scheduler ──► POST /meeting-debrief
                          │
@@ -211,17 +215,16 @@ Cloud Scheduler ──► POST /meeting-debrief
                    ▼            ▼
              Gemini         Knowledge
             (debrief)     Graph Extract
-                │         (background)
-                ▼            ▼
-          Google Chat    Firestore
+                │         (+ embedding)
+                ▼
+          Google Chat
 
 Cloud Scheduler ──► POST /meeting-prep
                          │
                 ┌────────┴────────────────┐
                 ▼                         ▼
         Calendar Service           Knowledge Graph
-      (upcoming meetings)         (people, projects,
-                │                  commitments)
+      (upcoming meetings)         (semantic search)
                 └────────┬────────────────┘
                          ▼
                    Gemini (prep brief)
@@ -240,16 +243,18 @@ Cloud Scheduler ──► POST /meeting-prep
 | `/email-alerts` | POST | Cloud Scheduler (every 5 min) | Triage inbox and send urgent alerts |
 | `/meeting-debrief` | POST | Cloud Scheduler (every 10 min) | Post-meeting debriefs with Granola notes |
 | `/meeting-prep` | POST | Cloud Scheduler (every 10 min) | Pre-meeting prep briefs with KG context |
-| `/knowledge-backfill` | POST | One-time | Bootstrap knowledge graph from existing data |
+| `/knowledge-backfill` | POST | One-time | Bootstrap knowledge graph from meetings, emails, calendar, tasks |
+| `/knowledge-embed-backfill` | POST | One-time | Add vector embeddings to existing KG entities |
 
 ### Scheduled jobs (Cloud Scheduler)
 
 ```
-Cloud Scheduler ──► POST /briefing           (daily at 8 AM)
-Cloud Scheduler ──► POST /email-alerts       (every 5 minutes)
-Cloud Scheduler ──► POST /meeting-debrief    (every 10 minutes, work hours)
-Cloud Scheduler ──► POST /meeting-prep       (every 10 minutes, work hours)
-One-time         ──► POST /knowledge-backfill (bootstrap knowledge graph)
+Cloud Scheduler ──► POST /briefing                (daily at 8 AM)
+Cloud Scheduler ──► POST /email-alerts            (every 5 minutes)
+Cloud Scheduler ──► POST /meeting-debrief         (every 10 minutes, work hours)
+Cloud Scheduler ──► POST /meeting-prep            (every 10 minutes, work hours)
+One-time         ──► POST /knowledge-backfill      (bootstrap knowledge graph)
+One-time         ──► POST /knowledge-embed-backfill (add embeddings to existing entities)
 ```
 
 **`/briefing`** — orchestrated by `briefing.py`:
@@ -258,6 +263,7 @@ One-time         ──► POST /knowledge-backfill (bootstrap knowledge graph)
 3. Runs proactive intelligence engines (commitment follow-up, pattern detection, drift detection)
 4. Sends all context + nudges to Gemini → formatted morning briefing
 5. Posts the result to the configured Google Chat space
+6. Feeds calendar events, tasks, and Granola notes into the knowledge graph (background)
 
 **`/email-alerts`** — also in `briefing.py`:
 1. Fetches recent inbox emails matching the configured query
@@ -282,10 +288,18 @@ One-time         ──► POST /knowledge-backfill (bootstrap knowledge graph)
 
 **`/knowledge-backfill`** — in `main.py`:
 1. Fetches the last 30 days of Granola meetings and recent inbox emails
-2. Batch-extracts entities (decisions, commitments, blockers, etc.) via Gemini Flash
-3. Stores everything in the `knowledge_graph` Firestore collection
-4. Idempotent — skips sources that have already been processed
-5. Runs in a background thread so the endpoint returns immediately
+2. Fetches today's calendar events and current open tasks
+3. Batch-extracts entities (decisions, commitments, blockers, etc.) via Gemini Flash
+4. Generates vector embeddings for each entity using text-embedding-004
+5. Stores everything in the `knowledge_graph` Firestore collection
+6. Idempotent — skips sources that have already been processed
+7. Runs in a background thread so the endpoint returns immediately
+
+**`/knowledge-embed-backfill`** — in `main.py`:
+1. Reads all existing KG entities from Firestore
+2. Generates vector embeddings for entities that don't have one yet
+3. Updates each document in-place with the embedding
+4. Idempotent — skips entities that already have embeddings
 
 ---
 
@@ -293,10 +307,11 @@ One-time         ──► POST /knowledge-backfill (bootstrap knowledge graph)
 
 ```
 momo/
-├── main.py                    # FastAPI app, endpoints, event parsing, context building, task execution
-├── gemini_service.py          # Gemini API wrapper, tiered model routing, system prompt, chat/briefing/debrief
+├── main.py                    # FastAPI app, endpoints, event parsing, chat routing
+├── agent.py                   # Agentic tool-use loop: tool declarations, executor, agent system prompt
+├── gemini_service.py          # Gemini API wrapper, system prompt, chat/briefing/debrief generation
 ├── proactive_intelligence.py  # Proactive intelligence: pre-meeting prep, commitment follow-up, patterns, drift
-├── knowledge_graph.py         # Entity extraction, Firestore storage, querying, smart routing by intent
+├── knowledge_graph.py         # Entity extraction, vector embeddings, semantic search, Firestore storage
 ├── briefing.py                # Morning briefing, proactive email alerts, post-meeting debrief pipelines
 ├── gmail_service.py           # Gmail API: fetch unread, search, alert candidates, format for context
 ├── calendar_service.py        # Calendar API: today's events, upcoming, recently ended, format for context
@@ -329,26 +344,29 @@ Parse event format (standard Chat vs. Workspace Add-on)
 Load conversation history from Firestore (up to 50 turns)
     │
     ▼
-_build_context() — up to 7 concurrent workers (90s timeout):
-  - always: today's meetings + open tasks + knowledge graph
-  - if email keywords detected: inbox emails + targeted email search
-  - if meeting/notes keywords or specific entities detected: Granola MCP query
+Agent loop (agent.py) — Gemini with tool declarations:
+    │
+    ├─► Gemini decides which tools to call
+    │     │
+    │     ▼
+    │   Execute tools in thread pool (per-tool timeouts):
+    │     - get_todays_calendar, get_open_tasks, get_recent_emails
+    │     - search_emails, search_knowledge_graph (semantic)
+    │     - create_task, update_task, complete_task, delete_task
+    │     - get_meeting_notes, get_jira_tickets, search_jira_tickets
+    │     │
+    │     ▼
+    │   Return results to Gemini → may call more tools
+    │     │
+    │     (repeats up to 6 iterations)
     │
     ▼
-Gemini chat_response() — tiered model routing:
-  - Standard (Flash): normal queries
-  - Deep (Pro): when knowledge graph context is present
-  - Auto-fallback: Pro → Flash on failure
-    │
-    ▼
-Parse task action tags from response (regex + prose fallback)
-    │
-    ├─► Execute task actions against Google Tasks API
+Final text response from Gemini
     │
     ▼
 Save turn to Firestore conversation history
     │
-    ├─► Extract entities to knowledge graph (background thread)
+    ├─► Extract entities to knowledge graph (background, with embedding)
     │
     ▼
 format_for_google_chat() → send reply (auto-split at 4000 chars)
@@ -358,22 +376,13 @@ format_for_google_chat() → send reply (auto-split at 4000 chars)
 
 ## How task management works
 
-Gemini is instructed to emit structured tags at the end of its response when a task action is needed:
+The agent calls task tools directly during the tool-use loop — no regex parsing or tag extraction needed:
 
-```
-[CREATE_TASK] title="Call Sarah" due="2026-02-18" notes="Re: Q2 plan"
-[UPDATE_TASK] find="Review proposal" due="2026-02-21"
-[COMPLETE_TASK] find="Send deck"
-[DELETE_TASK] find="test task"
-```
-
-The backend:
-1. **Regex extraction** — parses `[ACTION_TAG]` patterns with key-value pairs
-2. **Prose fallback** — catches natural language task descriptions (e.g. *"I moved your tasks to Friday"*) when Gemini doesn't emit tags
-3. **Bulk detection** — handles batch operations like *"push all my tasks to Friday"*
-4. **Fuzzy matching** — finds tasks by substring match across all task lists when executing updates, completions, or deletions
-5. **Execution** — runs each action against the Google Tasks API
-6. **Cleanup** — strips tags from the user-visible response and appends a summary of what was done
+1. **Gemini decides** — based on the user's message, the agent calls `create_task`, `update_task`, `complete_task`, or `delete_task`
+2. **Dedup checking** — `create_task` automatically checks for existing tasks with matching titles before creating
+3. **Fuzzy matching** — `update_task`, `complete_task`, and `delete_task` find tasks by fuzzy title match across all task lists
+4. **Bulk operations** — for requests like *"push all my tasks to Friday"*, the agent calls `get_open_tasks` first, then `update_task` for each one in a multi-iteration loop
+5. **Results in context** — tool results are returned to Gemini, which incorporates them naturally into its response
 
 ---
 
@@ -389,8 +398,8 @@ The backend:
 | Cloud Run | Hosts the FastAPI server | N/A |
 | Cloud Scheduler | Triggers `/briefing`, `/email-alerts`, `/meeting-debrief`, `/meeting-prep` | N/A |
 | Granola MCP | Fetch meeting notes, transcripts, action items | OAuth 2.0 (PKCE, auto-refresh) |
-| Gemini Flash | Chat, briefings, debriefs, meeting prep, entity extraction, email triage | API key |
-| Gemini Pro | Deep reasoning for knowledge graph queries (auto-fallback to Flash) | API key |
+| Gemini Flash | Agentic chat (tool-use loop), briefings, debriefs, meeting prep, entity extraction, email triage | API key |
+| Gemini text-embedding-004 | Vector embeddings for knowledge graph semantic search | API key |
 
 ---
 
@@ -520,6 +529,7 @@ After deploying:
    - `POST https://<url>/meeting-debrief` — every 10 minutes during work hours (e.g. `*/10 9-18 * * 1-5`)
    - `POST https://<url>/meeting-prep` — every 10 minutes during work hours
 4. (One-time) Bootstrap the knowledge graph: `curl -X POST https://<url>/knowledge-backfill`
+5. (One-time) Add embeddings to existing entities: `curl -X POST https://<url>/knowledge-embed-backfill`
 
 ---
 
@@ -532,7 +542,7 @@ After deploying:
 | `meeting_debriefs` | Google Calendar event ID | Tracks which meetings have already been debriefed |
 | `meeting_prep_sent` | Google Calendar event ID | Tracks which meetings have had prep briefs sent |
 | `proactive_nudges_sent` | hashed nudge key (MD5) | Deduplicates nudges with configurable cooldown window |
-| `knowledge_graph` | auto-generated | Extracted entities with provenance (source type/ID/title/date, related people/projects, tags) |
+| `knowledge_graph` | auto-generated | Extracted entities with provenance, vector embeddings, and metadata (source type/ID/title/date, related people/projects, tags) |
 | `granola_auth` | `token` | Stores the Granola OAuth token for Cloud Run (auto-refreshed) |
 
 ---
@@ -564,6 +574,11 @@ After deploying:
 | `SEARCH_LOOKBACK_DAYS` | No | `90` | How far back to search when looking up specific emails |
 | **Knowledge Graph** | | | |
 | `KNOWLEDGE_GRAPH_ENABLED` | No | `true` | Toggle knowledge graph extraction and querying |
+| `GEMINI_EMBEDDING_MODEL` | No | `models/text-embedding-004` | Model for generating entity embeddings |
+| `SEMANTIC_SEARCH_THRESHOLD` | No | `0.60` | Minimum cosine similarity for semantic search results |
+| `SEMANTIC_SEARCH_LIMIT` | No | `15` | Maximum number of semantic search results |
+| **Agentic Mode** | | | |
+| `AGENTIC_MODE_ENABLED` | No | `true` | Use agent tool-use loop for chat (falls back to legacy context mode if disabled) |
 | **Proactive Intelligence** | | | |
 | `PROACTIVE_INTELLIGENCE_ENABLED` | No | `true` | Toggle all proactive intelligence engines |
 | `MEETING_PREP_ENABLED` | No | `true` | Toggle pre-meeting prep briefs |

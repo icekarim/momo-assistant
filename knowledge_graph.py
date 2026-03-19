@@ -21,7 +21,51 @@ from conversation_store import get_db
 _kg_cache = TTLCache(maxsize=128, ttl=300)
 _kg_cache_lock = threading.Lock()
 
+_embedding_cache = TTLCache(maxsize=1, ttl=300)
+_embedding_cache_lock = threading.Lock()
+
 genai.configure(api_key=config.GEMINI_API_KEY)
+
+
+# ── Embedding helpers ────────────────────────────────────────
+
+
+def _build_embedding_text(entry: dict, source_type: str = "") -> str:
+    """Build a combined text string from an entity for embedding generation."""
+    parts = [
+        entry.get("entity_type", ""),
+        entry.get("name", ""),
+        entry.get("content", ""),
+    ]
+    if entry.get("owner"):
+        parts.append(f"owner: {entry['owner']}")
+    if entry.get("related_people"):
+        parts.append(f"people: {', '.join(entry['related_people'])}")
+    if entry.get("related_projects"):
+        parts.append(f"projects: {', '.join(entry['related_projects'])}")
+    if source_type:
+        parts.append(f"source: {source_type}")
+    return " | ".join(p for p in parts if p)
+
+
+def _get_embedding(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list[float]:
+    """Generate an embedding vector for a text string using Gemini."""
+    result = genai.embed_content(
+        model=config.GEMINI_EMBEDDING_MODEL,
+        content=text,
+        task_type=task_type,
+    )
+    return result["embedding"]
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Compute cosine similarity between two vectors."""
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(x * x for x in b) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
 
 # ── Extraction prompt ────────────────────────────────────────
 # Literal braces in the JSON example are doubled ({{ }}) so
@@ -126,7 +170,7 @@ def _run_extraction(source_type: str, source_title: str, content: str,
 
 def _store_entries(entries: list[dict], source_type: str, source_id: str,
                    source_title: str, source_date: str):
-    """Persist extracted entries to Firestore and invalidate query cache."""
+    """Persist extracted entries to Firestore with embeddings and invalidate caches."""
     db = get_db()
     collection = db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -147,10 +191,17 @@ def _store_entries(entries: list[dict], source_type: str, source_id: str,
             "source_date": source_date,
             "extracted_at": now_iso,
         }
+        try:
+            text = _build_embedding_text(entry, source_type=source_type)
+            doc["embedding"] = _get_embedding(text)
+        except Exception as exc:
+            print(f"  Knowledge graph: embedding generation failed ({exc}), storing without")
         collection.add(doc)
 
     with _kg_cache_lock:
         _kg_cache.clear()
+    with _embedding_cache_lock:
+        _embedding_cache.clear()
 
 
 def extract_and_store(source_type: str, source_id: str, source_title: str,
@@ -476,6 +527,91 @@ def update_entity_status(doc_id: str, new_status: str):
     })
     with _kg_cache_lock:
         _kg_cache.clear()
+    with _embedding_cache_lock:
+        _embedding_cache.clear()
+
+
+# ── Semantic search ──────────────────────────────────────────
+
+
+def _get_all_embeddings() -> list[dict]:
+    """Cached bulk read of all KG entities with embeddings from Firestore."""
+    with _embedding_cache_lock:
+        cached = _embedding_cache.get("all")
+    if cached is not None:
+        return cached
+
+    db = get_db()
+    docs = db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION).stream()
+    entities = [_doc_to_dict(doc) for doc in docs]
+
+    with _embedding_cache_lock:
+        _embedding_cache["all"] = entities
+    return entities
+
+
+def semantic_search(query: str, limit: int | None = None,
+                    threshold: float | None = None) -> list[dict]:
+    """Search the knowledge graph using vector similarity.
+
+    Embeds the query, compares against all stored entity embeddings,
+    and returns the top matches above the similarity threshold.
+    """
+    limit = limit or config.SEMANTIC_SEARCH_LIMIT
+    threshold = threshold if threshold is not None else config.SEMANTIC_SEARCH_THRESHOLD
+
+    try:
+        query_embedding = _get_embedding(query, task_type="RETRIEVAL_QUERY")
+    except Exception as exc:
+        print(f"Knowledge graph: query embedding failed ({exc}), falling back to empty")
+        return []
+
+    entities = _get_all_embeddings()
+
+    scored = []
+    for entity in entities:
+        if "embedding" not in entity:
+            continue
+        score = _cosine_similarity(query_embedding, entity["embedding"])
+        if score >= threshold:
+            scored.append((score, entity))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [entity for _score, entity in scored[:limit]]
+
+
+def embed_backfill() -> dict:
+    """Add embeddings to existing KG entities that don't have one.
+
+    Returns counts of updated and skipped entities.
+    """
+    import time as _time
+
+    db = get_db()
+    docs = list(db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION).stream())
+
+    updated, skipped, failed = 0, 0, 0
+    for doc in docs:
+        data = doc.to_dict()
+        if "embedding" in data:
+            skipped += 1
+            continue
+
+        try:
+            text = _build_embedding_text(data, source_type=data.get("source_type", ""))
+            embedding = _get_embedding(text)
+            doc.reference.update({"embedding": embedding})
+            updated += 1
+        except Exception as exc:
+            print(f"  Embed backfill failed for {doc.id}: {exc}")
+            failed += 1
+        _time.sleep(0.1)
+
+    with _embedding_cache_lock:
+        _embedding_cache.clear()
+
+    print(f"Embed backfill: {updated} updated, {skipped} already had embeddings, {failed} failed")
+    return {"updated": updated, "skipped": skipped, "failed": failed}
 
 
 def _doc_to_dict(doc) -> dict:
@@ -519,125 +655,17 @@ def format_knowledge_for_context(entries: list[dict]) -> str:
 
 
 def query_knowledge_graph(user_message: str) -> str:
-    """Given a user message, figure out what to query and return formatted context.
+    """Given a user message, find relevant knowledge using semantic search.
 
-    Uses keyword matching and simple NLP to determine the right query strategy,
-    then formats results for injection into Gemini context.
+    Embeds the user message, compares against all stored entity embeddings,
+    and returns the top matches formatted for Gemini context.
     """
     if not config.KNOWLEDGE_GRAPH_ENABLED:
         return ""
 
-    lower = user_message.lower()
-    results = []
-
-    person_name = _extract_person_name(user_message)
-    project_name = _extract_project_name(user_message)
-
-    commitment_keywords = ["commitment", "committed", "promised", "owe", "action item",
-                           "haven't done", "outstanding", "follow up", "follow-up"]
-    wants_commitments = any(kw in lower for kw in commitment_keywords)
-
-    blocker_keywords = ["blocker", "blocked", "blocking", "stuck", "impediment"]
-    wants_blockers = any(kw in lower for kw in blocker_keywords)
-
-    decision_keywords = ["decided", "decision", "agreed", "alignment", "conclusion"]
-    wants_decisions = any(kw in lower for kw in decision_keywords)
-
-    if wants_commitments:
-        results.extend(query_open_commitments(limit=10))
-    if wants_blockers:
-        results.extend(query_by_type("blocker", limit=10))
-    if wants_decisions:
-        results.extend(query_by_type("decision", limit=10))
-
-    if person_name:
-        results.extend(query_by_person(person_name, limit=10))
-    if project_name:
-        results.extend(query_by_project(project_name, limit=10))
-
-    if not results:
-        search_terms = _extract_knowledge_search_terms(user_message)
-        if search_terms:
-            results = search_knowledge(search_terms, limit=10)
+    results = semantic_search(user_message)
 
     if not results:
         return ""
 
-    seen_ids = set()
-    unique = []
-    for r in results:
-        rid = r.get("id")
-        if rid and rid not in seen_ids:
-            seen_ids.add(rid)
-            unique.append(r)
-
-    return format_knowledge_for_context(unique)
-
-
-def _extract_person_name(message: str) -> str | None:
-    """Try to extract a person's name from the user message."""
-    import re
-
-    patterns = [
-        r"(?:with|from|about|by|to)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)",
-        r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)'s\b",
-        r"(?:met|meeting|call|sync|chat)\s+(?:with\s+)?([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)",
-    ]
-
-    skip_words = {
-        "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
-        "January", "February", "March", "April", "May", "June", "July", "August",
-        "September", "October", "November", "December", "Today", "Tomorrow",
-        "Momo", "Granola", "Gmail", "Google", "Gemini",
-    }
-
-    for pattern in patterns:
-        match = re.search(pattern, message)
-        if match:
-            name = match.group(1).strip()
-            if name not in skip_words and len(name) > 1:
-                return name
-    return None
-
-
-def _extract_project_name(message: str) -> str | None:
-    """Try to extract a project/client name from the user message.
-
-    Looks for known patterns and falls back to capitalized multi-word phrases
-    that might be client/project names (e.g. "BJ's", "DSW", "Lowes").
-    """
-    import re
-
-    patterns = [
-        r"(?:history of|about|on|with|for|the)\s+(?:the\s+)?([A-Z][A-Za-z']+(?:\s+[A-Za-z']+){0,3}?)(?:\s+(?:project|deal|account|client|discussion|meeting|topic))",
-        r"([A-Z]{2,}(?:'s)?)\b",
-    ]
-
-    skip_words = {"AI", "API", "CEO", "CTO", "CFO", "COO", "VP", "PM", "QA",
-                  "HR", "IT", "OK", "AM", "PM", "US", "UK", "EU"}
-
-    for pattern in patterns:
-        for match in re.finditer(pattern, message):
-            name = match.group(1).strip()
-            if name not in skip_words and len(name) > 1:
-                return name
-    return None
-
-
-def _extract_knowledge_search_terms(message: str) -> list[str]:
-    """Extract search keywords from a user message for tag-based search."""
-    import re
-    stopwords = {
-        "what", "whats", "how", "is", "are", "the", "a", "an", "my", "me", "i",
-        "from", "with", "them", "as", "well", "going", "on", "about", "any",
-        "history", "full", "story", "tell", "show", "give", "last", "time",
-        "since", "changed", "happened", "discussed", "decided", "committed",
-        "do", "does", "did", "can", "could", "would", "should", "will",
-        "in", "to", "for", "of", "and", "or", "but", "not", "also",
-        "please", "hey", "hi", "hello", "momo", "check", "look",
-        "has", "have", "had", "been", "there", "they", "this", "that",
-        "up", "out", "all", "some", "just", "like", "know", "see", "want",
-    }
-    words = re.findall(r'\b[a-zA-Z0-9]+\b', message.lower())
-    keywords = [w for w in words if w not in stopwords and len(w) > 2]
-    return keywords[:5]
+    return format_knowledge_for_context(results)
