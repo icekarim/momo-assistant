@@ -1,8 +1,9 @@
 """Cross-Meeting Intelligence Graph — entity extraction, storage, and querying.
 
 Extracts people, projects, decisions, commitments, blockers, and topics from
-meeting debriefs and emails, stores them in Firestore, and provides query
-functions for surfacing institutional memory in Momo's chat responses.
+meetings, emails, calendar events, tasks, and Granola notes, stores them in
+Firestore, and provides query functions for surfacing institutional memory in
+Momo's chat responses.
 """
 
 import json
@@ -195,6 +196,105 @@ def _safe_extract(source_type, source_id, source_title, source_date, content, at
     except Exception:
         print("  Knowledge graph background extraction failed:")
         traceback.print_exc()
+
+
+# ── Source-specific extraction helpers ───────────────────────
+
+
+def extract_from_calendar_events(events: list[dict]):
+    """Extract knowledge from calendar events (background, per-event).
+
+    Skips all-day events (holidays, OOO). Uses the Google Calendar event ID
+    as source_id so dedup prevents re-extraction of the same event.
+    """
+    if not config.KNOWLEDGE_GRAPH_ENABLED or not events:
+        return
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    for event in events:
+        if event.get("is_all_day"):
+            continue
+
+        attendees = [a["name"] for a in event.get("attendees", [])]
+        parts = [f"Meeting: {event.get('title', '')}"]
+        parts.append(f"Time: {event.get('start_time', '')} – {event.get('end_time', '')}")
+        if event.get("location"):
+            parts.append(f"Location: {event['location']}")
+        if attendees:
+            parts.append(f"Attendees: {', '.join(attendees)}")
+        if event.get("organizer"):
+            parts.append(f"Organizer: {event['organizer']}")
+        if event.get("description"):
+            parts.append(f"Description: {event['description']}")
+
+        extract_and_store_background(
+            source_type="calendar",
+            source_id=event.get("id", ""),
+            source_title=event.get("title", ""),
+            source_date=today,
+            content="\n".join(parts),
+            attendees=attendees,
+        )
+
+
+def extract_from_tasks(tasks: list[dict]):
+    """Extract knowledge from the current task list (batched, once per day).
+
+    Tasks are small individually, so we batch them into one extraction call.
+    Uses a date-based source_id so it runs once per day.
+    """
+    if not config.KNOWLEDGE_GRAPH_ENABLED or not tasks:
+        return
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    source_id = f"tasks-daily-{today}"
+
+    lines = []
+    for t in tasks:
+        line = f"- {t['title']}"
+        if t.get("due"):
+            overdue = " (OVERDUE)" if t.get("is_overdue") else ""
+            line += f" [due: {t['due']}{overdue}]"
+        if t.get("notes"):
+            line += f" — {t['notes']}"
+        if t.get("list_name"):
+            line += f" (list: {t['list_name']})"
+        lines.append(line)
+
+    content = f"Open tasks as of {today}:\n" + "\n".join(lines)
+
+    extract_and_store_background(
+        source_type="tasks",
+        source_id=source_id,
+        source_title=f"Task snapshot {today}",
+        source_date=today,
+        content=content,
+        attendees=[],
+    )
+
+
+def extract_from_granola_notes(granola_context: str, source_date: str | None = None):
+    """Extract knowledge from Granola meeting notes context.
+
+    Used by the morning briefing to capture yesterday's notes that may not
+    have been caught by the post-meeting debrief pipeline.
+    """
+    if not config.KNOWLEDGE_GRAPH_ENABLED:
+        return
+    if not granola_context or not granola_context.strip():
+        return
+
+    date = source_date or datetime.now().strftime("%Y-%m-%d")
+    source_id = f"granola-briefing-{date}"
+
+    extract_and_store_background(
+        source_type="meeting_notes",
+        source_id=source_id,
+        source_title=f"Granola meeting notes ({date})",
+        source_date=date,
+        content=granola_context,
+        attendees=[],
+    )
 
 
 # ── Query functions ──────────────────────────────────────────
