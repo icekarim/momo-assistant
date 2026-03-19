@@ -2,13 +2,14 @@
 Momo — FastAPI Application
 
 Endpoints:
-  POST /chat               — Google Chat webhook (receives user messages)
-  POST /briefing           — Trigger morning briefing (called by Cloud Scheduler)
-  POST /email-alerts       — Trigger proactive important email checks
-  POST /meeting-debrief    — Post-meeting debrief with Granola notes (Cloud Scheduler)
-  POST /meeting-prep       — Pre-meeting prep briefs with KG context (Cloud Scheduler)
-  POST /knowledge-backfill — Backfill knowledge graph from recent meetings/emails
-  GET  /health             — Health check
+  POST /chat                    — Google Chat webhook (receives user messages)
+  POST /briefing                — Trigger morning briefing (called by Cloud Scheduler)
+  POST /email-alerts            — Trigger proactive important email checks
+  POST /meeting-debrief         — Post-meeting debrief with Granola notes (Cloud Scheduler)
+  POST /meeting-prep            — Pre-meeting prep briefs with KG context (Cloud Scheduler)
+  POST /knowledge-backfill      — Backfill knowledge graph from recent meetings/emails
+  POST /knowledge-embed-backfill — Add vector embeddings to existing KG entities
+  GET  /health                  — Health check
 """
 
 from fastapi import FastAPI, Request, HTTPException
@@ -28,7 +29,7 @@ from calendar_service import (
     fetch_todays_meetings,
     format_meetings_for_context,
 )
-from tasks_service import fetch_open_tasks, format_tasks_for_context, create_task, update_task, complete_task, delete_task
+from tasks_service import fetch_open_tasks, format_tasks_for_context, create_task
 from gemini_service import chat_response, transcribe_audio
 from chat_service import format_for_google_chat, send_chat_message, download_attachment, _SUPPORTED_AUDIO_TYPES
 from conversation_store import get_conversation, add_turn, clear_conversation, get_pending_tasks, clear_pending_tasks
@@ -207,6 +208,22 @@ async def trigger_knowledge_backfill():
     thread = threading.Thread(target=_run_backfill, daemon=True)
     thread.start()
     return {"status": "started", "message": "backfill running in background, check logs for progress"}
+
+
+@app.post("/knowledge-embed-backfill")
+async def trigger_embed_backfill():
+    """Add vector embeddings to existing KG entities that don't have one.
+    Returns immediately and processes in a background thread."""
+    if not config.KNOWLEDGE_GRAPH_ENABLED:
+        return {"status": "skipped", "reason": "knowledge graph disabled"}
+
+    def _run():
+        from knowledge_graph import embed_backfill
+        embed_backfill()
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    return {"status": "started", "message": "embed backfill running in background, check logs for progress"}
 
 
 def _run_backfill():
@@ -616,55 +633,19 @@ def _process_message_background(text, user_id, space, audio_attachments=None):
         _t1 = time.time()
         print(f"[perf] get_conversation: {_t1 - _t0:.2f}s (history={len(history)} turns)")
 
-        context_data = _build_context(text)
+        if config.AGENTIC_MODE_ENABLED:
+            from agent import run_agent_loop
+            response = run_agent_loop(text, history)
+        else:
+            context_data = _build_context(text)
+            response = chat_response(text, history, context_data)
+            response = _remove_task_tags(response)
+
         _t2 = time.time()
-        print(f"[perf] build_context: {_t2 - _t1:.2f}s (sources={list(context_data.keys())})")
-
-        response = chat_response(text, history, context_data)
-        _t3 = time.time()
-        print(f"[perf] chat_response: {_t3 - _t2:.2f}s (response={len(response or '')} chars)")
-
-        task_actions = _extract_all_task_proposals(response, text)
-
-        if not task_actions:
-            bulk = _detect_bulk_task_action(text)
-            if bulk:
-                task_actions = bulk
-
-        task_summary = ""
-        if task_actions:
-            results = []
-            skipped = []
-            errors = []
-            for action_item in task_actions:
-                try:
-                    result = _execute_task_action(action_item)
-                    if "error" in result:
-                        errors.append(f"{action_item.get('title', action_item.get('find', '?'))}: {result['error']}")
-                    elif result.get("status") in ("already_exists", "already_completed"):
-                        skipped.append(f"*{result['title']}* — {result['status'].replace('_', ' ')}")
-                    else:
-                        results.append(f"*{result['title']}* — {result['status']}")
-                except Exception as e:
-                    errors.append(f"{action_item.get('title', action_item.get('find', '?'))}: {str(e)}")
-
-            lines = []
-            if results:
-                lines.append(f"\n✅ *done — {len(results)} task(s):*")
-                lines.extend(f"  - {r}" for r in results)
-            if skipped:
-                lines.append(f"\n🟡 *skipped — {len(skipped)} already existed:*")
-                lines.extend(f"  - {s}" for s in skipped)
-            if errors:
-                lines.append(f"\n🔴 *couldn't do {len(errors)}:*")
-                lines.extend(f"  - {e}" for e in errors)
-            task_summary = "\n".join(lines)
-
-        clean_response = _remove_task_tags(response)
-        full_response = clean_response + task_summary if task_summary else clean_response
+        print(f"[perf] response: {_t2 - _t1:.2f}s ({len(response or '')} chars)")
 
         add_turn(user_id, "user", text)
-        add_turn(user_id, "assistant", clean_response)
+        add_turn(user_id, "assistant", response)
 
         if config.KNOWLEDGE_GRAPH_ENABLED:
             from datetime import datetime as _dt
@@ -679,12 +660,12 @@ def _process_message_background(text, user_id, space, audio_attachments=None):
                 attendees=[],
             )
 
-        formatted = format_for_google_chat(full_response)
-        _t4 = time.time()
+        formatted = format_for_google_chat(response)
+        _t3 = time.time()
         send_chat_message(space, formatted)
-        _t5 = time.time()
-        print(f"[perf] send_chat_message: {_t5 - _t4:.2f}s")
-        print(f"[perf] TOTAL: {_t5 - _t0:.2f}s")
+        _t4 = time.time()
+        print(f"[perf] send_chat_message: {_t4 - _t3:.2f}s")
+        print(f"[perf] TOTAL: {_t4 - _t0:.2f}s")
 
     except Exception as e:
         traceback.print_exc()
@@ -694,240 +675,11 @@ def _process_message_background(text, user_id, space, audio_attachments=None):
             print(f"Failed to send error message: {e}")
 
 
-def _extract_all_task_proposals(response, user_message=""):
-    """Extract ALL task action proposals from Gemini's response.
-    Returns a list of action dicts. Supports bulk operations."""
-    proposals = []
-
-    # CREATE
-    for match in re.finditer(
-        r'\[CREATE_TASK\]\s*title="([^"]+)"(?:\s*due="([^"]*)")?(?:\s*notes="([^"]*)")?',
-        response,
-    ):
-        task = {"action": "create", "title": match.group(1)}
-        if match.group(2):
-            task["due"] = match.group(2)
-        if match.group(3):
-            task["notes"] = match.group(3)
-        proposals.append(task)
-
-    # UPDATE
-    for match in re.finditer(
-        r'\[UPDATE_TASK\]\s*find="([^"]+)"(?:\s*title="([^"]*)")?(?:\s*due="([^"]*)")?(?:\s*notes="([^"]*)")?',
-        response,
-    ):
-        task = {"action": "update", "find": match.group(1)}
-        if match.group(2):
-            task["new_title"] = match.group(2)
-        if match.group(3):
-            task["new_due"] = match.group(3)
-        if match.group(4):
-            task["new_notes"] = match.group(4)
-        proposals.append(task)
-
-    # COMPLETE
-    for match in re.finditer(r'\[COMPLETE_TASK\]\s*find="([^"]+)"', response):
-        proposals.append({"action": "complete", "find": match.group(1)})
-
-    # DELETE
-    for match in re.finditer(r'\[DELETE_TASK\]\s*find="([^"]+)"', response):
-        proposals.append({"action": "delete", "find": match.group(1)})
-
-    if proposals:
-        return proposals
-
-    if _user_has_task_intent(user_message):
-        return _fallback_parse_prose(response)
-
-    return None
-
-
-def _user_has_task_intent(user_message):
-    """Only use fallback prose parsing when the user's message clearly
-    indicates they want to create, update, complete, or delete a task."""
-    lower = user_message.lower()
-    task_intent_patterns = [
-        r'\b(?:add|create|make|set up|new)\b.*\btask',
-        r'\btask\b.*\b(?:add|create|make)',
-        r'\b(?:move|push|reschedule|change|update)\b.*\b(?:task|due|deadline)',
-        r'\b(?:complete|finish|done|mark)\b.*\btask',
-        r'\b(?:delete|remove)\b.*\btask',
-        r'\bremind\s+me\b',
-        r'\b(?:add|create)\b.*\bto.do\b',
-        r'\b(?:move|push)\b.*\bto\s+(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)',
-    ]
-    return any(re.search(p, lower) for p in task_intent_patterns)
-
-
-def _fallback_parse_prose(response):
-    """Fallback: detect task actions from Gemini's prose when it forgets tags.
-    Looks for patterns like 'moved "X" to today' or 'added "X"'."""
-    from datetime import datetime, timedelta
-
-    lower = response.lower()
-    proposals = []
-
-    now = datetime.now()
-    today_iso = now.strftime("%Y-%m-%d")
-    tomorrow_iso = (now + timedelta(days=1)).strftime("%Y-%m-%d")
-
-    weekday_map = {}
-    for i in range(1, 8):
-        d = now + timedelta(days=i)
-        weekday_map[d.strftime("%A").lower()] = d.strftime("%Y-%m-%d")
-
-    def _resolve_date(text):
-        t = text.lower().strip().rstrip(".")
-        if t == "today":
-            return today_iso
-        if t == "tomorrow":
-            return tomorrow_iso
-        for day_name, iso in weekday_map.items():
-            if day_name in t:
-                return iso
-        date_match = re.search(r'(\d{4}-\d{2}-\d{2})', t)
-        if date_match:
-            return date_match.group(1)
-        return None
-
-    for match in re.finditer(
-        r'(?:moved|updated|pushed|changed|rescheduled)\s+"([^"]+)"\s+(?:to|due)\s+(\w+[\w\s,]*)',
-        lower,
-    ):
-        title = match.group(1)
-        date = _resolve_date(match.group(2))
-        if date:
-            orig_match = re.search(re.escape(match.group(1)), response, re.IGNORECASE)
-            orig_title = orig_match.group(0) if orig_match else title
-            proposals.append({"action": "update", "find": orig_title, "new_due": date})
-
-    for match in re.finditer(
-        r'(?:added|created)\s+"([^"]+)"(?:\s+(?:to your tasks?|for you))?(?:[,.]?\s*due\s+(\w+[\w\s,]*))?',
-        lower,
-    ):
-        title = match.group(1)
-        orig_match = re.search(re.escape(match.group(1)), response, re.IGNORECASE)
-        orig_title = orig_match.group(0) if orig_match else title
-        task = {"action": "create", "title": orig_title}
-        if match.group(2):
-            date = _resolve_date(match.group(2))
-            if date:
-                task["due"] = date
-        proposals.append(task)
-
-    for match in re.finditer(
-        r'(?:marked|completed|finished|crossed off)\s+"([^"]+)"',
-        lower,
-    ):
-        orig_match = re.search(re.escape(match.group(1)), response, re.IGNORECASE)
-        orig_title = orig_match.group(0) if orig_match else match.group(1)
-        proposals.append({"action": "complete", "find": orig_title})
-
-    for match in re.finditer(
-        r'(?:deleted|removed)\s+"([^"]+)"',
-        lower,
-    ):
-        orig_match = re.search(re.escape(match.group(1)), response, re.IGNORECASE)
-        orig_title = orig_match.group(0) if orig_match else match.group(1)
-        proposals.append({"action": "delete", "find": orig_title})
-
-    return proposals if proposals else None
-
-
 def _remove_task_tags(response):
-    """Remove all task action tags from the response shown to the user."""
+    """Remove all task action tags from the response shown to the user.
+    Used by the legacy (non-agentic) fallback path."""
     cleaned = re.sub(r'\[(CREATE|UPDATE|COMPLETE|DELETE)_TASK\][^\n]*\n?', '', response)
     return cleaned.strip()
-
-
-def _execute_task_action(action_item):
-    """Execute a single confirmed task action."""
-    action = action_item.get("action", "create")
-    if action == "create":
-        return create_task(
-            title=action_item["title"],
-            notes=action_item.get("notes", ""),
-            due_date=action_item.get("due"),
-        )
-    elif action == "update":
-        return update_task(
-            task_title=action_item["find"],
-            new_title=action_item.get("new_title"),
-            new_notes=action_item.get("new_notes"),
-            new_due=action_item.get("new_due"),
-        )
-    elif action == "complete":
-        return complete_task(task_title=action_item["find"])
-    elif action == "delete":
-        return delete_task(task_title=action_item["find"])
-    return {"error": f"Unknown action: {action}"}
-
-
-def _detect_bulk_task_action(user_message):
-    """Detect bulk task operations like 'change all tasks to due today' and
-    programmatically generate update actions for every open task.
-    Skips tasks that already have the target due date."""
-    from datetime import datetime, timedelta
-
-    lower = user_message.lower().strip()
-
-    all_patterns = [
-        r'(?:change|move|push|set|update|reschedule)\s+(?:all|every|each)\s+(?:my\s+)?(?:pending\s+|open\s+)?tasks?\b',
-        r'(?:make|set)\s+(?:all|every|each)\s+(?:my\s+)?(?:pending\s+|open\s+)?tasks?\s+(?:due|to)',
-        r'(?:push|move)\s+everything\s+(?:to|due)',
-    ]
-    if not any(re.search(p, lower) for p in all_patterns):
-        return None
-
-    now = datetime.now()
-    today_iso = now.strftime("%Y-%m-%d")
-    tomorrow_iso = (now + timedelta(days=1)).strftime("%Y-%m-%d")
-    weekday_map = {}
-    for i in range(1, 8):
-        d = now + timedelta(days=i)
-        weekday_map[d.strftime("%A").lower()] = d.strftime("%Y-%m-%d")
-
-    target_date = None
-    if "today" in lower:
-        target_date = today_iso
-    elif "tomorrow" in lower:
-        target_date = tomorrow_iso
-    else:
-        for day_name, iso in weekday_map.items():
-            if day_name in lower:
-                target_date = iso
-                break
-        if not target_date:
-            date_match = re.search(r'(\d{4}-\d{2}-\d{2})', lower)
-            if date_match:
-                target_date = date_match.group(1)
-
-    if not target_date:
-        return None
-
-    try:
-        tasks = fetch_open_tasks()
-    except Exception:
-        return None
-
-    if not tasks:
-        return None
-
-    target_human = datetime.strptime(target_date, "%Y-%m-%d").strftime("%b %d, %Y")
-
-    actions = []
-    for t in tasks:
-        if t.get("due") == target_human:
-            continue
-        if not t.get("is_overdue"):
-            continue
-        actions.append({
-            "action": "update",
-            "find": t["title"],
-            "new_due": target_date,
-        })
-
-    return actions if actions else None
 
 
 def _extract_search_terms(user_message):
