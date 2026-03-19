@@ -133,6 +133,9 @@ def run_morning_briefing():
         print("  No CHAT_SPACE_ID configured. Printing to console:")
         print(summary)
 
+    # Feed calendar events, tasks, and Granola notes into the knowledge graph
+    _extract_briefing_sources_to_kg(meetings, tasks, granola_ctx)
+
     print("Momo's morning briefing delivered.")
     return {
         "status": "sent",
@@ -140,6 +143,32 @@ def run_morning_briefing():
         "meetings": len(meetings),
         "tasks": len(tasks),
     }
+
+
+def _extract_briefing_sources_to_kg(meetings, tasks, granola_ctx):
+    """Feed morning briefing data into the knowledge graph (background).
+
+    Calendar events and tasks are extracted here; emails are already handled
+    by the proactive email alert pipeline. Granola notes from the briefing
+    are extracted to catch meetings the debrief pipeline may have missed.
+    """
+    try:
+        from knowledge_graph import (
+            extract_from_calendar_events,
+            extract_from_tasks,
+            extract_from_granola_notes,
+        )
+        if meetings:
+            print("  KG: extracting from calendar events...")
+            extract_from_calendar_events(meetings)
+        if tasks:
+            print("  KG: extracting from tasks...")
+            extract_from_tasks(tasks)
+        if granola_ctx:
+            print("  KG: extracting from Granola notes...")
+            extract_from_granola_notes(granola_ctx)
+    except Exception as e:
+        print(f"  KG extraction from briefing sources failed: {e}")
 
 
 def run_proactive_email_alerts():
