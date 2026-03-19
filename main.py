@@ -217,6 +217,7 @@ def _run_backfill():
     print("Backfill: starting knowledge graph backfill...")
     meetings_ok, meetings_fail = 0, 0
     emails_ok, emails_fail = 0, 0
+    calendar_ok, tasks_ok = 0, 0
 
     if config.GRANOLA_ENABLED:
         try:
@@ -289,8 +290,33 @@ def _run_backfill():
         print(f"  Backfill: email processing failed: {e}")
         traceback.print_exc()
 
+    # Calendar events — extract from today's meetings
+    try:
+        from calendar_service import fetch_todays_meetings
+        from knowledge_graph import extract_from_calendar_events
+        cal_events = fetch_todays_meetings()
+        print(f"Backfill: found {len(cal_events)} calendar events to process")
+        extract_from_calendar_events(cal_events)
+        calendar_ok = len([e for e in cal_events if not e.get("is_all_day")])
+    except Exception as e:
+        print(f"  Backfill: calendar processing failed: {e}")
+        traceback.print_exc()
+
+    # Tasks — extract current open tasks
+    try:
+        from tasks_service import fetch_open_tasks
+        from knowledge_graph import extract_from_tasks
+        open_tasks = fetch_open_tasks()
+        print(f"Backfill: found {len(open_tasks)} open tasks to process")
+        extract_from_tasks(open_tasks)
+        tasks_ok = len(open_tasks)
+    except Exception as e:
+        print(f"  Backfill: tasks processing failed: {e}")
+        traceback.print_exc()
+
     print(f"Backfill complete: meetings={meetings_ok} ok/{meetings_fail} fail, "
-          f"emails={emails_ok} ok/{emails_fail} fail")
+          f"emails={emails_ok} ok/{emails_fail} fail, "
+          f"calendar={calendar_ok}, tasks={tasks_ok}")
 
 
 # ── Google Chat Webhook ──────────────────────────────────────
