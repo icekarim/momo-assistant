@@ -335,6 +335,90 @@ async def chat_webhook(request: Request):
     return _make_response("Momo is here. Send me a message to get started.", is_addon)
 
 
+_CONFIRM_WORDS = {
+    "yes", "yep", "yeah", "yea", "y", "sure", "do it", "go ahead",
+    "create them", "create those", "create those tasks", "create these tasks",
+    "create tasks", "create these", "add them", "add those", "add those tasks",
+    "add these tasks", "go for it", "please", "yes please", "yep do it",
+    "sounds good", "let's do it", "ok", "okay",
+}
+_DECLINE_WORDS = {
+    "no", "nah", "nope", "n", "skip", "skip those", "no thanks",
+    "don't create", "never mind", "nevermind", "cancel",
+}
+
+
+def _check_pending_task_intent(lower: str) -> str | None:
+    """Detect whether a message confirms or declines pending tasks.
+
+    Returns 'confirm', 'decline', or None (ambiguous / unrelated).
+    Uses prefix matching so qualifiers like 'all due tmrw' don't break it.
+    """
+    if lower in _CONFIRM_WORDS:
+        return "confirm"
+    if lower in _DECLINE_WORDS:
+        return "decline"
+
+    for phrase in sorted(_DECLINE_WORDS, key=len, reverse=True):
+        if lower.startswith(phrase):
+            return "decline"
+    for phrase in sorted(_CONFIRM_WORDS, key=len, reverse=True):
+        if lower.startswith(phrase):
+            return "confirm"
+
+    confirm_patterns = [
+        r'^(?:yes|yeah|yep|sure|ok|okay)[,.]?\s',
+        r'\bcreate\s+(?:those|these|the)\s+tasks?\b',
+        r'\badd\s+(?:those|these|the)\s+tasks?\b',
+        r'^(?:do it|go ahead|go for it|let\'s do it|sounds good)',
+    ]
+    if any(re.search(p, lower) for p in confirm_patterns):
+        return "confirm"
+
+    decline_patterns = [
+        r'^(?:no|nah|nope)[,.]?\s',
+        r'\bskip\b.*\btasks?\b',
+        r'\bdon\'t\s+(?:create|add)\b',
+    ]
+    if any(re.search(p, lower) for p in decline_patterns):
+        return "decline"
+
+    return None
+
+
+def _parse_due_date_override(lower: str) -> str | None:
+    """Extract a due-date override from a confirmation message.
+
+    Handles phrases like 'all due tmrw', 'due tomorrow', 'for friday', etc.
+    Returns an ISO date string or None.
+    """
+    from datetime import datetime, timedelta
+
+    now = datetime.now()
+    today_iso = now.strftime("%Y-%m-%d")
+    tomorrow_iso = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    weekday_map = {}
+    for i in range(1, 8):
+        d = now + timedelta(days=i)
+        weekday_map[d.strftime("%A").lower()] = d.strftime("%Y-%m-%d")
+
+    if re.search(r'\b(?:due\s+)?(?:today|for today)\b', lower):
+        return today_iso
+    if re.search(r'\b(?:due\s+)?(?:tmrw|tomorrow|for\s+tomorrow)\b', lower):
+        return tomorrow_iso
+
+    for day_name, iso in weekday_map.items():
+        if re.search(rf'\b(?:due\s+)?(?:{day_name}|for\s+{day_name})\b', lower):
+            return iso
+
+    date_match = re.search(r'(\d{4}-\d{2}-\d{2})', lower)
+    if date_match:
+        return date_match.group(1)
+
+    return None
+
+
 async def handle_message(ev: dict) -> dict:
     """Process an incoming chat message (text and/or voice).
     Returns an immediate ack and processes the real response in a background
@@ -379,19 +463,14 @@ async def handle_message(ev: dict) -> dict:
             except Exception as e:
                 return _make_response(f"Error generating briefing: {str(e)}", is_addon)
 
-        _CONFIRM_PHRASES = {
-            "yes", "yep", "yeah", "yea", "y", "sure", "do it", "go ahead",
-            "create them", "create those", "create those tasks", "create tasks",
-            "add them", "add those", "add those tasks", "go for it", "please",
-            "yes please", "yep do it", "sounds good", "let's do it",
-        }
-        _DECLINE_PHRASES = {
-            "no", "nah", "nope", "n", "skip", "skip those", "no thanks",
-            "don't create", "never mind", "nevermind", "cancel",
-        }
-        if lower in _CONFIRM_PHRASES:
-            pending, meeting_title = get_pending_tasks()
-            if pending:
+        pending, meeting_title = get_pending_tasks()
+        if pending:
+            confirm_or_decline = _check_pending_task_intent(lower)
+            if confirm_or_decline == "confirm":
+                due_override = _parse_due_date_override(lower)
+                if due_override:
+                    for task in pending:
+                        task["due"] = due_override
                 target_space = space or config.CHAT_SPACE_ID
                 thread = threading.Thread(
                     target=_create_pending_tasks_background,
@@ -400,9 +479,7 @@ async def handle_message(ev: dict) -> dict:
                 )
                 thread.start()
                 return _make_response("", is_addon)
-        if lower in _DECLINE_PHRASES:
-            pending, _ = get_pending_tasks()
-            if pending:
+            if confirm_or_decline == "decline":
                 clear_pending_tasks()
                 return _make_response("Got it — skipped those tasks.", is_addon)
 
