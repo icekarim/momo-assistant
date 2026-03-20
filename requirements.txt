@@ -8,5 +8,6 @@ google-auth-httplib2==0.2.0
 google-cloud-firestore==2.19.0
 python-dotenv==1.0.1
 cachetools==5.5.0
+numpy
 mcp
 httpx

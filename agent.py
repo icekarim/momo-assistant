@@ -13,7 +13,6 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from datetime import datetime, timedelta
 
 import google.generativeai as genai
-from google.generativeai.types import content_types
 
 import config
 
@@ -31,12 +30,44 @@ _TOOL_TIMEOUTS = {
     "delete_task": 10,
     "get_recent_emails": 15,
     "search_emails": 15,
-    "search_knowledge_graph": 10,
-    "get_meeting_notes": 12,
+    "search_knowledge_graph": 30,
+    "get_meeting_notes": 30,
     "get_jira_tickets": 12,
     "get_jira_issue": 12,
     "search_jira_tickets": 12,
 }
+
+# ── Schema helper ────────────────────────────────────────────
+
+_TYPE_MAP = {
+    "string": genai.protos.Type.STRING,
+    "integer": genai.protos.Type.INTEGER,
+    "number": genai.protos.Type.NUMBER,
+    "boolean": genai.protos.Type.BOOLEAN,
+    "object": genai.protos.Type.OBJECT,
+    "array": genai.protos.Type.ARRAY,
+}
+
+
+def _schema(json_schema: dict) -> genai.protos.Schema:
+    """Convert a JSON-Schema-style dict to a genai.protos.Schema."""
+    schema_type = _TYPE_MAP.get(json_schema.get("type", "object"), genai.protos.Type.OBJECT)
+
+    properties = {}
+    for key, prop in json_schema.get("properties", {}).items():
+        properties[key] = genai.protos.Schema(
+            type=_TYPE_MAP.get(prop.get("type", "string"), genai.protos.Type.STRING),
+            description=prop.get("description", ""),
+        )
+
+    required = json_schema.get("required") or None
+
+    return genai.protos.Schema(
+        type=schema_type,
+        properties=properties if properties else None,
+        required=required,
+    )
+
 
 # ── Tool declarations ────────────────────────────────────────
 
@@ -45,12 +76,12 @@ _CORE_TOOLS = [
         genai.protos.FunctionDeclaration(
             name="get_todays_calendar",
             description="Get today's meetings and schedule from Google Calendar. Returns all events for today with times, attendees, and details.",
-            parameters=content_types.to_function_parameters({"type": "object", "properties": {}}),
+            parameters=_schema({"type": "object", "properties": {}}),
         ),
         genai.protos.FunctionDeclaration(
             name="get_calendar_for_date",
             description="Get meetings for a specific date from Google Calendar. Use this when the user asks about a date other than today.",
-            parameters=content_types.to_function_parameters({
+            parameters=_schema({
                 "type": "object",
                 "properties": {
                     "date": {"type": "string", "description": "Date in YYYY-MM-DD format"},
@@ -61,12 +92,12 @@ _CORE_TOOLS = [
         genai.protos.FunctionDeclaration(
             name="get_open_tasks",
             description="Get all open/incomplete tasks from Google Tasks across all task lists. Includes due dates, overdue status, and recently completed tasks.",
-            parameters=content_types.to_function_parameters({"type": "object", "properties": {}}),
+            parameters=_schema({"type": "object", "properties": {}}),
         ),
         genai.protos.FunctionDeclaration(
             name="create_task",
             description="Create a new task in Google Tasks. Checks for duplicates automatically.",
-            parameters=content_types.to_function_parameters({
+            parameters=_schema({
                 "type": "object",
                 "properties": {
                     "title": {"type": "string", "description": "Task title"},
@@ -79,7 +110,7 @@ _CORE_TOOLS = [
         genai.protos.FunctionDeclaration(
             name="update_task",
             description="Update an existing task (change title, due date, or notes). Finds the task by fuzzy title match.",
-            parameters=content_types.to_function_parameters({
+            parameters=_schema({
                 "type": "object",
                 "properties": {
                     "find": {"type": "string", "description": "Current task title to find (fuzzy match)"},
@@ -93,7 +124,7 @@ _CORE_TOOLS = [
         genai.protos.FunctionDeclaration(
             name="complete_task",
             description="Mark a task as completed. Finds the task by fuzzy title match.",
-            parameters=content_types.to_function_parameters({
+            parameters=_schema({
                 "type": "object",
                 "properties": {
                     "find": {"type": "string", "description": "Task title to find and complete"},
@@ -104,7 +135,7 @@ _CORE_TOOLS = [
         genai.protos.FunctionDeclaration(
             name="delete_task",
             description="Delete a task. Finds the task by fuzzy title match.",
-            parameters=content_types.to_function_parameters({
+            parameters=_schema({
                 "type": "object",
                 "properties": {
                     "find": {"type": "string", "description": "Task title to find and delete"},
@@ -115,7 +146,7 @@ _CORE_TOOLS = [
         genai.protos.FunctionDeclaration(
             name="get_recent_emails",
             description="Get recent unread emails from the inbox. Returns sender, subject, date, and body.",
-            parameters=content_types.to_function_parameters({
+            parameters=_schema({
                 "type": "object",
                 "properties": {
                     "max_results": {"type": "integer", "description": "Maximum number of emails to return (default 15)"},
@@ -125,7 +156,7 @@ _CORE_TOOLS = [
         genai.protos.FunctionDeclaration(
             name="search_emails",
             description="Search emails with a custom query. Use this when looking for emails from a specific person, about a specific topic, or in a time range.",
-            parameters=content_types.to_function_parameters({
+            parameters=_schema({
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Search query (e.g. person name, topic, 'from:sarah', etc.)"},
@@ -143,7 +174,7 @@ _CORE_TOOLS = [
                 "past discussions, decisions, commitments, action items, blockers, or anything someone "
                 "said or agreed to. Supports natural language queries."
             ),
-            parameters=content_types.to_function_parameters({
+            parameters=_schema({
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Natural language search query"},
@@ -163,7 +194,7 @@ def _build_optional_tools() -> list:
         extra_decls.append(genai.protos.FunctionDeclaration(
             name="get_meeting_notes",
             description="Search Granola meeting notes, transcripts, and action items. Use for questions about what was discussed in meetings.",
-            parameters=content_types.to_function_parameters({
+            parameters=_schema({
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Search query for meeting notes"},
@@ -176,12 +207,12 @@ def _build_optional_tools() -> list:
         extra_decls.append(genai.protos.FunctionDeclaration(
             name="get_jira_tickets",
             description="Get active Jira tickets where the user is assignee, reporter, or watcher.",
-            parameters=content_types.to_function_parameters({"type": "object", "properties": {}}),
+            parameters=_schema({"type": "object", "properties": {}}),
         ))
         extra_decls.append(genai.protos.FunctionDeclaration(
             name="get_jira_issue",
             description="Get details for a specific Jira issue by key (e.g. PROJ-123).",
-            parameters=content_types.to_function_parameters({
+            parameters=_schema({
                 "type": "object",
                 "properties": {
                     "key": {"type": "string", "description": "Jira issue key (e.g. PROJ-123)"},
@@ -192,7 +223,7 @@ def _build_optional_tools() -> list:
         extra_decls.append(genai.protos.FunctionDeclaration(
             name="search_jira_tickets",
             description="Search Jira tickets with a text query.",
-            parameters=content_types.to_function_parameters({
+            parameters=_schema({
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Text search query"},

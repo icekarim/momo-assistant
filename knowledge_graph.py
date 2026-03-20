@@ -21,7 +21,7 @@ from conversation_store import get_db
 _kg_cache = TTLCache(maxsize=128, ttl=300)
 _kg_cache_lock = threading.Lock()
 
-_embedding_cache = TTLCache(maxsize=1, ttl=300)
+_embedding_cache = TTLCache(maxsize=1, ttl=1800)  # 30 min — embeddings rarely change
 _embedding_cache_lock = threading.Lock()
 
 genai.configure(api_key=config.GEMINI_API_KEY)
@@ -59,13 +59,13 @@ def _get_embedding(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list[flo
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    """Compute cosine similarity between two vectors."""
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = sum(x * x for x in a) ** 0.5
-    norm_b = sum(x * x for x in b) ** 0.5
+    """Compute cosine similarity between two vectors (fallback, prefer _batch_cosine)."""
+    import numpy as np
+    a_arr, b_arr = np.array(a), np.array(b)
+    norm_a, norm_b = np.linalg.norm(a_arr), np.linalg.norm(b_arr)
     if norm_a == 0 or norm_b == 0:
         return 0.0
-    return dot / (norm_a * norm_b)
+    return float(np.dot(a_arr, b_arr) / (norm_a * norm_b))
 
 # ── Extraction prompt ────────────────────────────────────────
 # Literal braces in the JSON example are doubled ({{ }}) so
@@ -534,29 +534,67 @@ def update_entity_status(doc_id: str, new_status: str):
 # ── Semantic search ──────────────────────────────────────────
 
 
-def _get_all_embeddings() -> list[dict]:
-    """Cached bulk read of all KG entities with embeddings from Firestore."""
+def _get_all_embeddings() -> tuple[list[dict], "np.ndarray | None"]:
+    """Cached bulk read of all KG entities + pre-computed embedding matrix.
+
+    Returns (entities, matrix) where matrix is a numpy array of shape
+    (N, embedding_dim) for entities that have embeddings. Cached for 30 min.
+    """
+    import numpy as np
+
     with _embedding_cache_lock:
         cached = _embedding_cache.get("all")
     if cached is not None:
         return cached
 
+    t0 = __import__("time").time()
     db = get_db()
     docs = db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION).stream()
     entities = [_doc_to_dict(doc) for doc in docs]
 
+    # Pre-compute numpy matrix for vectorized cosine similarity
+    indexed_entities = []
+    vectors = []
+    for e in entities:
+        emb = e.get("embedding")
+        if emb:
+            indexed_entities.append(e)
+            vectors.append(emb)
+
+    matrix = np.array(vectors, dtype=np.float32) if vectors else None
+
+    # Pre-compute norms for fast cosine similarity
+    if matrix is not None:
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0  # avoid division by zero
+        matrix = matrix / norms  # normalize once, reuse on every query
+
+    result = (indexed_entities, matrix)
     with _embedding_cache_lock:
-        _embedding_cache["all"] = entities
-    return entities
+        _embedding_cache["all"] = result
+
+    elapsed = __import__("time").time() - t0
+    print(f"Knowledge graph: loaded {len(indexed_entities)} embeddings in {elapsed:.2f}s")
+    return result
+
+
+def warm_embedding_cache():
+    """Pre-load the embedding cache. Call on startup to avoid cold-start latency."""
+    try:
+        _get_all_embeddings()
+    except Exception as exc:
+        print(f"Knowledge graph: embedding cache warmup failed: {exc}")
 
 
 def semantic_search(query: str, limit: int | None = None,
                     threshold: float | None = None) -> list[dict]:
-    """Search the knowledge graph using vector similarity.
+    """Search the knowledge graph using vectorized cosine similarity.
 
-    Embeds the query, compares against all stored entity embeddings,
-    and returns the top matches above the similarity threshold.
+    Embeds the query, compares against the pre-computed normalized embedding
+    matrix in a single numpy operation, and returns the top matches.
     """
+    import numpy as np
+
     limit = limit or config.SEMANTIC_SEARCH_LIMIT
     threshold = threshold if threshold is not None else config.SEMANTIC_SEARCH_THRESHOLD
 
@@ -566,18 +604,29 @@ def semantic_search(query: str, limit: int | None = None,
         print(f"Knowledge graph: query embedding failed ({exc}), falling back to empty")
         return []
 
-    entities = _get_all_embeddings()
+    indexed_entities, matrix = _get_all_embeddings()
 
-    scored = []
-    for entity in entities:
-        if "embedding" not in entity:
-            continue
-        score = _cosine_similarity(query_embedding, entity["embedding"])
-        if score >= threshold:
-            scored.append((score, entity))
+    if matrix is None or len(indexed_entities) == 0:
+        return []
 
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [entity for _score, entity in scored[:limit]]
+    # Vectorized cosine similarity: one matrix-vector dot product
+    q = np.array(query_embedding, dtype=np.float32)
+    q_norm = np.linalg.norm(q)
+    if q_norm == 0:
+        return []
+    q = q / q_norm
+
+    scores = matrix @ q  # (N,) — all similarities in one operation
+
+    # Filter and sort
+    mask = scores >= threshold
+    if not mask.any():
+        return []
+
+    indices = np.where(mask)[0]
+    top_indices = indices[np.argsort(scores[indices])[::-1][:limit]]
+
+    return [indexed_entities[i] for i in top_indices]
 
 
 def embed_backfill() -> dict:
