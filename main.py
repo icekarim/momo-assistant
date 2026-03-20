@@ -685,10 +685,16 @@ def _format_pending_task_action(action: dict) -> str:
 
 def _build_task_approval_block(actions: list[dict]) -> str:
     """Build the standard approval block appended to pending task replies."""
-    lines = ["📝 *pending approval*"]
+    lines = ["📝 *Approve these Google Tasks changes*"]
     lines.extend(f"  {idx}. {_format_pending_task_action(action)}" for idx, action in enumerate(actions, start=1))
     lines.append("")
-    lines.append('_Reply *yes* to approve all, *approve 2* to approve one, or *no* to cancel_')
+    if len(actions) == 1:
+        lines.append('_Reply *yes* to apply this change in Google Tasks, or *no* to cancel_')
+    else:
+        lines.append(
+            f"_Reply *yes* to apply all {len(actions)} changes in Google Tasks, "
+            "*approve 2* to apply only item #2, or *no* to cancel_"
+        )
     return "\n".join(lines)
 
 
@@ -704,7 +710,7 @@ def _build_pending_selection_help(intent: str, actions: list[dict]) -> str:
     """Prompt the user to clarify which pending task(s) they mean."""
     verb = "approve" if intent == "confirm" else "cancel"
     return (
-        f"not sure which task you want to {verb}. reply with `{verb} 1` "
+        f"not sure which item you want to {verb}. reply with `{verb} 1` to choose item #1 "
         f"or paste part of the task name.\n\n{_build_task_approval_block(actions)}"
     )
 
