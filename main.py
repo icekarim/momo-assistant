@@ -29,10 +29,24 @@ from calendar_service import (
     fetch_todays_meetings,
     format_meetings_for_context,
 )
-from tasks_service import fetch_open_tasks, format_tasks_for_context, create_task
+from tasks_service import (
+    fetch_open_tasks,
+    format_tasks_for_context,
+    create_task,
+    update_task,
+    complete_task,
+    delete_task,
+)
 from gemini_service import chat_response, transcribe_audio
 from chat_service import format_for_google_chat, send_chat_message, download_attachment, _SUPPORTED_AUDIO_TYPES
-from conversation_store import get_conversation, add_turn, clear_conversation, get_pending_tasks, clear_pending_tasks
+from conversation_store import (
+    get_conversation,
+    add_turn,
+    clear_conversation,
+    get_pending_task_actions,
+    clear_pending_task_actions,
+    store_pending_task_actions,
+)
 
 app = FastAPI(title="Momo")
 
@@ -409,94 +423,281 @@ async def chat_webhook(request: Request):
     return _make_response("Momo is here. Send me a message to get started.", is_addon)
 
 
-_CONFIRM_WORDS = {
-    "yes", "yep", "yeah", "yea", "y", "sure", "do it", "go ahead",
-    "create them", "create those", "create those tasks", "create these tasks",
-    "create tasks", "create these", "add them", "add those", "add those tasks",
-    "add these tasks", "go for it", "please", "yes please", "yep do it",
-    "sounds good", "let's do it", "ok", "okay",
+_APPROVE_WORDS = {
+    "yes",
+    "approve",
+    "approved",
+    "confirm",
+    "confirmed",
+    "yes please",
+    "yes approve",
+    "approve them",
+    "approve please",
+    "confirm them",
+    "create them",
+    "create these tasks",
 }
 _DECLINE_WORDS = {
-    "no", "nah", "nope", "n", "skip", "skip those", "no thanks",
-    "don't create", "never mind", "nevermind", "cancel",
+    "no",
+    "nope",
+    "no thanks",
+    "decline",
+    "cancel",
+    "cancel them",
+    "skip",
+    "skip them",
+    "don't do it",
+    "dont do it",
+}
+_APPROVE_PREFIXES = tuple(sorted(_APPROVE_WORDS, key=len, reverse=True))
+_DECLINE_PREFIXES = tuple(sorted(_DECLINE_WORDS, key=len, reverse=True))
+_ORDINAL_WORDS = {
+    "first": 1,
+    "second": 2,
+    "third": 3,
+    "fourth": 4,
+    "fifth": 5,
+    "sixth": 6,
+    "seventh": 7,
+    "eighth": 8,
+    "ninth": 9,
+    "tenth": 10,
+}
+_REFERENCE_FILLER_WORDS = {
+    "a", "an", "the", "this", "that", "these", "those",
+    "task", "tasks", "item", "items", "one", "ones",
+    "just", "only", "please", "pls", "do", "for", "me",
 }
 
 
 def _check_pending_task_intent(lower: str) -> str | None:
-    """Detect whether a message confirms or declines pending tasks.
-
-    Returns 'confirm', 'decline', or None (ambiguous / unrelated).
-    Uses prefix matching so qualifiers like 'all due tmrw' don't break it,
-    but requires a word boundary after the match to avoid false positives
-    (e.g. "y" matching "you can mark..." or "n" matching "noted").
-    """
-    if lower in _CONFIRM_WORDS:
+    """Detect explicit approval or rejection of a pending task request."""
+    normalized = re.sub(r"\s+", " ", lower).strip().rstrip(".,!?")
+    if normalized in _APPROVE_WORDS:
         return "confirm"
-    if lower in _DECLINE_WORDS:
+    if normalized in _DECLINE_WORDS:
         return "decline"
-
-    _WORD_BOUNDARY = {' ', ',', '.', '!', '?', ';', ':'}
-
-    for phrase in sorted(_DECLINE_WORDS, key=len, reverse=True):
-        if len(phrase) > 1 and lower.startswith(phrase):
-            if len(lower) == len(phrase) or lower[len(phrase)] in _WORD_BOUNDARY:
-                return "decline"
-    for phrase in sorted(_CONFIRM_WORDS, key=len, reverse=True):
-        if len(phrase) > 1 and lower.startswith(phrase):
-            if len(lower) == len(phrase) or lower[len(phrase)] in _WORD_BOUNDARY:
-                return "confirm"
-
-    confirm_patterns = [
-        r'^(?:yes|yeah|yep|sure|ok|okay)[,.]?\s',
-        r'\bcreate\s+(?:those|these|the)\s+tasks?\b',
-        r'\badd\s+(?:those|these|the)\s+tasks?\b',
-        r'^(?:do it|go ahead|go for it|let\'s do it|sounds good)',
-    ]
-    if any(re.search(p, lower) for p in confirm_patterns):
-        return "confirm"
-
-    decline_patterns = [
-        r'^(?:no|nah|nope)[,.]?\s',
-        r'\bskip\b.*\btasks?\b',
-        r'\bdon\'t\s+(?:create|add)\b',
-    ]
-    if any(re.search(p, lower) for p in decline_patterns):
-        return "decline"
-
     return None
 
 
-def _parse_due_date_override(lower: str) -> str | None:
-    """Extract a due-date override from a confirmation message.
+def _extract_pending_task_command(lower: str) -> tuple[str | None, str]:
+    """Return (intent, remainder) for explicit approve/cancel commands."""
+    normalized = re.sub(r"\s+", " ", lower).strip().rstrip(".,!?")
 
-    Handles phrases like 'all due tmrw', 'due tomorrow', 'for friday', etc.
-    Returns an ISO date string or None.
-    """
-    from datetime import datetime, timedelta
+    for phrase in _APPROVE_PREFIXES:
+        if normalized == phrase:
+            return "confirm", ""
+        if normalized.startswith(f"{phrase} "):
+            return "confirm", normalized[len(phrase):].lstrip(" ,:-")
 
-    now = datetime.now()
-    today_iso = now.strftime("%Y-%m-%d")
-    tomorrow_iso = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+    for phrase in _DECLINE_PREFIXES:
+        if normalized == phrase:
+            return "decline", ""
+        if normalized.startswith(f"{phrase} "):
+            return "decline", normalized[len(phrase):].lstrip(" ,:-")
 
-    weekday_map = {}
-    for i in range(1, 8):
-        d = now + timedelta(days=i)
-        weekday_map[d.strftime("%A").lower()] = d.strftime("%Y-%m-%d")
+    return None, ""
 
-    if re.search(r'\b(?:due\s+)?(?:today|for today)\b', lower):
-        return today_iso
-    if re.search(r'\b(?:due\s+)?(?:tmrw|tomorrow|for\s+tomorrow)\b', lower):
-        return tomorrow_iso
 
-    for day_name, iso in weekday_map.items():
-        if re.search(rf'\b(?:due\s+)?(?:{day_name}|for\s+{day_name})\b', lower):
-            return iso
+def _action_reference_texts(action: dict) -> list[str]:
+    """Return the task phrases a user might use to reference an action."""
+    refs = []
+    if action.get("find"):
+        refs.append(action["find"])
+    if action.get("title"):
+        refs.append(action["title"])
+    return refs
 
-    date_match = re.search(r'(\d{4}-\d{2}-\d{2})', lower)
-    if date_match:
-        return date_match.group(1)
 
+def _normalize_reference_tokens(text: str) -> tuple[list[str], str]:
+    """Normalize a phrase for fuzzy task-reference matching."""
+    tokens = re.findall(r"[a-z0-9']+", text.lower())
+    filtered = [token for token in tokens if token not in _REFERENCE_FILLER_WORDS]
+    return filtered, " ".join(filtered)
+
+
+def _match_action_by_reference(reference: str, actions: list[dict]) -> set[int] | None:
+    """Try to match a user-supplied task reference to pending actions."""
+    ref_tokens, ref_phrase = _normalize_reference_tokens(reference)
+    if not ref_tokens:
+        return None
+
+    substring_matches = set()
+    overlap_matches = set()
+
+    for idx, action in enumerate(actions):
+        for candidate in _action_reference_texts(action):
+            candidate_tokens, candidate_phrase = _normalize_reference_tokens(candidate)
+            if not candidate_tokens:
+                continue
+
+            if ref_phrase and ref_phrase in candidate_phrase:
+                substring_matches.add(idx)
+                continue
+
+            overlap = len(set(ref_tokens) & set(candidate_tokens))
+            if len(ref_tokens) == 1:
+                if overlap == 1 and ref_tokens[0] in candidate_tokens:
+                    overlap_matches.add(idx)
+            elif overlap >= 2 and overlap / len(ref_tokens) >= 0.6:
+                overlap_matches.add(idx)
+
+    if len(substring_matches) == 1:
+        return substring_matches
+    if len(substring_matches) > 1:
+        return None
+    if len(overlap_matches) == 1:
+        return overlap_matches
     return None
+
+
+def _select_pending_action_indices(reference: str, actions: list[dict]) -> set[int] | None:
+    """Resolve a partial approval/cancel reference to pending action indices."""
+    normalized = re.sub(r"\s+", " ", reference).strip().rstrip(".,!?")
+    if not normalized:
+        return set(range(len(actions)))
+
+    all_refs = {
+        "all",
+        "all of them",
+        "them",
+        "these",
+        "those",
+        "these tasks",
+        "those tasks",
+        "everything",
+    }
+    singular_refs = {"it", "this one", "that one", "one of them", "one task"}
+
+    if normalized in all_refs:
+        return set(range(len(actions)))
+    if normalized in singular_refs:
+        return {0} if len(actions) == 1 else None
+
+    indices = set()
+
+    for match in re.findall(r"#?(\d+)", normalized):
+        idx = int(match)
+        if 1 <= idx <= len(actions):
+            indices.add(idx - 1)
+
+    for word, idx in _ORDINAL_WORDS.items():
+        if re.search(rf"\b{word}\b", normalized):
+            if idx <= len(actions):
+                indices.add(idx - 1)
+    if re.search(r"\blast\b", normalized) and actions:
+        indices.add(len(actions) - 1)
+
+    if indices:
+        return indices
+
+    return _match_action_by_reference(normalized, actions)
+
+
+def _parse_pending_task_reply(lower: str, actions: list[dict]) -> dict:
+    """Parse an approval/cancel reply and resolve which actions it targets."""
+    exact_intent = _check_pending_task_intent(lower)
+    if exact_intent:
+        return {
+            "intent": exact_intent,
+            "selected_indices": set(range(len(actions))),
+            "ambiguous": False,
+        }
+
+    intent, remainder = _extract_pending_task_command(lower)
+    if not intent:
+        return {"intent": None, "selected_indices": set(), "ambiguous": False}
+
+    selected_indices = _select_pending_action_indices(remainder, actions)
+    if selected_indices is None:
+        return {"intent": intent, "selected_indices": set(), "ambiguous": True}
+
+    return {
+        "intent": intent,
+        "selected_indices": selected_indices,
+        "ambiguous": False,
+    }
+
+
+def _user_task_scope(user_id: str, space: str) -> str:
+    """Scope direct task approvals to the current user in the current space."""
+    return f"user:{space or 'direct'}:{user_id}"
+
+
+def _space_task_scope(space: str) -> str | None:
+    """Scope scheduled debrief approvals to the chat space."""
+    if not space:
+        return None
+    return f"space:{space}"
+
+
+def _get_pending_task_request(user_id: str, space: str) -> tuple[dict | None, str | None]:
+    """Fetch the highest-priority pending task request for this message."""
+    user_scope = _user_task_scope(user_id, space)
+    pending = get_pending_task_actions(scope_id=user_scope)
+    if pending:
+        return pending, user_scope
+
+    space_scope = _space_task_scope(space)
+    if space_scope:
+        pending = get_pending_task_actions(scope_id=space_scope)
+        if pending:
+            return pending, space_scope
+
+    return None, None
+
+
+def _format_pending_task_action(action: dict) -> str:
+    """Render a short human-readable summary of a pending task mutation."""
+    op = action.get("action", "create")
+    if op == "create":
+        due = f" (due {action['due']})" if action.get("due") else ""
+        return f"create *{action['title']}*{due}"
+
+    if op == "update":
+        changes = []
+        if action.get("title"):
+            changes.append(f"rename to *{action['title']}*")
+        if action.get("due"):
+            changes.append(f"set due {action['due']}")
+        if "notes" in action:
+            changes.append("clear notes" if not action.get("notes") else "update notes")
+        change_str = "; ".join(changes) if changes else "update details"
+        return f"update *{action['find']}* ({change_str})"
+
+    if op == "complete":
+        return f"mark *{action['find']}* complete"
+
+    if op == "delete":
+        return f"delete *{action['find']}*"
+
+    return f"{op} task request"
+
+
+def _build_task_approval_block(actions: list[dict]) -> str:
+    """Build the standard approval block appended to pending task replies."""
+    lines = ["📝 *pending approval*"]
+    lines.extend(f"  {idx}. {_format_pending_task_action(action)}" for idx, action in enumerate(actions, start=1))
+    lines.append("")
+    lines.append('_Reply *yes* to approve all, *approve 2* to approve one, or *no* to cancel_')
+    return "\n".join(lines)
+
+
+def _append_task_approval_block(response: str, actions: list[dict]) -> str:
+    """Append the pending-approval summary to the agent's response."""
+    block = _build_task_approval_block(actions)
+    if not response:
+        return block
+    return f"{response.rstrip()}\n\n{block}"
+
+
+def _build_pending_selection_help(intent: str, actions: list[dict]) -> str:
+    """Prompt the user to clarify which pending task(s) they mean."""
+    verb = "approve" if intent == "confirm" else "cancel"
+    return (
+        f"not sure which task you want to {verb}. reply with `{verb} 1` "
+        f"or paste part of the task name.\n\n{_build_task_approval_block(actions)}"
+    )
 
 
 async def handle_message(ev: dict) -> dict:
@@ -543,25 +744,62 @@ async def handle_message(ev: dict) -> dict:
             except Exception as e:
                 return _make_response(f"Error generating briefing: {str(e)}", is_addon)
 
-        pending, meeting_title = get_pending_tasks()
-        if pending:
-            confirm_or_decline = _check_pending_task_intent(lower)
-            if confirm_or_decline == "confirm":
-                due_override = _parse_due_date_override(lower)
-                if due_override:
-                    for task in pending:
-                        task["due"] = due_override
+        pending_request, pending_scope_id = _get_pending_task_request(
+            user_id,
+            space or config.CHAT_SPACE_ID,
+        )
+        if pending_request:
+            parsed_reply = _parse_pending_task_reply(lower, pending_request["actions"])
+            if parsed_reply["ambiguous"]:
+                return _make_response(
+                    _build_pending_selection_help(parsed_reply["intent"], pending_request["actions"]),
+                    is_addon,
+                )
+            if parsed_reply["intent"] == "confirm":
+                selected_indices = parsed_reply["selected_indices"]
+                selected_actions = [
+                    action for idx, action in enumerate(pending_request["actions"])
+                    if idx in selected_indices
+                ]
+                remaining_actions = [
+                    action for idx, action in enumerate(pending_request["actions"])
+                    if idx not in selected_indices
+                ]
                 target_space = space or config.CHAT_SPACE_ID
                 thread = threading.Thread(
-                    target=_create_pending_tasks_background,
-                    args=(pending, meeting_title, target_space),
+                    target=_apply_pending_task_actions_background,
+                    args=(
+                        selected_actions,
+                        remaining_actions,
+                        pending_request.get("meeting_title", ""),
+                        target_space,
+                        pending_scope_id,
+                    ),
                     daemon=True,
                 )
                 thread.start()
                 return _make_response("", is_addon)
-            if confirm_or_decline == "decline":
-                clear_pending_tasks()
-                return _make_response("Got it — skipped those tasks.", is_addon)
+            if parsed_reply["intent"] == "decline":
+                selected_indices = parsed_reply["selected_indices"]
+                remaining_actions = [
+                    action for idx, action in enumerate(pending_request["actions"])
+                    if idx not in selected_indices
+                ]
+                if remaining_actions:
+                    store_pending_task_actions(
+                        remaining_actions,
+                        scope_id=pending_scope_id,
+                        meeting_title=pending_request.get("meeting_title", ""),
+                        approval_message=pending_request.get("approval_message", ""),
+                    )
+                    reply = (
+                        "got it — removed that task from pending approval.\n\n"
+                        + _build_task_approval_block(remaining_actions)
+                    )
+                else:
+                    clear_pending_task_actions(scope_id=pending_scope_id)
+                    reply = "Got it — canceled that pending task request."
+                return _make_response(reply, is_addon)
 
     target_space = space or config.CHAT_SPACE_ID
     thread = threading.Thread(
@@ -574,48 +812,94 @@ async def handle_message(ev: dict) -> dict:
     return _make_response("", is_addon)
 
 
-def _create_pending_tasks_background(pending_tasks, meeting_title, space):
-    """Create confirmed pending tasks from a debrief and report back."""
+def _apply_pending_task_actions_background(
+    pending_actions,
+    remaining_actions,
+    meeting_title,
+    space,
+    scope_id,
+):
+    """Apply approved pending task mutations and report back."""
     try:
         results = []
         skipped = []
         errors = []
-        for task in pending_tasks:
+        for action in pending_actions:
+            op = action.get("action", "create")
+            label = action.get("title") or action.get("find") or op
             try:
-                result = create_task(
-                    title=task["title"],
-                    notes=task.get("notes", ""),
-                    due_date=task.get("due"),
-                )
-                status = result.get("status", "error")
-                if "error" in result:
-                    errors.append(f"{task['title']}: {result['error']}")
-                elif status in ("already_exists", "already_completed"):
-                    skipped.append(f"*{result['title']}* — {status.replace('_', ' ')}")
+                if op == "create":
+                    result = create_task(
+                        title=action["title"],
+                        notes=action.get("notes", ""),
+                        due_date=action.get("due"),
+                    )
+                    status = result.get("status", "error")
+                    if "error" in result:
+                        errors.append(f"{label}: {result['error']}")
+                    elif status in ("already_exists", "already_completed"):
+                        skipped.append(f"*{result['title']}* — {status.replace('_', ' ')}")
+                    else:
+                        results.append(f"created *{result['title']}*")
+                elif op == "update":
+                    result = update_task(
+                        task_title=action["find"],
+                        new_title=action.get("title"),
+                        new_notes=action.get("notes"),
+                        new_due=action.get("due"),
+                    )
+                    if "error" in result:
+                        errors.append(f"{label}: {result['error']}")
+                    else:
+                        results.append(f"updated *{result['title']}*")
+                elif op == "complete":
+                    result = complete_task(task_title=action["find"])
+                    if "error" in result:
+                        errors.append(f"{label}: {result['error']}")
+                    else:
+                        results.append(f"completed *{result['title']}*")
+                elif op == "delete":
+                    result = delete_task(task_title=action["find"])
+                    if "error" in result:
+                        errors.append(f"{label}: {result['error']}")
+                    else:
+                        results.append(f"deleted *{result['title']}*")
                 else:
-                    results.append(f"*{result['title']}* — {status}")
+                    errors.append(f"{label}: unknown task action '{op}'")
             except Exception as e:
-                errors.append(f"{task['title']}: {str(e)}")
+                errors.append(f"{label}: {str(e)}")
 
         lines = []
+        if meeting_title:
+            lines.append(f"📝 *approved from {meeting_title}*")
         if results:
-            lines.append(f"✅ *{len(results)} task(s) created:*")
-            lines.extend(f"  • {r}" for r in results)
+            lines.append(f"✅ *{len(results)} task change(s) applied:*")
+            lines.extend(f"  • {result}" for result in results)
         if skipped:
-            lines.append(f"🟡 *{len(skipped)} skipped (already existed):*")
+            lines.append(f"🟡 *{len(skipped)} skipped:*")
             lines.extend(f"  • {s}" for s in skipped)
         if errors:
             lines.append(f"🔴 *{len(errors)} failed:*")
             lines.extend(f"  • {e}" for e in errors)
 
-        reply = "\n".join(lines) if lines else "No tasks to create."
+        if remaining_actions:
+            store_pending_task_actions(
+                remaining_actions,
+                scope_id=scope_id,
+                meeting_title=meeting_title,
+            )
+            lines.append("")
+            lines.append(_build_task_approval_block(remaining_actions))
+        else:
+            clear_pending_task_actions(scope_id=scope_id)
+
+        reply = "\n".join(lines) if lines else "No task changes were applied."
         formatted = format_for_google_chat(reply)
         send_chat_message(space, formatted)
-        clear_pending_tasks()
     except Exception as e:
         traceback.print_exc()
         try:
-            send_chat_message(space, f"sorry, something went wrong creating those tasks: {str(e)}")
+            send_chat_message(space, f"sorry, something went wrong applying that task request: {str(e)}")
         except Exception:
             print(f"Failed to send error message: {e}")
 
@@ -670,9 +954,16 @@ def _process_message_background(text, user_id, space, audio_attachments=None):
         _t1 = time.time()
         print(f"[perf] get_conversation: {_t1 - _t0:.2f}s (history={len(history)} turns)")
 
+        pending_task_actions = []
         if config.AGENTIC_MODE_ENABLED:
             from agent import run_agent_loop
-            response = run_agent_loop(text, history)
+            response, pending_task_actions = run_agent_loop(text, history)
+            if pending_task_actions:
+                store_pending_task_actions(
+                    pending_task_actions,
+                    scope_id=_user_task_scope(user_id, space),
+                )
+                response = _append_task_approval_block(response, pending_task_actions)
         else:
             context_data = _build_context(text)
             response = chat_response(text, history, context_data)
