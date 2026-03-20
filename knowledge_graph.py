@@ -7,9 +7,11 @@ Momo's chat responses.
 """
 
 import json
+import re
 import threading
 import traceback
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import google.generativeai as genai
 from cachetools import TTLCache
@@ -66,6 +68,130 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     if norm_a == 0 or norm_b == 0:
         return 0.0
     return float(np.dot(a_arr, b_arr) / (norm_a * norm_b))
+
+
+_EMAIL_RE = re.compile(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}")
+
+
+def _parse_source_date(value: str | datetime | None) -> datetime | None:
+    """Parse a variety of source date formats into a comparable UTC-naive date."""
+    if not value:
+        return None
+
+    parsed = value if isinstance(value, datetime) else None
+    text = "" if isinstance(value, datetime) else str(value).strip()
+
+    if parsed is None and text:
+        for candidate in (text.replace("Z", "+00:00"), text[:10]):
+            try:
+                parsed = datetime.fromisoformat(candidate)
+                break
+            except ValueError:
+                continue
+
+    if parsed is None and text:
+        try:
+            parsed = parsedate_to_datetime(text)
+        except (TypeError, ValueError, IndexError):
+            parsed = None
+
+    if parsed is None and text:
+        for fmt in ("%Y/%m/%d", "%b %d, %Y", "%b %d, %I:%M %p"):
+            try:
+                parsed = datetime.strptime(text, fmt)
+                if fmt == "%b %d, %I:%M %p":
+                    parsed = parsed.replace(year=datetime.now().year)
+                break
+            except ValueError:
+                continue
+
+    if parsed is None:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _normalize_source_date(value: str | datetime | None) -> str:
+    """Store source dates in YYYY-MM-DD whenever possible."""
+    parsed = _parse_source_date(value)
+    if parsed:
+        return parsed.strftime("%Y-%m-%d")
+    return str(value or "").strip()
+
+
+def _entry_date_key(entry: dict) -> datetime:
+    parsed = _parse_source_date(entry.get("source_date"))
+    return parsed or datetime.min
+
+
+def _normalize_text(value: str | None) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", (value or "").lower()))
+
+
+def _person_tokens(value: str | None) -> list[str]:
+    text = (value or "").strip().lower()
+    if not text:
+        return []
+
+    tokens = []
+    for email in _EMAIL_RE.findall(text):
+        tokens.extend(re.findall(r"[a-z0-9]+", email.split("@", 1)[0]))
+
+    text = _EMAIL_RE.sub(" ", text)
+    text = re.sub(r"[<>]", " ", text)
+    tokens.extend(re.findall(r"[a-z0-9]+", text))
+    return [token for token in tokens if token]
+
+
+def _person_matches(query: str, candidate: str) -> bool:
+    q_tokens = _person_tokens(query)
+    c_tokens = _person_tokens(candidate)
+    if not q_tokens or not c_tokens:
+        return False
+    if q_tokens == c_tokens:
+        return True
+
+    q_set = set(q_tokens)
+    c_set = set(c_tokens)
+
+    if len(q_tokens) >= 2 and len(c_tokens) >= 2:
+        if q_tokens[0] == c_tokens[0] and q_tokens[-1] == c_tokens[-1]:
+            return True
+        if q_set.issubset(c_set) or c_set.issubset(q_set):
+            return True
+
+    if len(q_tokens) == 1:
+        return q_tokens[0] in c_set
+    if len(c_tokens) == 1:
+        return c_tokens[0] in q_set
+    return False
+
+
+def _project_matches(query: str, candidate: str) -> bool:
+    q = _normalize_text(query)
+    c = _normalize_text(candidate)
+    if not q or not c:
+        return False
+    if q == c:
+        return True
+    if min(len(q), len(c)) < 5:
+        return False
+    return q in c or c in q
+
+
+def _load_all_entries() -> list[dict]:
+    cache_key = ("all_entries",)
+    with _kg_cache_lock:
+        cached = _kg_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    db = get_db()
+    entries = [_doc_to_dict(doc) for doc in db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION).stream()]
+    with _kg_cache_lock:
+        _kg_cache[cache_key] = entries
+    return entries
 
 # ── Extraction prompt ────────────────────────────────────────
 # Literal braces in the JSON example are doubled ({{ }}) so
@@ -188,7 +314,7 @@ def _store_entries(entries: list[dict], source_type: str, source_id: str,
             "source_type": source_type,
             "source_id": source_id,
             "source_title": source_title,
-            "source_date": source_date,
+            "source_date": _normalize_source_date(source_date),
             "extracted_at": now_iso,
         }
         try:
@@ -353,23 +479,28 @@ def extract_from_granola_notes(granola_context: str, source_date: str | None = N
 
 def query_by_person(name: str, since: str | None = None,
                     limit: int = 50) -> list[dict]:
-    """All knowledge nodes mentioning a person (array-contains on related_people)."""
-    cache_key = ("person", name, since, limit)
+    """All knowledge nodes mentioning a person, with fuzzy name/email matching."""
+    cache_key = ("person", _normalize_text(name), since, limit)
     with _kg_cache_lock:
         cached = _kg_cache.get(cache_key)
     if cached is not None:
         return cached
 
-    db = get_db()
-    query = (
-        db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
-        .where(filter=FieldFilter("related_people", "array_contains", name))
-        .order_by("source_date", direction="DESCENDING")
-        .limit(limit)
-    )
-    if since:
-        query = query.where(filter=FieldFilter("source_date", ">=", since))
-    results = [_doc_to_dict(doc) for doc in query.stream()]
+    since_dt = _parse_source_date(since) if since else None
+    results = []
+    for entry in sorted(_load_all_entries(), key=_entry_date_key, reverse=True):
+        if since_dt:
+            entry_dt = _parse_source_date(entry.get("source_date"))
+            if not entry_dt or entry_dt < since_dt:
+                continue
+
+        people = entry.get("related_people", [])
+        owner = entry.get("owner") or ""
+        if any(_person_matches(name, person) for person in people) or _person_matches(name, owner):
+            results.append(entry)
+            if len(results) >= limit:
+                break
+
     with _kg_cache_lock:
         _kg_cache[cache_key] = results
     return results
@@ -377,23 +508,26 @@ def query_by_person(name: str, since: str | None = None,
 
 def query_by_project(name: str, since: str | None = None,
                      limit: int = 50) -> list[dict]:
-    """All knowledge nodes related to a project/client."""
-    cache_key = ("project", name, since, limit)
+    """All knowledge nodes related to a project/client, case-insensitive."""
+    cache_key = ("project", _normalize_text(name), since, limit)
     with _kg_cache_lock:
         cached = _kg_cache.get(cache_key)
     if cached is not None:
         return cached
 
-    db = get_db()
-    query = (
-        db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
-        .where(filter=FieldFilter("related_projects", "array_contains", name))
-        .order_by("source_date", direction="DESCENDING")
-        .limit(limit)
-    )
-    if since:
-        query = query.where(filter=FieldFilter("source_date", ">=", since))
-    results = [_doc_to_dict(doc) for doc in query.stream()]
+    since_dt = _parse_source_date(since) if since else None
+    results = []
+    for entry in sorted(_load_all_entries(), key=_entry_date_key, reverse=True):
+        if since_dt:
+            entry_dt = _parse_source_date(entry.get("source_date"))
+            if not entry_dt or entry_dt < since_dt:
+                continue
+
+        if any(_project_matches(name, project) for project in entry.get("related_projects", [])):
+            results.append(entry)
+            if len(results) >= limit:
+                break
+
     with _kg_cache_lock:
         _kg_cache[cache_key] = results
     return results
@@ -432,20 +566,34 @@ def query_open_commitments(since: str | None = None,
     if cached is not None:
         return cached
 
-    db = get_db()
-    query = (
-        db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
-        .where(filter=FieldFilter("entity_type", "in", ["commitment", "action_item"]))
-        .where(filter=FieldFilter("status", "==", "open"))
-        .order_by("source_date", direction="DESCENDING")
-        .limit(limit)
-    )
-    if since:
-        query = query.where(filter=FieldFilter("source_date", ">=", since))
-    results = [_doc_to_dict(doc) for doc in query.stream()]
+    since_dt = _parse_source_date(since) if since else None
+    results = []
+    for entry in sorted(_load_all_entries(), key=_entry_date_key, reverse=True):
+        if entry.get("entity_type") not in ("commitment", "action_item"):
+            continue
+        if entry.get("status") != "open":
+            continue
+
+        if since_dt:
+            entry_dt = _parse_source_date(entry.get("source_date"))
+            if not entry_dt or entry_dt < since_dt:
+                continue
+
+        results.append(entry)
+        if len(results) >= limit:
+            break
+
     with _kg_cache_lock:
         _kg_cache[cache_key] = results
     return results
+
+
+def query_all_entries(limit: int | None = None) -> list[dict]:
+    """Return all KG entries sorted by source date descending."""
+    entries = sorted(_load_all_entries(), key=_entry_date_key, reverse=True)
+    if limit is None:
+        return entries
+    return entries[:limit]
 
 
 def search_knowledge(keywords: list[str], limit: int = 50) -> list[dict]:
@@ -486,34 +634,36 @@ def search_knowledge(keywords: list[str], limit: int = 50) -> list[dict]:
 def query_recent(days: int = 7, limit: int = 50) -> list[dict]:
     """All entries from the last N days."""
     from datetime import timedelta
-    since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-    db = get_db()
-    query = (
-        db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
-        .where(filter=FieldFilter("source_date", ">=", since))
-        .order_by("source_date", direction="DESCENDING")
-        .limit(limit)
-    )
-    return [_doc_to_dict(doc) for doc in query.stream()]
+    since_dt = (datetime.now() - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
+    results = []
+    for entry in sorted(_load_all_entries(), key=_entry_date_key, reverse=True):
+        entry_dt = _parse_source_date(entry.get("source_date"))
+        if not entry_dt or entry_dt < since_dt:
+            continue
+        results.append(entry)
+        if len(results) >= limit:
+            break
+    return results
 
 
 def query_open_by_age(min_days: int = 3, limit: int = 50) -> list[dict]:
     """Open commitments/action items older than min_days."""
     from datetime import timedelta
-    cutoff = (datetime.now() - timedelta(days=min_days)).strftime("%Y-%m-%d")
-    db = get_db()
-    query = (
-        db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
-        .where(filter=FieldFilter("entity_type", "in", ["commitment", "action_item"]))
-        .where(filter=FieldFilter("status", "==", "open"))
-        .order_by("source_date", direction="ASCENDING")
-        .limit(limit)
-    )
+    cutoff_dt = (datetime.now() - timedelta(days=min_days)).replace(hour=0, minute=0, second=0, microsecond=0)
     results = []
-    for doc in query.stream():
-        d = _doc_to_dict(doc)
-        if d.get("source_date", "9999") <= cutoff:
-            results.append(d)
+    for entry in sorted(_load_all_entries(), key=_entry_date_key):
+        if entry.get("entity_type") not in ("commitment", "action_item"):
+            continue
+        if entry.get("status") != "open":
+            continue
+
+        entry_dt = _parse_source_date(entry.get("source_date"))
+        if not entry_dt or entry_dt > cutoff_dt:
+            continue
+
+        results.append(entry)
+        if len(results) >= limit:
+            break
     return results
 
 
@@ -666,6 +816,7 @@ def embed_backfill() -> dict:
 def _doc_to_dict(doc) -> dict:
     d = doc.to_dict()
     d["id"] = doc.id
+    d["source_date"] = _normalize_source_date(d.get("source_date"))
     return d
 
 
