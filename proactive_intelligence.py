@@ -30,10 +30,10 @@ from conversation_store import (
 )
 from knowledge_graph import (
     format_knowledge_for_context,
+    query_all_entries,
     query_by_person,
     query_by_project,
     query_open_by_age,
-    query_open_commitments,
     query_recent,
     update_entity_status,
 )
@@ -45,6 +45,42 @@ def _nudge_key(nudge_type: str, identifier: str) -> str:
     """Deterministic key for dedup. Hashed so Firestore doc IDs stay clean."""
     raw = f"{nudge_type}:{identifier}".lower().strip()
     return hashlib.md5(raw.encode()).hexdigest()[:16]
+
+
+_DRIFT_ACTIVITY_SOURCES = {"meeting", "meeting_notes", "email"}
+
+
+def _is_drift_activity_entry(entry: dict) -> bool:
+    return entry.get("source_type") in _DRIFT_ACTIVITY_SOURCES
+
+
+def _has_recent_activity(entry: dict, recent_entries: list[dict]) -> bool:
+    """Return True if the item showed up in recent meeting/email activity."""
+    target_name = (entry.get("name") or "").strip().lower()
+    target_projects = {
+        project.strip().lower()
+        for project in entry.get("related_projects", [])
+        if project
+    }
+    if not target_name and not target_projects:
+        return False
+
+    for other in recent_entries:
+        if other.get("id") == entry.get("id"):
+            continue
+
+        if target_name and (other.get("name") or "").strip().lower() == target_name:
+            return True
+
+        other_projects = {
+            project.strip().lower()
+            for project in other.get("related_projects", [])
+            if project
+        }
+        if target_projects and target_projects & other_projects:
+            return True
+
+    return False
 
 
 # ── Engine 1: Pre-Meeting Prep ───────────────────────────────
@@ -80,13 +116,11 @@ def _build_meeting_prep(meeting: dict) -> str | None:
     all_entries = []
     seen_ids = set()
 
-    first_names = [name.split()[0] if name else name for name in attendee_names]
-
-    with ThreadPoolExecutor(max_workers=max(len(first_names) + 1, 4)) as pool:
+    with ThreadPoolExecutor(max_workers=max(len(attendee_names), 4)) as pool:
         person_futures = {
-            pool.submit(query_by_person, fn, 8): fn for fn in first_names
+            pool.submit(query_by_person, attendee, None, 8): attendee
+            for attendee in attendee_names
         }
-        commitment_future = pool.submit(query_open_commitments, 15)
 
         for future in as_completed(person_futures):
             try:
@@ -97,19 +131,6 @@ def _build_meeting_prep(meeting: dict) -> str | None:
             except Exception as exc:
                 print(f"    KG person query failed: {exc}")
 
-        attendee_first_lower = {n.lower() for n in first_names if n}
-        try:
-            for c in commitment_future.result():
-                if c["id"] in seen_ids:
-                    continue
-                people = {p.lower() for p in c.get("related_people", [])}
-                owner = (c.get("owner") or "").lower()
-                if people & attendee_first_lower or owner in attendee_first_lower:
-                    seen_ids.add(c["id"])
-                    all_entries.append(c)
-        except Exception as exc:
-            print(f"    KG commitments query failed: {exc}")
-
     projects = set()
     for e in all_entries:
         projects.update(e.get("related_projects", []))
@@ -118,7 +139,8 @@ def _build_meeting_prep(meeting: dict) -> str | None:
     if project_list:
         with ThreadPoolExecutor(max_workers=len(project_list)) as pool:
             proj_futures = {
-                pool.submit(query_by_project, proj, 5): proj for proj in project_list
+                pool.submit(query_by_project, proj, None, 5): proj
+                for proj in project_list
             }
             for future in as_completed(proj_futures):
                 try:
@@ -182,8 +204,7 @@ def run_meeting_prep() -> dict:
                 sent_count += 1
                 print(f"    Prep sent for: {meeting['title']}")
             else:
-                mark_prep_sent(event_id, meeting["title"])
-                print(f"    No KG context for: {meeting['title']}, skipping")
+                print(f"    No KG context for: {meeting['title']}, will retry on next run")
         except Exception as exc:
             print(f"    Prep failed for '{meeting['title']}': {exc}")
             traceback.print_exc()
@@ -313,7 +334,7 @@ Otherwise, return just the insights as bullet points (- ), no headers, no preamb
 
 def _run_pattern_engine() -> list[dict]:
     """Analyze recent KG entries for recurring patterns."""
-    entries = query_recent(days=30, limit=100)
+    entries = query_recent(days=30, limit=300)
     if len(entries) < 5:
         return []
 
@@ -356,7 +377,7 @@ def _run_pattern_engine() -> list[dict]:
     if not pattern_lines:
         return []
 
-    nudge_id = _nudge_key("pattern", datetime.now().strftime("%Y-%m-%d"))
+    nudge_id = _nudge_key("pattern", "\n".join(pattern_lines))
     if has_nudge_been_sent(nudge_id):
         return []
 
@@ -392,25 +413,41 @@ def _run_drift_engine() -> list[dict]:
     cutoff = (datetime.now() - timedelta(days=threshold)).strftime("%Y-%m-%d")
 
     stale_commitments = query_open_by_age(min_days=threshold, limit=30)
+    recent_activity = [
+        entry
+        for entry in query_recent(days=threshold, limit=500)
+        if _is_drift_activity_entry(entry)
+    ]
 
-    project_last_seen: dict[str, str] = {}
-    recent = query_recent(days=60, limit=200)
-    for e in recent:
+    project_last_seen: dict[str, tuple[str, str]] = {}
+    for e in query_all_entries(limit=5000):
+        if not _is_drift_activity_entry(e):
+            continue
+
+        source_date = e.get("source_date", "")
+        if not source_date:
+            continue
+
         for proj in e.get("related_projects", []):
-            existing = project_last_seen.get(proj, "")
-            entry_date = e.get("source_date", "")
-            if entry_date > existing:
-                project_last_seen[proj] = entry_date
+            normalized = proj.strip().lower()
+            if not normalized:
+                continue
+            _, existing_date = project_last_seen.get(normalized, (proj, ""))
+            if source_date > existing_date:
+                project_last_seen[normalized] = (proj, source_date)
 
     stale_projects = [
         (proj, last_date)
-        for proj, last_date in project_last_seen.items()
+        for proj, last_date in project_last_seen.values()
         if last_date <= cutoff
     ]
 
     nudges = []
 
     for entry in stale_commitments[:5]:
+        if _has_recent_activity(entry, recent_activity):
+            continue
+
         nudge_id = _nudge_key("drift_commitment", entry.get("id", ""))
         if has_nudge_been_sent(nudge_id):
             continue
@@ -427,7 +464,8 @@ def _run_drift_engine() -> list[dict]:
             "title": entry.get("name", "Unnamed item"),
             "body": (
                 f"this {entry.get('entity_type', 'item')} has been open for {days_ago} days "
-                f"with no updates (from: {entry.get('source_title', '?')}). still active?"
+                f"and hasn't shown up in recent meeting/email activity "
+                f"(from: {entry.get('source_title', '?')}). still active?"
             ),
             "related_entity_ids": [entry.get("id", "")],
             "delivery": "briefing",
@@ -449,7 +487,7 @@ def _run_drift_engine() -> list[dict]:
             "priority": "low",
             "title": f"{proj} — gone quiet",
             "body": (
-                f"the '{proj}' project hasn't been mentioned in any meetings or emails "
+                f"the '{proj}' project hasn't shown up in meetings or emails "
                 f"for {days_ago} days. is this still active?"
             ),
             "related_entity_ids": [],
