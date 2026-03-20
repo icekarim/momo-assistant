@@ -335,7 +335,13 @@ def _process_debrief_tasks(debrief_text, meeting_title="", scope_id="latest"):
     store_pending_tasks(pending, meeting_title=meeting_title, scope_id=scope_id)
 
     cleaned += "\n\n📋 *Suggested tasks:*\n" + "\n".join(suggestion_lines)
-    cleaned += "\n\n_Reply *yes* to approve all, or *approve 2* to approve one_"
+    if len(pending) == 1:
+        cleaned += "\n\n_Reply *yes* to create this task in Google Tasks, or *no* to dismiss it_"
+    else:
+        cleaned += (
+            f"\n\n_Reply *yes* to create all {len(pending)} tasks in Google Tasks, "
+            "*approve 2* to create only task #2, or *no* to dismiss them_"
+        )
 
     return cleaned
 
