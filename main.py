@@ -289,8 +289,17 @@ def _run_backfill():
             xml = list_granola_meetings("last_30_days")
             if xml:
                 meetings = []
-                for match in _re.finditer(r'<meeting\s+id="([^"]+)"\s+title="([^"]+)"', xml):
-                    meetings.append({"id": match.group(1), "title": match.group(2)})
+                for match in _re.finditer(r'<meeting\s+([^>]+)>', xml):
+                    attrs = dict(_re.findall(r'(\w+)="([^"]*)"', match.group(1)))
+                    meeting_id = attrs.get("id")
+                    title = attrs.get("title")
+                    if not meeting_id or not title:
+                        continue
+                    meetings.append({
+                        "id": meeting_id,
+                        "title": title,
+                        "source_date": (attrs.get("date", "") or attrs.get("start_date", ""))[:10],
+                    })
 
                 print(f"Backfill: found {len(meetings)} meetings to process")
 
@@ -314,7 +323,7 @@ def _run_backfill():
                                 source_type="meeting",
                                 source_id=m["id"],
                                 source_title=m["title"],
-                                source_date="",
+                                source_date=m.get("source_date", ""),
                                 content=notes,
                                 attendees=[],
                             )
@@ -338,7 +347,7 @@ def _run_backfill():
                     source_type="email",
                     source_id=email["id"],
                     source_title=email.get("subject", ""),
-                    source_date=email.get("date_human", ""),
+                    source_date=email.get("date_ymd") or email.get("date", "")[:10] or email.get("date_human", ""),
                     content=email.get("body", ""),
                     attendees=[email.get("from", "")],
                 )
