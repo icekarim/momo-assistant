@@ -18,6 +18,13 @@ def _safe_doc_id(user_id):
     return user_id.replace("/", "_")
 
 
+def _pending_task_doc_id(scope_id: str = "latest") -> str:
+    """Map a pending-task scope to a Firestore-safe document ID."""
+    if not scope_id or scope_id == "latest":
+        return "latest"
+    return _safe_doc_id(scope_id)
+
+
 def get_db():
     global _db
     if _db is None:
@@ -171,26 +178,38 @@ def mark_nudge_sent(nudge_key, nudge_type, title):
     )
 
 
-def store_pending_tasks(tasks, meeting_title=""):
-    """Store proposed tasks from a debrief so the user can confirm later.
-    Each task is a dict with 'title' and optional 'due', 'notes' keys.
-    Only one pending proposal set is kept at a time (latest wins)."""
+def store_pending_task_actions(actions, scope_id="latest", meeting_title="", approval_message=""):
+    """Store pending task mutations awaiting explicit approval.
+
+    Each action is a dict with an ``action`` key (create/update/complete/delete)
+    plus the fields needed to execute that mutation. Only one pending action set
+    is kept per scope; newer requests replace older pending ones.
+    """
     db = get_db()
-    db.collection(config.FIRESTORE_PENDING_TASKS_COLLECTION).document("latest").set(
+    db.collection(config.FIRESTORE_PENDING_TASKS_COLLECTION).document(
+        _pending_task_doc_id(scope_id)
+    ).set(
         {
-            "tasks": tasks,
+            "actions": actions,
             "meeting_title": meeting_title,
+            "approval_message": approval_message,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
     )
 
 
-def get_pending_tasks():
-    """Retrieve pending task proposals. Returns (tasks_list, meeting_title) or ([], '')."""
+def get_pending_task_actions(scope_id="latest"):
+    """Retrieve pending task actions for a scope.
+
+    Returns a dict with ``actions``, ``meeting_title``, and ``approval_message``,
+    or ``None`` if nothing is pending or the request expired.
+    """
     db = get_db()
-    doc = db.collection(config.FIRESTORE_PENDING_TASKS_COLLECTION).document("latest").get()
+    doc = db.collection(config.FIRESTORE_PENDING_TASKS_COLLECTION).document(
+        _pending_task_doc_id(scope_id)
+    ).get()
     if not doc.exists:
-        return [], ""
+        return None
     data = doc.to_dict()
     created = data.get("created_at", "")
     if created:
@@ -198,13 +217,74 @@ def get_pending_tasks():
             created_dt = datetime.fromisoformat(created)
             age_hours = (datetime.now(timezone.utc) - created_dt).total_seconds() / 3600
             if age_hours > 24:
-                return [], ""
+                return None
         except (ValueError, TypeError):
             pass
-    return data.get("tasks", []), data.get("meeting_title", "")
+
+    actions = data.get("actions")
+    if actions is None:
+        # Backward compatibility for older pending create-only proposals.
+        actions = data.get("tasks", [])
+
+    normalized_actions = []
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        if "action" not in action:
+            normalized_actions.append({"action": "create", **action})
+        else:
+            normalized_actions.append(action)
+
+    if not normalized_actions:
+        return None
+
+    return {
+        "actions": normalized_actions,
+        "meeting_title": data.get("meeting_title", ""),
+        "approval_message": data.get("approval_message", ""),
+    }
 
 
-def clear_pending_tasks():
-    """Remove pending task proposals after they've been acted on."""
+def clear_pending_task_actions(scope_id="latest"):
+    """Remove pending task actions after they've been approved or canceled."""
     db = get_db()
-    db.collection(config.FIRESTORE_PENDING_TASKS_COLLECTION).document("latest").delete()
+    db.collection(config.FIRESTORE_PENDING_TASKS_COLLECTION).document(
+        _pending_task_doc_id(scope_id)
+    ).delete()
+
+
+def store_pending_tasks(tasks, meeting_title="", scope_id="latest"):
+    """Store proposed create-task suggestions for user confirmation later."""
+    actions = []
+    for task in tasks:
+        action = {"action": "create", "title": task["title"]}
+        if task.get("due"):
+            action["due"] = task["due"]
+        if task.get("notes"):
+            action["notes"] = task["notes"]
+        actions.append(action)
+    store_pending_task_actions(actions, scope_id=scope_id, meeting_title=meeting_title)
+
+
+def get_pending_tasks(scope_id="latest"):
+    """Backward-compatible wrapper for create-task proposals."""
+    pending = get_pending_task_actions(scope_id=scope_id)
+    if not pending:
+        return [], ""
+
+    tasks = []
+    for action in pending["actions"]:
+        if action.get("action", "create") != "create":
+            continue
+        task = {"title": action["title"]}
+        if action.get("due"):
+            task["due"] = action["due"]
+        if action.get("notes"):
+            task["notes"] = action["notes"]
+        tasks.append(task)
+    return tasks, pending.get("meeting_title", "")
+
+
+def clear_pending_tasks(scope_id="latest"):
+    """Backward-compatible wrapper for pending create-task proposals."""
+    clear_pending_task_actions(scope_id=scope_id)
