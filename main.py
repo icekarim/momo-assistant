@@ -426,19 +426,25 @@ def _check_pending_task_intent(lower: str) -> str | None:
     """Detect whether a message confirms or declines pending tasks.
 
     Returns 'confirm', 'decline', or None (ambiguous / unrelated).
-    Uses prefix matching so qualifiers like 'all due tmrw' don't break it.
+    Uses prefix matching so qualifiers like 'all due tmrw' don't break it,
+    but requires a word boundary after the match to avoid false positives
+    (e.g. "y" matching "you can mark..." or "n" matching "noted").
     """
     if lower in _CONFIRM_WORDS:
         return "confirm"
     if lower in _DECLINE_WORDS:
         return "decline"
 
+    _WORD_BOUNDARY = {' ', ',', '.', '!', '?', ';', ':'}
+
     for phrase in sorted(_DECLINE_WORDS, key=len, reverse=True):
-        if lower.startswith(phrase):
-            return "decline"
+        if len(phrase) > 1 and lower.startswith(phrase):
+            if len(lower) == len(phrase) or lower[len(phrase)] in _WORD_BOUNDARY:
+                return "decline"
     for phrase in sorted(_CONFIRM_WORDS, key=len, reverse=True):
-        if lower.startswith(phrase):
-            return "confirm"
+        if len(phrase) > 1 and lower.startswith(phrase):
+            if len(lower) == len(phrase) or lower[len(phrase)] in _WORD_BOUNDARY:
+                return "confirm"
 
     confirm_patterns = [
         r'^(?:yes|yeah|yep|sure|ok|okay)[,.]?\s',
