@@ -196,6 +196,30 @@ async def trigger_meeting_prep():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── Granola Token Refresh ────────────────────────────────────
+
+@app.post("/granola-token-refresh")
+async def granola_token_refresh():
+    """Proactively refresh the Granola OAuth token.
+
+    Designed to be called by Cloud Scheduler every 4 hours to keep the
+    refresh_token alive. Granola access tokens last 6h; refreshing before
+    expiry prevents the refresh_token from going stale.
+    """
+    if not config.GRANOLA_ENABLED:
+        return {"status": "skipped", "reason": "granola disabled"}
+
+    try:
+        from granola_service import _load_token, _cached_token
+        token = _load_token()
+        if token:
+            return {"status": "ok", "message": "Granola token is valid"}
+        else:
+            return {"status": "error", "message": "Granola token refresh failed — re-run granola_auth_setup.py"}
+    except Exception as e:
+        return {"status": "error", "message": f"Granola token refresh failed: {str(e)}"}
+
+
 # ── Knowledge Graph Backfill ─────────────────────────────────
 
 @app.post("/knowledge-backfill")
