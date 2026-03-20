@@ -39,7 +39,7 @@ app = FastAPI(title="Momo")
 
 @app.on_event("startup")
 async def startup_warmup():
-    """Pre-initialize Google credentials and cache discovery docs on startup."""
+    """Pre-initialize Google credentials, discovery docs, and KG embeddings on startup."""
     from google_auth import warmup
     warmup()
     try:
@@ -52,6 +52,13 @@ async def startup_warmup():
         print("Discovery docs cached on startup")
     except Exception as e:
         print(f"Discovery cache warmup failed (will retry on first request): {e}")
+
+    # Pre-load KG embeddings so first semantic search is fast
+    if config.KNOWLEDGE_GRAPH_ENABLED:
+        def _warm_kg():
+            from knowledge_graph import warm_embedding_cache
+            warm_embedding_cache()
+        threading.Thread(target=_warm_kg, daemon=True).start()
 
 
 # ── Helpers for Workspace Add-on format ──────────────────────
