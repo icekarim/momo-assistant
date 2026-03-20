@@ -106,6 +106,7 @@ def _parse_message(msg):
         "to": headers.get("to", ""),
         "subject": headers.get("subject", "(no subject)"),
         "date": date.isoformat(),
+        "date_ymd": date.strftime("%Y-%m-%d"),
         "date_human": date.strftime("%b %d, %I:%M %p"),
         "body": body,
         "snippet": msg.get("snippet", ""),
