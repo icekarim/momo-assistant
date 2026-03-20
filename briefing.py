@@ -216,7 +216,7 @@ def run_proactive_email_alerts():
             source_type="email",
             source_id=email["id"],
             source_title=email.get("subject", ""),
-            source_date=email.get("date_human", ""),
+            source_date=email.get("date_ymd") or email.get("date", "")[:10] or email.get("date_human", ""),
             content=email.get("body", ""),
             attendees=[email.get("from", "")],
         )
