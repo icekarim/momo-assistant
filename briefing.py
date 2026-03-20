@@ -123,7 +123,12 @@ def run_morning_briefing():
         granola_context=granola_ctx, jira_context=jira_ctx,
         nudges_context=nudges_ctx,
     )
-    summary = _process_debrief_tasks(summary, meeting_title="Morning Briefing")
+    pending_scope = f"space:{config.CHAT_SPACE_ID}" if config.CHAT_SPACE_ID else "latest"
+    summary = _process_debrief_tasks(
+        summary,
+        meeting_title="Morning Briefing",
+        scope_id=pending_scope,
+    )
 
     if config.CHAT_SPACE_ID:
         print("  Sending to Google Chat...")
@@ -298,7 +303,7 @@ def _gemini_triage_emails(emails):
     return flagged
 
 
-def _process_debrief_tasks(debrief_text, meeting_title=""):
+def _process_debrief_tasks(debrief_text, meeting_title="", scope_id="latest"):
     """Parse [CREATE_TASK] tags from a debrief, store them as pending
     proposals for user confirmation, and return cleaned text with a
     nicely formatted suggestion section replacing the raw tags."""
@@ -314,7 +319,7 @@ def _process_debrief_tasks(debrief_text, meeting_title=""):
 
     pending = []
     suggestion_lines = []
-    for match in matches:
+    for idx, match in enumerate(matches, start=1):
         title = match.group(1)
         due = match.group(2) or None
         notes = match.group(3) or ""
@@ -325,12 +330,12 @@ def _process_debrief_tasks(debrief_text, meeting_title=""):
             task["notes"] = notes
         pending.append(task)
         due_str = f" (due {due})" if due else ""
-        suggestion_lines.append(f"  • {title}{due_str}")
+        suggestion_lines.append(f"  {idx}. {title}{due_str}")
 
-    store_pending_tasks(pending, meeting_title=meeting_title)
+    store_pending_tasks(pending, meeting_title=meeting_title, scope_id=scope_id)
 
     cleaned += "\n\n📋 *Suggested tasks:*\n" + "\n".join(suggestion_lines)
-    cleaned += "\n\n_Reply *yes* to create these tasks_"
+    cleaned += "\n\n_Reply *yes* to approve all, or *approve 2* to approve one_"
 
     return cleaned
 
@@ -453,7 +458,12 @@ def run_post_meeting_debrief():
             end_time = meeting.get("end_time", "")
             event_id = meeting.get("id", "")
             debrief = generate_post_meeting_debrief(title, attendees, granola_notes, end_time)
-            debrief = _process_debrief_tasks(debrief, meeting_title=title)
+            pending_scope = f"space:{config.CHAT_SPACE_ID}" if config.CHAT_SPACE_ID else "latest"
+            debrief = _process_debrief_tasks(
+                debrief,
+                meeting_title=title,
+                scope_id=pending_scope,
+            )
             formatted = format_for_google_chat(debrief)
             send_chat_message(config.CHAT_SPACE_ID, formatted)
             mark_debrief_sent(event_id, title)

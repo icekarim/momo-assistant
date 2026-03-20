@@ -96,7 +96,7 @@ _CORE_TOOLS = [
         ),
         genai.protos.FunctionDeclaration(
             name="create_task",
-            description="Create a new task in Google Tasks. Checks for duplicates automatically.",
+            description="Queue a new task request for approval. This does not execute until the user explicitly approves it.",
             parameters=_schema({
                 "type": "object",
                 "properties": {
@@ -109,7 +109,7 @@ _CORE_TOOLS = [
         ),
         genai.protos.FunctionDeclaration(
             name="update_task",
-            description="Update an existing task (change title, due date, or notes). Finds the task by fuzzy title match.",
+            description="Queue an update request for an existing task. This does not execute until the user explicitly approves it.",
             parameters=_schema({
                 "type": "object",
                 "properties": {
@@ -123,7 +123,7 @@ _CORE_TOOLS = [
         ),
         genai.protos.FunctionDeclaration(
             name="complete_task",
-            description="Mark a task as completed. Finds the task by fuzzy title match.",
+            description="Queue a completion request for a task. This does not execute until the user explicitly approves it.",
             parameters=_schema({
                 "type": "object",
                 "properties": {
@@ -134,7 +134,7 @@ _CORE_TOOLS = [
         ),
         genai.protos.FunctionDeclaration(
             name="delete_task",
-            description="Delete a task. Finds the task by fuzzy title match.",
+            description="Queue a delete request for a task. This does not execute until the user explicitly approves it.",
             parameters=_schema({
                 "type": "object",
                 "properties": {
@@ -244,14 +244,14 @@ def _get_all_tools() -> list:
 # ── Tool executor ────────────────────────────────────────────
 
 
-def execute_tool(name: str, args: dict) -> str:
+def execute_tool(name: str, args: dict, pending_task_actions: list[dict] | None = None) -> str:
     """Dispatch a tool call to the appropriate service function.
 
     Returns a string result for the agent to consume, or an error message.
     """
     t0 = time.time()
     try:
-        result = _dispatch(name, args)
+        result = _dispatch(name, args, pending_task_actions=pending_task_actions)
         elapsed = time.time() - t0
         print(f"[agent] tool '{name}': {elapsed:.2f}s ({len(result)} chars)")
         return result
@@ -261,7 +261,7 @@ def execute_tool(name: str, args: dict) -> str:
         return f"Error calling {name}: {str(exc)}"
 
 
-def _dispatch(name: str, args: dict) -> str:
+def _dispatch(name: str, args: dict, pending_task_actions: list[dict] | None = None) -> str:
     """Route a tool call to the correct service function."""
 
     if name == "get_todays_calendar":
@@ -277,33 +277,38 @@ def _dispatch(name: str, args: dict) -> str:
         return format_tasks_for_context(fetch_open_tasks())
 
     if name == "create_task":
-        from tasks_service import create_task
-        result = create_task(
-            title=args["title"],
-            notes=args.get("notes", ""),
-            due_date=args.get("due"),
-        )
-        return json.dumps(result)
+        action = {"action": "create", "title": args["title"]}
+        if args.get("due"):
+            action["due"] = args["due"]
+        if args.get("notes"):
+            action["notes"] = args["notes"]
+        if pending_task_actions is not None:
+            pending_task_actions.append(action)
+        return json.dumps({"status": "pending_approval", "action": action})
 
     if name == "update_task":
-        from tasks_service import update_task
-        result = update_task(
-            task_title=args["find"],
-            new_title=args.get("title"),
-            new_notes=args.get("notes"),
-            new_due=args.get("due"),
-        )
-        return json.dumps(result)
+        action = {"action": "update", "find": args["find"]}
+        if args.get("title"):
+            action["title"] = args["title"]
+        if args.get("notes") is not None:
+            action["notes"] = args["notes"]
+        if args.get("due"):
+            action["due"] = args["due"]
+        if pending_task_actions is not None:
+            pending_task_actions.append(action)
+        return json.dumps({"status": "pending_approval", "action": action})
 
     if name == "complete_task":
-        from tasks_service import complete_task
-        result = complete_task(task_title=args["find"])
-        return json.dumps(result)
+        action = {"action": "complete", "find": args["find"]}
+        if pending_task_actions is not None:
+            pending_task_actions.append(action)
+        return json.dumps({"status": "pending_approval", "action": action})
 
     if name == "delete_task":
-        from tasks_service import delete_task
-        result = delete_task(task_title=args["find"])
-        return json.dumps(result)
+        action = {"action": "delete", "find": args["find"]}
+        if pending_task_actions is not None:
+            pending_task_actions.append(action)
+        return json.dumps({"status": "pending_approval", "action": action})
 
     if name == "get_recent_emails":
         from gmail_service import fetch_unread_client_emails, format_emails_for_context
@@ -370,7 +375,9 @@ You MUST call tools to get real data before answering questions about emails, ca
 NEVER guess, fabricate, or hallucinate data. If you don't have data from a tool call, say so.
 Be efficient — call only the tools you need. Don't call everything "just in case".
 If one tool doesn't return what you need, try a different one. For example, if search_knowledge_graph doesn't find it, try search_emails.
-For task changes (create, update, complete, delete), use the task tools directly. The user will see the result.
+For task changes (create, update, complete, delete), use the task tools to prepare the request. Those tools do NOT execute immediately — they queue a pending approval.
+After queueing a task change, explicitly say it's waiting for approval and tell the user to reply "yes" to approve or "no" to cancel.
+Never say a task was already created, updated, completed, or deleted before approval happens.
 When a tool returns an error, tell the user naturally — don't retry endlessly.
 
 The search_knowledge_graph tool searches across ALL of Momo's memory — meetings, emails, calendar events, tasks, chat history, and Granola notes. Use it for any "what happened", "what did we discuss", "who said what", "what was decided" type questions.
@@ -457,14 +464,14 @@ def _build_history(conversation_history: list[dict]) -> list[dict]:
 
 
 def run_agent_loop(user_message: str, conversation_history: list[dict],
-                   max_iterations: int = 6) -> str:
+                   max_iterations: int = 6) -> tuple[str, list[dict]]:
     """Run the agentic tool-use loop.
 
     Sends the user message to Gemini with tool declarations.  If Gemini
     responds with function calls, executes them and sends results back.
     Repeats until Gemini produces a text response or max_iterations is hit.
 
-    Returns the final text response.
+    Returns the final text response and any queued task actions.
     """
     tools = _get_all_tools()
     model = genai.GenerativeModel(
@@ -479,12 +486,14 @@ def run_agent_loop(user_message: str, conversation_history: list[dict],
     t0 = time.time()
     print(f"[agent] starting loop (max_iterations={max_iterations})")
 
+    pending_task_actions: list[dict] = []
+
     try:
         response = chat.send_message(user_message)
     except Exception as exc:
         print(f"[agent] initial send failed: {exc}")
         traceback.print_exc()
-        return "sorry, something went wrong talking to gemini — try again in a sec?"
+        return "sorry, something went wrong talking to gemini — try again in a sec?", pending_task_actions
 
     for iteration in range(max_iterations):
         candidate = response.candidates[0] if response.candidates else None
@@ -499,7 +508,7 @@ def run_agent_loop(user_message: str, conversation_history: list[dict],
             if text_parts:
                 final = "\n".join(text_parts)
                 print(f"[agent] done in {iteration + 1} iteration(s), {time.time() - t0:.2f}s total")
-                return final
+                return final, pending_task_actions
             break
 
         print(f"[agent] iteration {iteration + 1}: {len(function_calls)} tool call(s): "
@@ -512,7 +521,7 @@ def run_agent_loop(user_message: str, conversation_history: list[dict],
 
             try:
                 with ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(execute_tool, fc.name, dict(fc.args))
+                    future = pool.submit(execute_tool, fc.name, dict(fc.args), pending_task_actions)
                     result_str = future.result(timeout=timeout)
             except FuturesTimeoutError:
                 result_str = f"Tool '{fc.name}' timed out after {timeout}s"
@@ -537,8 +546,8 @@ def run_agent_loop(user_message: str, conversation_history: list[dict],
         except Exception as exc:
             print(f"[agent] send_message failed on iteration {iteration + 1}: {exc}")
             if text_parts:
-                return "\n".join(text_parts)
-            return "sorry, hit a snag pulling your data — try again?"
+                return "\n".join(text_parts), pending_task_actions
+            return "sorry, hit a snag pulling your data — try again?", pending_task_actions
 
     final_text = ""
     try:
@@ -552,4 +561,4 @@ def run_agent_loop(user_message: str, conversation_history: list[dict],
     elapsed = time.time() - t0
     print(f"[agent] loop ended after {max_iterations} iterations, {elapsed:.2f}s total")
 
-    return final_text or "i pulled a lot of info but couldn't put it together — try asking differently?"
+    return final_text or "i pulled a lot of info but couldn't put it together — try asking differently?", pending_task_actions
