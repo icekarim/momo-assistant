@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 import google.generativeai as genai
 
 import config
-from langsmith_config import traceable, traced_chat_send
+from langsmith_config import traceable, traced_chat_send, set_trace_metadata, _get_run_tree
 
 genai.configure(api_key=config.GEMINI_API_KEY)
 
@@ -465,9 +465,10 @@ def _build_history(conversation_history: list[dict]) -> list[dict]:
     return history
 
 
-@traceable(name="agent-loop")
+@traceable(name="agent-loop", tags=["chat", "user-initiated"])
 def run_agent_loop(user_message: str, conversation_history: list[dict],
-                   max_iterations: int = 6) -> tuple[str, list[dict]]:
+                   max_iterations: int = 6,
+                   thread_id: str | None = None) -> tuple[str, list[dict]]:
     """Run the agentic tool-use loop.
 
     Sends the user message to Gemini with tool declarations.  If Gemini
@@ -476,6 +477,8 @@ def run_agent_loop(user_message: str, conversation_history: list[dict],
 
     Returns the final text response and any queued task actions.
     """
+    if thread_id:
+        set_trace_metadata(thread_id=thread_id)
     tools = _get_all_tools()
     model = genai.GenerativeModel(
         model_name=config.GEMINI_MODEL_FLASH,
@@ -518,13 +521,26 @@ def run_agent_loop(user_message: str, conversation_history: list[dict],
               f"{[fc.function_call.name for fc in function_calls]}")
 
         tool_responses = []
+        # Capture the current run tree so child threads inherit the trace context
+        parent_run_tree = _get_run_tree()
         for part in function_calls:
             fc = part.function_call
             timeout = _TOOL_TIMEOUTS.get(fc.name, 10)
 
+            def _run_tool(name, args, pending, rt=parent_run_tree):
+                """Execute tool with LangSmith context propagated."""
+                if rt is not None:
+                    import contextvars
+                    try:
+                        from langsmith.run_helpers import _PARENT_RUN_TREE
+                        _PARENT_RUN_TREE.set(rt)
+                    except (ImportError, AttributeError):
+                        pass
+                return execute_tool(name, args, pending)
+
             try:
                 with ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(execute_tool, fc.name, dict(fc.args), pending_task_actions)
+                    future = pool.submit(_run_tool, fc.name, dict(fc.args), pending_task_actions)
                     result_str = future.result(timeout=timeout)
             except FuturesTimeoutError:
                 result_str = f"Tool '{fc.name}' timed out after {timeout}s"

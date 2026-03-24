@@ -128,22 +128,31 @@ def _build_meeting_prep(meeting: dict) -> str | None:
 
     all_entries = []
     seen_ids = set()
+    title = meeting.get("title", "")
 
-    with ThreadPoolExecutor(max_workers=max(len(attendee_names), 4)) as pool:
+    # Query KG in parallel: by each attendee AND by meeting title (semantic search)
+    from knowledge_graph import semantic_search as _semantic_search
+    workers = max(len(attendee_names) + 1, 4)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         person_futures = {
-            pool.submit(query_by_person, attendee, None, 8): attendee
+            pool.submit(query_by_person, attendee, None, 8): f"person:{attendee}"
             for attendee in attendee_names
         }
+        # Also search by meeting title to catch topic-based KG entries
+        title_future = pool.submit(_semantic_search, title, 10)
+        person_futures[title_future] = f"title:{title}"
 
         for future in as_completed(person_futures):
+            label = person_futures[future]
             try:
                 for entry in future.result():
                     if entry["id"] not in seen_ids:
                         seen_ids.add(entry["id"])
                         all_entries.append(entry)
             except Exception as exc:
-                print(f"    KG person query failed: {exc}")
+                print(f"    KG query failed ({label}): {exc}")
 
+    # Also query by projects found in existing results
     projects = set()
     for e in all_entries:
         projects.update(e.get("related_projects", []))
@@ -164,11 +173,13 @@ def _build_meeting_prep(meeting: dict) -> str | None:
                 except Exception as exc:
                     print(f"    KG project query failed: {exc}")
 
-    if not all_entries:
-        return None
-
-    knowledge_context = format_knowledge_for_context(all_entries[:20])
     attendees_str = ", ".join(attendee_names)
+
+    if not all_entries:
+        # No KG context — generate a minimal prep with just attendee + time info
+        knowledge_context = "(No prior context found for these attendees or topics.)"
+    else:
+        knowledge_context = format_knowledge_for_context(all_entries[:20])
 
     prompt = _PREP_PROMPT.format(
         title=meeting["title"],
@@ -186,9 +197,12 @@ def _build_meeting_prep(meeting: dict) -> str | None:
         return None
 
 
-@traceable(name="meeting-prep")
 def run_meeting_prep() -> dict:
-    """Check for upcoming meetings and send prep briefs for unsent ones."""
+    """Check for upcoming meetings and send prep briefs for unsent ones.
+
+    Only creates a LangSmith trace when there are actual meetings to prep,
+    so idle polling runs don't flood the trace dashboard.
+    """
     if not config.PROACTIVE_INTELLIGENCE_ENABLED or not config.MEETING_PREP_ENABLED:
         return {"status": "skipped", "reason": "meeting prep disabled"}
     if not config.KNOWLEDGE_GRAPH_ENABLED:
@@ -200,14 +214,29 @@ def run_meeting_prep() -> dict:
     if not upcoming:
         return {"status": "no_meetings", "preps_sent": 0}
 
-    sent_count = 0
+    # Filter to meetings that actually need prep
+    meetings_to_prep = []
     for meeting in upcoming:
         event_id = meeting.get("id", "")
         if not event_id or meeting.get("is_all_day"):
             continue
         if has_prep_been_sent(event_id):
             continue
+        meetings_to_prep.append(meeting)
 
+    if not meetings_to_prep:
+        return {"status": "no_preps", "preps_sent": 0}
+
+    # Only trace when we're doing real work
+    return _run_meeting_prep_traced(meetings_to_prep)
+
+
+@traceable(name="meeting-prep", tags=["proactive", "scheduled"])
+def _run_meeting_prep_traced(meetings: list) -> dict:
+    """Traced inner function — only called when there are meetings to prep."""
+    sent_count = 0
+    for meeting in meetings:
+        event_id = meeting.get("id", "")
         print(f"  Generating meeting prep for: {meeting['title']}")
         try:
             brief = _build_meeting_prep(meeting)
@@ -516,7 +545,7 @@ def _run_drift_engine() -> list[dict]:
 # ── Coordinators ─────────────────────────────────────────────
 
 
-@traceable(name="daily-nudges")
+@traceable(name="daily-nudges", tags=["proactive", "scheduled"])
 def generate_daily_nudges() -> str:
     """Run commitment, pattern, and drift engines. Returns formatted text
     for inclusion in the morning briefing, or empty string if nothing to report."""
