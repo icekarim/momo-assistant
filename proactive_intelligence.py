@@ -20,9 +20,12 @@ from datetime import datetime, timedelta
 import google.generativeai as genai
 
 import config
+from langsmith_config import traceable, traced_generate_content
 from calendar_service import fetch_upcoming_meetings
 from chat_service import format_for_google_chat, send_chat_message
 from conversation_store import (
+    add_turn,
+    conversation_scope,
     has_nudge_been_sent,
     has_prep_been_sent,
     mark_nudge_sent,
@@ -39,6 +42,16 @@ from knowledge_graph import (
 )
 
 genai.configure(api_key=config.GEMINI_API_KEY)
+
+
+def _store_proactive_message(message: str, space_id: str) -> None:
+    """Persist a proactive assistant message into the matching chat history."""
+    if not message or not space_id:
+        return
+    try:
+        add_turn(conversation_scope(space=space_id), "assistant", message)
+    except Exception as exc:
+        print(f"  Failed to store proactive message in conversation history: {exc}")
 
 
 def _nudge_key(nudge_type: str, identifier: str) -> str:
@@ -166,13 +179,14 @@ def _build_meeting_prep(meeting: dict) -> str | None:
 
     model = genai.GenerativeModel(model_name=config.GEMINI_MODEL_FLASH)
     try:
-        resp = model.generate_content(prompt)
+        resp = traced_generate_content(model, prompt, model_name=config.GEMINI_MODEL_FLASH)
         return resp.text.strip()
     except Exception as exc:
         print(f"  Meeting prep generation failed: {exc}")
         return None
 
 
+@traceable(name="meeting-prep")
 def run_meeting_prep() -> dict:
     """Check for upcoming meetings and send prep briefs for unsent ones."""
     if not config.PROACTIVE_INTELLIGENCE_ENABLED or not config.MEETING_PREP_ENABLED:
@@ -200,6 +214,7 @@ def run_meeting_prep() -> dict:
             if brief:
                 formatted = format_for_google_chat(brief)
                 send_chat_message(config.CHAT_SPACE_ID, formatted)
+                _store_proactive_message(brief, config.CHAT_SPACE_ID)
                 mark_prep_sent(event_id, meeting["title"])
                 sent_count += 1
                 print(f"    Prep sent for: {meeting['title']}")
@@ -248,7 +263,7 @@ def _check_commitment_evidence(commitment: dict) -> str | None:
                     body=(email.get("body", "") or "")[:500],
                 )
                 try:
-                    resp = model.generate_content(prompt)
+                    resp = traced_generate_content(model, prompt, model_name=config.GEMINI_MODEL_FLASH)
                     if resp.text.strip().lower().startswith("yes"):
                         return f"Found matching email: {email.get('subject', '?')}"
                 except Exception:
@@ -384,7 +399,7 @@ def _run_pattern_engine() -> list[dict]:
     model = genai.GenerativeModel(model_name=config.GEMINI_MODEL_FLASH)
     try:
         prompt = _PATTERN_PROMPT.format(patterns="\n".join(pattern_lines))
-        resp = model.generate_content(prompt)
+        resp = traced_generate_content(model, prompt, model_name=config.GEMINI_MODEL_FLASH)
         text = resp.text.strip()
     except Exception as exc:
         print(f"  Pattern insight generation failed: {exc}")
@@ -501,6 +516,7 @@ def _run_drift_engine() -> list[dict]:
 # ── Coordinators ─────────────────────────────────────────────
 
 
+@traceable(name="daily-nudges")
 def generate_daily_nudges() -> str:
     """Run commitment, pattern, and drift engines. Returns formatted text
     for inclusion in the morning briefing, or empty string if nothing to report."""
@@ -561,6 +577,7 @@ def _send_standalone_nudges(nudges: list[dict]):
     try:
         formatted = format_for_google_chat(text)
         send_chat_message(config.CHAT_SPACE_ID, formatted)
+        _store_proactive_message(text, config.CHAT_SPACE_ID)
     except Exception as exc:
         print(f"  Failed to send standalone nudges: {exc}")
 
