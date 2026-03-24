@@ -2,7 +2,7 @@ from enum import Enum
 
 import google.generativeai as genai
 import config
-from langsmith_config import traceable, traced_generate_content, traced_chat_send
+from langsmith_config import traceable, traced_generate_content, traced_chat_send, set_trace_metadata
 
 genai.configure(api_key=config.GEMINI_API_KEY)
 
@@ -246,7 +246,7 @@ def _get_model(complexity: TaskComplexity = TaskComplexity.STANDARD,
     )
 
 
-@traceable(name="transcribe-audio")
+@traceable(name="transcribe-audio", tags=["chat", "user-initiated"])
 def transcribe_audio(audio_bytes: bytes, mime_type: str) -> str | None:
     """Transcribe audio using Gemini's native multimodal capabilities.
 
@@ -273,7 +273,7 @@ def transcribe_audio(audio_bytes: bytes, mime_type: str) -> str | None:
         return None
 
 
-@traceable(name="morning-briefing")
+@traceable(name="morning-briefing", tags=["briefing", "scheduled"])
 def generate_morning_briefing(emails_context, meetings_context, tasks_context,
                                granola_context="", jira_context="",
                                nudges_context=""):
@@ -324,12 +324,15 @@ Please create my morning briefing."""
     return resp.text
 
 
-@traceable(name="chat-response")
-def chat_response(user_message, conversation_history, context_data):
+@traceable(name="chat-response", tags=["chat", "user-initiated"])
+def chat_response(user_message, conversation_history, context_data, thread_id=None):
     """Generate a conversational response with email/calendar/task context."""
     import time
     from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
     from datetime import datetime, timedelta
+
+    if thread_id:
+        set_trace_metadata(thread_id=thread_id)
 
     has_kg_context = bool(context_data.get("knowledge_graph"))
     complexity = TaskComplexity.DEEP if has_kg_context else TaskComplexity.STANDARD
@@ -437,7 +440,7 @@ def chat_response(user_message, conversation_history, context_data):
             print(f"Slow chat_response: {elapsed:.1f}s (tier: {complexity.value})")
 
 
-@traceable(name="post-meeting-debrief")
+@traceable(name="post-meeting-debrief", tags=["proactive", "scheduled"])
 def generate_post_meeting_debrief(meeting_title, attendees, granola_notes, end_time=""):
     """Generate a short post-meeting debrief (summary + action items)."""
     attendee_str = ", ".join(attendees) if attendees else "unknown attendees"
