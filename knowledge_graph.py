@@ -294,6 +294,29 @@ def _run_extraction(source_type: str, source_title: str, content: str,
         return []
 
 
+def _search_tokens_for_people(people: list[str], owner: str | None = None) -> list[str]:
+    """Generate lowercase search tokens for Firestore array_contains queries."""
+    tokens = set()
+    all_people = list(people or [])
+    if owner:
+        all_people.append(owner)
+    for person in all_people:
+        for tok in _person_tokens(person):
+            if len(tok) >= 2:  # skip single-char tokens
+                tokens.add(tok)
+    return sorted(tokens)
+
+
+def _search_tokens_for_projects(projects: list[str]) -> list[str]:
+    """Generate lowercase search tokens for Firestore array_contains queries."""
+    tokens = set()
+    for project in (projects or []):
+        for tok in re.findall(r"[a-z0-9]+", project.lower()):
+            if len(tok) >= 2:
+                tokens.add(tok)
+    return sorted(tokens)
+
+
 def _store_entries(entries: list[dict], source_type: str, source_id: str,
                    source_title: str, source_date: str):
     """Persist extracted entries to Firestore with embeddings and invalidate caches."""
@@ -302,15 +325,21 @@ def _store_entries(entries: list[dict], source_type: str, source_id: str,
     now_iso = datetime.now(timezone.utc).isoformat()
 
     for entry in entries:
+        people = entry.get("related_people", [])
+        owner = entry.get("owner")
+        projects = entry.get("related_projects", [])
         doc = {
             "entity_type": entry.get("entity_type", "topic"),
             "name": entry.get("name", ""),
             "content": entry.get("content", ""),
             "status": entry.get("status"),
-            "owner": entry.get("owner"),
-            "related_people": entry.get("related_people", []),
-            "related_projects": entry.get("related_projects", []),
+            "owner": owner,
+            "related_people": people,
+            "related_projects": projects,
             "tags": entry.get("tags", []),
+            # Indexed search token arrays for Firestore-native queries
+            "_search_people": _search_tokens_for_people(people, owner),
+            "_search_projects": _search_tokens_for_projects(projects),
             "source_type": source_type,
             "source_id": source_id,
             "source_title": source_title,
@@ -479,21 +508,36 @@ def extract_from_granola_notes(granola_context: str, source_date: str | None = N
 
 def query_by_person(name: str, since: str | None = None,
                     limit: int = 50) -> list[dict]:
-    """All knowledge nodes mentioning a person, with fuzzy name/email matching."""
-    cache_key = ("person", _normalize_text(name), since, limit)
+    """All knowledge nodes mentioning a person, using Firestore-native queries."""
+    tokens = _person_tokens(name)
+    if not tokens:
+        return []
+    # Pick the most distinctive token (longest) for the Firestore query
+    search_token = max(tokens, key=len)
+
+    cache_key = ("person", search_token, since, limit)
     with _kg_cache_lock:
         cached = _kg_cache.get(cache_key)
     if cached is not None:
         return cached
 
+    db = get_db()
+    query = (
+        db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
+        .where(filter=FieldFilter("_search_people", "array_contains", search_token))
+        .order_by("source_date", direction="DESCENDING")
+        .limit(limit * 2)  # over-fetch to allow post-filtering
+    )
+    candidates = [_doc_to_dict(doc) for doc in query.stream()]
+
+    # Post-filter with fuzzy matching for precision
     since_dt = _parse_source_date(since) if since else None
     results = []
-    for entry in sorted(_load_all_entries(), key=_entry_date_key, reverse=True):
+    for entry in candidates:
         if since_dt:
             entry_dt = _parse_source_date(entry.get("source_date"))
             if not entry_dt or entry_dt < since_dt:
                 continue
-
         people = entry.get("related_people", [])
         owner = entry.get("owner") or ""
         if any(_person_matches(name, person) for person in people) or _person_matches(name, owner):
@@ -508,21 +552,36 @@ def query_by_person(name: str, since: str | None = None,
 
 def query_by_project(name: str, since: str | None = None,
                      limit: int = 50) -> list[dict]:
-    """All knowledge nodes related to a project/client, case-insensitive."""
-    cache_key = ("project", _normalize_text(name), since, limit)
+    """All knowledge nodes related to a project/client, using Firestore-native queries."""
+    tokens = re.findall(r"[a-z0-9]+", name.lower())
+    tokens = [t for t in tokens if len(t) >= 2]
+    if not tokens:
+        return []
+    search_token = max(tokens, key=len)
+
+    cache_key = ("project", search_token, since, limit)
     with _kg_cache_lock:
         cached = _kg_cache.get(cache_key)
     if cached is not None:
         return cached
 
+    db = get_db()
+    query = (
+        db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
+        .where(filter=FieldFilter("_search_projects", "array_contains", search_token))
+        .order_by("source_date", direction="DESCENDING")
+        .limit(limit * 2)
+    )
+    candidates = [_doc_to_dict(doc) for doc in query.stream()]
+
+    # Post-filter with fuzzy matching for precision
     since_dt = _parse_source_date(since) if since else None
     results = []
-    for entry in sorted(_load_all_entries(), key=_entry_date_key, reverse=True):
+    for entry in candidates:
         if since_dt:
             entry_dt = _parse_source_date(entry.get("source_date"))
             if not entry_dt or entry_dt < since_dt:
                 continue
-
         if any(_project_matches(name, project) for project in entry.get("related_projects", [])):
             results.append(entry)
             if len(results) >= limit:
@@ -632,39 +691,44 @@ def search_knowledge(keywords: list[str], limit: int = 50) -> list[dict]:
 
 
 def query_recent(days: int = 7, limit: int = 50) -> list[dict]:
-    """All entries from the last N days."""
+    """All entries from the last N days, using Firestore-native query."""
     from datetime import timedelta
     since_dt = (datetime.now() - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
-    results = []
-    for entry in sorted(_load_all_entries(), key=_entry_date_key, reverse=True):
-        entry_dt = _parse_source_date(entry.get("source_date"))
-        if not entry_dt or entry_dt < since_dt:
-            continue
-        results.append(entry)
-        if len(results) >= limit:
-            break
-    return results
+    since_str = since_dt.strftime("%Y-%m-%d")
+
+    db = get_db()
+    query = (
+        db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
+        .where(filter=FieldFilter("source_date", ">=", since_str))
+        .order_by("source_date", direction="DESCENDING")
+        .limit(limit)
+    )
+    return [_doc_to_dict(doc) for doc in query.stream()]
 
 
 def query_open_by_age(min_days: int = 3, limit: int = 50) -> list[dict]:
-    """Open commitments/action items older than min_days."""
+    """Open commitments/action items older than min_days, using Firestore-native query."""
     from datetime import timedelta
     cutoff_dt = (datetime.now() - timedelta(days=min_days)).replace(hour=0, minute=0, second=0, microsecond=0)
+    cutoff_str = cutoff_dt.strftime("%Y-%m-%d")
+
+    db = get_db()
+    # Query open commitments
     results = []
-    for entry in sorted(_load_all_entries(), key=_entry_date_key):
-        if entry.get("entity_type") not in ("commitment", "action_item"):
-            continue
-        if entry.get("status") != "open":
-            continue
+    for entity_type in ("commitment", "action_item"):
+        query = (
+            db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
+            .where(filter=FieldFilter("entity_type", "==", entity_type))
+            .where(filter=FieldFilter("status", "==", "open"))
+            .where(filter=FieldFilter("source_date", "<=", cutoff_str))
+            .order_by("source_date")
+            .limit(limit)
+        )
+        results.extend(_doc_to_dict(doc) for doc in query.stream())
 
-        entry_dt = _parse_source_date(entry.get("source_date"))
-        if not entry_dt or entry_dt > cutoff_dt:
-            continue
-
-        results.append(entry)
-        if len(results) >= limit:
-            break
-    return results
+    # Sort by date and trim
+    results.sort(key=_entry_date_key)
+    return results[:limit]
 
 
 def update_entity_status(doc_id: str, new_status: str):
@@ -811,6 +875,53 @@ def embed_backfill() -> dict:
 
     print(f"Embed backfill: {updated} updated, {skipped} already had embeddings, {failed} failed")
     return {"updated": updated, "skipped": skipped, "failed": failed}
+
+
+def search_index_backfill() -> dict:
+    """Add _search_people and _search_projects tokens to existing KG docs.
+
+    Run once after deploying the Firestore-native query changes.
+    Returns counts of updated and skipped entities.
+    """
+    db = get_db()
+    docs = list(db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION).stream())
+
+    updated, skipped = 0, 0
+    batch = db.batch()
+    batch_count = 0
+
+    for doc in docs:
+        data = doc.to_dict()
+        if "_search_people" in data and "_search_projects" in data:
+            skipped += 1
+            continue
+
+        people_tokens = _search_tokens_for_people(
+            data.get("related_people", []), data.get("owner"))
+        project_tokens = _search_tokens_for_projects(
+            data.get("related_projects", []))
+
+        batch.update(doc.reference, {
+            "_search_people": people_tokens,
+            "_search_projects": project_tokens,
+        })
+        updated += 1
+        batch_count += 1
+
+        # Firestore batches max 500 writes
+        if batch_count >= 400:
+            batch.commit()
+            batch = db.batch()
+            batch_count = 0
+
+    if batch_count > 0:
+        batch.commit()
+
+    with _kg_cache_lock:
+        _kg_cache.clear()
+
+    print(f"Search index backfill: {updated} updated, {skipped} already indexed")
+    return {"updated": updated, "skipped": skipped}
 
 
 def _doc_to_dict(doc) -> dict:
