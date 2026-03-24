@@ -18,6 +18,7 @@ try:
     if not _TRACING_ENABLED:
         raise ImportError("tracing disabled")
     from langsmith import traceable
+    from langsmith import get_current_run_tree as _get_run_tree
     print("[langsmith] tracing enabled — sending to project:",
           os.getenv("LANGSMITH_PROJECT", "default"))
 except ImportError:
@@ -26,6 +27,29 @@ except ImportError:
         if args and callable(args[0]):
             return args[0]
         return lambda fn: fn
+
+    def _get_run_tree():
+        return None
+
+
+def set_trace_metadata(**kwargs):
+    """Inject runtime metadata/tags into the current trace.
+
+    Usage:
+        set_trace_metadata(thread_id="spaces/abc", user_id="u123",
+                           tags=["chat", "user-initiated"])
+    """
+    rt = _get_run_tree()
+    if rt is None:
+        return
+    tags = kwargs.pop("tags", None)
+    if tags:
+        existing = rt.tags or []
+        rt.tags = list(set(existing + tags))
+    for key, value in kwargs.items():
+        if rt.metadata is None:
+            rt.metadata = {}
+        rt.metadata[key] = value
 
 
 # ── Traced Gemini wrappers ───────────────────────────────────────
