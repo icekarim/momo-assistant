@@ -12,10 +12,23 @@ _conversation_cache = TTLCache(maxsize=64, ttl=60)
 _cache_lock = threading.Lock()
 
 
-def _safe_doc_id(user_id):
-    """Sanitize user_id for use as a Firestore document ID.
-    Add-on payloads use 'users/123456' which contains '/' — replace with '_'."""
-    return user_id.replace("/", "_")
+def _safe_doc_id(scope_id):
+    """Sanitize a conversation or task scope ID for Firestore doc IDs."""
+    return scope_id.replace("/", "_")
+
+
+def conversation_scope(user_id: str = "", space: str = "") -> str:
+    """Return the conversation scope for the current chat context.
+
+    Google Chat replies happen inside a space, so scope chat history to that
+    space when available. This lets follow-up questions reference proactive
+    messages that were posted into the same room or DM.
+    """
+    if space:
+        return f"space:{space}"
+    if user_id:
+        return f"user:{user_id}"
+    return "user:unknown"
 
 
 def _pending_task_doc_id(scope_id: str = "latest") -> str:
@@ -32,10 +45,10 @@ def get_db():
     return _db
 
 
-def get_conversation(user_id):
-    """Get conversation history for a user. Cached for 60s to avoid
+def get_conversation(scope_id):
+    """Get conversation history for a scope. Cached for 60s to avoid
     redundant Firestore reads during rapid back-and-forth exchanges."""
-    cache_key = _safe_doc_id(user_id)
+    cache_key = _safe_doc_id(scope_id)
     with _cache_lock:
         cached = _conversation_cache.get(cache_key)
     if cached is not None:
@@ -50,10 +63,10 @@ def get_conversation(user_id):
     return turns
 
 
-def add_turn(user_id, role, content):
+def add_turn(scope_id, role, content):
     """Add a conversation turn and trim to max length."""
     db = get_db()
-    cache_key = _safe_doc_id(user_id)
+    cache_key = _safe_doc_id(scope_id)
     doc_ref = db.collection(config.FIRESTORE_COLLECTION).document(cache_key)
 
     doc = doc_ref.get()
@@ -77,10 +90,10 @@ def add_turn(user_id, role, content):
         _conversation_cache[cache_key] = turns
 
 
-def clear_conversation(user_id):
-    """Clear conversation history for a user."""
+def clear_conversation(scope_id):
+    """Clear conversation history for a scope."""
     db = get_db()
-    cache_key = _safe_doc_id(user_id)
+    cache_key = _safe_doc_id(scope_id)
     db.collection(config.FIRESTORE_COLLECTION).document(cache_key).delete()
 
     with _cache_lock:

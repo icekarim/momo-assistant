@@ -16,6 +16,8 @@ from tasks_service import fetch_open_tasks, format_tasks_for_context
 from gemini_service import generate_morning_briefing, generate_post_meeting_debrief
 from chat_service import send_chat_message, format_for_google_chat
 from conversation_store import (
+    add_turn,
+    conversation_scope,
     has_email_alert_been_sent,
     mark_email_alert_sent,
     has_debrief_been_sent,
@@ -24,10 +26,21 @@ from conversation_store import (
 import config
 
 
-def run_morning_briefing():
+def _store_proactive_message(message: str, space_id: str) -> None:
+    """Persist a proactive assistant message into the matching chat history."""
+    if not message or not space_id:
+        return
+    try:
+        add_turn(conversation_scope(space=space_id), "assistant", message)
+    except Exception as exc:
+        print(f"  Failed to store proactive message in conversation history: {exc}")
+
+
+def run_morning_briefing(space_id: str | None = None):
     """Full morning briefing pipeline.
     Fetches emails, meetings, tasks, Granola notes, and nudges in parallel."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    target_space = space_id or config.CHAT_SPACE_ID
 
     print("Momo is preparing the morning briefing...")
 
@@ -123,17 +136,18 @@ def run_morning_briefing():
         granola_context=granola_ctx, jira_context=jira_ctx,
         nudges_context=nudges_ctx,
     )
-    pending_scope = f"space:{config.CHAT_SPACE_ID}" if config.CHAT_SPACE_ID else "latest"
+    pending_scope = conversation_scope(space=target_space) if target_space else "latest"
     summary = _process_debrief_tasks(
         summary,
         meeting_title="Morning Briefing",
         scope_id=pending_scope,
     )
 
-    if config.CHAT_SPACE_ID:
+    if target_space:
         print("  Sending to Google Chat...")
         formatted = format_for_google_chat(summary)
-        send_chat_message(config.CHAT_SPACE_ID, formatted)
+        send_chat_message(target_space, formatted)
+        _store_proactive_message(summary, target_space)
     else:
         print("  No CHAT_SPACE_ID configured. Printing to console:")
         print(summary)
@@ -208,6 +222,7 @@ def run_proactive_email_alerts():
         )
         formatted = format_for_google_chat(message)
         send_chat_message(config.CHAT_SPACE_ID, formatted)
+        _store_proactive_message(message, config.CHAT_SPACE_ID)
         mark_email_alert_sent(email)
         sent_count += 1
 
@@ -472,6 +487,7 @@ def run_post_meeting_debrief():
             )
             formatted = format_for_google_chat(debrief)
             send_chat_message(config.CHAT_SPACE_ID, formatted)
+            _store_proactive_message(debrief, config.CHAT_SPACE_ID)
             mark_debrief_sent(event_id, title)
             sent_count += 1
             print(f"    Debrief sent for: {title}")
@@ -502,6 +518,7 @@ def run_post_meeting_debrief():
                 debrief = _process_debrief_tasks(debrief, meeting_title=title)
                 formatted = format_for_google_chat(debrief)
                 send_chat_message(config.CHAT_SPACE_ID, formatted)
+                _store_proactive_message(debrief, config.CHAT_SPACE_ID)
                 mark_debrief_sent(meeting.get("id", ""), title)
                 sent_count += 1
                 print(f"    Debrief sent for: {title}")
