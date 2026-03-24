@@ -43,6 +43,7 @@ from conversation_store import (
     get_conversation,
     add_turn,
     clear_conversation,
+    conversation_scope,
     get_pending_task_actions,
     clear_pending_task_actions,
     store_pending_task_actions,
@@ -749,12 +750,12 @@ async def handle_message(ev: dict) -> dict:
     if text and not audio_attachments:
         lower = text.lower().strip()
         if lower in ("clear", "reset", "start over"):
-            clear_conversation(user_id)
+            clear_conversation(conversation_scope(user_id=user_id, space=space))
             return _make_response("Slate wiped. What can Momo do for you?", is_addon)
 
         if lower in ("briefing", "morning briefing", "daily briefing"):
             try:
-                run_morning_briefing()
+                run_morning_briefing(space or config.CHAT_SPACE_ID)
                 return _make_response("Morning briefing sent!", is_addon)
             except Exception as e:
                 return _make_response(f"Error generating briefing: {str(e)}", is_addon)
@@ -965,7 +966,8 @@ def _process_message_background(text, user_id, space, audio_attachments=None):
             if text is None:
                 return
 
-        history = get_conversation(user_id)
+        conversation_id = conversation_scope(user_id=user_id, space=space)
+        history = get_conversation(conversation_id)
         _t1 = time.time()
         print(f"[perf] get_conversation: {_t1 - _t0:.2f}s (history={len(history)} turns)")
 
@@ -987,8 +989,8 @@ def _process_message_background(text, user_id, space, audio_attachments=None):
         _t2 = time.time()
         print(f"[perf] response: {_t2 - _t1:.2f}s ({len(response or '')} chars)")
 
-        add_turn(user_id, "user", text)
-        add_turn(user_id, "assistant", response)
+        add_turn(conversation_id, "user", text)
+        add_turn(conversation_id, "assistant", response)
 
         if config.KNOWLEDGE_GRAPH_ENABLED:
             from datetime import datetime as _dt
