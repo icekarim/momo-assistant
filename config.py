@@ -74,7 +74,7 @@ AGENTIC_MODE_ENABLED = os.getenv("AGENTIC_MODE_ENABLED", "true").lower() == "tru
 # ── Proactive Intelligence ───────────────────────────────────
 PROACTIVE_INTELLIGENCE_ENABLED = os.getenv("PROACTIVE_INTELLIGENCE_ENABLED", "true").lower() == "true"
 MEETING_PREP_ENABLED = os.getenv("MEETING_PREP_ENABLED", "true").lower() == "true"
-MEETING_PREP_LOOKAHEAD_HOURS = int(os.getenv("MEETING_PREP_LOOKAHEAD_HOURS", "1"))
+MEETING_PREP_LOOKAHEAD_HOURS = int(os.getenv("MEETING_PREP_LOOKAHEAD_HOURS", "2"))
 COMMITMENT_FOLLOWUP_DAYS = int(os.getenv("COMMITMENT_FOLLOWUP_DAYS", "3"))
 DRIFT_THRESHOLD_DAYS = int(os.getenv("DRIFT_THRESHOLD_DAYS", "14"))
 NUDGE_COOLDOWN_DAYS = int(os.getenv("NUDGE_COOLDOWN_DAYS", "7"))

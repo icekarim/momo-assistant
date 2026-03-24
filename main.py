@@ -218,6 +218,105 @@ async def trigger_meeting_prep():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── KG + Meeting Prep E2E Test ────────────────────────────────
+
+@app.get("/test-kg")
+async def test_kg(query: str = "test", person: str = ""):
+    """E2E test for knowledge graph queries and meeting prep generation.
+    Usage: /test-kg?query=ProjectName&person=Person+Name"""
+    import time
+    results = {}
+
+    if not config.KNOWLEDGE_GRAPH_ENABLED:
+        return {"error": "knowledge graph disabled"}
+
+    from knowledge_graph import query_by_project, query_by_person, semantic_search
+
+    # Test query_by_project
+    t0 = time.time()
+    try:
+        project_results = query_by_project(query)
+        results["query_by_project"] = {
+            "query": query,
+            "count": len(project_results),
+            "time_ms": round((time.time() - t0) * 1000),
+            "sample": [{"name": e.get("name"), "type": e.get("entity_type"),
+                        "date": e.get("source_date")} for e in project_results[:5]],
+        }
+    except Exception as e:
+        results["query_by_project"] = {"error": str(e), "time_ms": round((time.time() - t0) * 1000)}
+
+    # Test query_by_person (if provided)
+    if person:
+        t0 = time.time()
+        try:
+            person_results = query_by_person(person)
+            results["query_by_person"] = {
+                "query": person,
+                "count": len(person_results),
+                "time_ms": round((time.time() - t0) * 1000),
+                "sample": [{"name": e.get("name"), "type": e.get("entity_type"),
+                            "date": e.get("source_date")} for e in person_results[:5]],
+            }
+        except Exception as e:
+            results["query_by_person"] = {"error": str(e), "time_ms": round((time.time() - t0) * 1000)}
+
+    # Test semantic_search
+    t0 = time.time()
+    try:
+        semantic_results = semantic_search(query)
+        results["semantic_search"] = {
+            "query": query,
+            "count": len(semantic_results),
+            "time_ms": round((time.time() - t0) * 1000),
+            "sample": [{"name": e.get("name"), "type": e.get("entity_type"),
+                        "date": e.get("source_date")} for e in semantic_results[:5]],
+        }
+    except Exception as e:
+        results["semantic_search"] = {"error": str(e), "time_ms": round((time.time() - t0) * 1000)}
+
+    # Test simulated meeting prep
+    t0 = time.time()
+    try:
+        from proactive_intelligence import _build_meeting_prep
+        fake_meeting = {
+            "title": f"Internal Sync: {query}",
+            "start_time": "3:00 PM",
+            "attendees": [{"name": person}] if person else [{"name": "Team"}],
+        }
+        prep = _build_meeting_prep(fake_meeting)
+        results["meeting_prep"] = {
+            "time_ms": round((time.time() - t0) * 1000),
+            "generated": bool(prep),
+            "length": len(prep) if prep else 0,
+            "preview": (prep[:500] + "...") if prep and len(prep) > 500 else prep,
+        }
+    except Exception as e:
+        results["meeting_prep"] = {"error": str(e), "time_ms": round((time.time() - t0) * 1000)}
+
+    return results
+
+
+# ── LangSmith Evals Trigger ──────────────────────────────────
+
+@app.post("/run-evals")
+async def trigger_evals():
+    """Called by Cloud Scheduler once daily to run LLM-as-judge evals
+    against production traces collected in the momo-prod-traces dataset."""
+    from datetime import datetime
+    try:
+        from scripts.run_langsmith_evals import run_evals
+        prefix = f"momo-eval-{datetime.now().strftime('%Y%m%d')}"
+        run_evals(prefix=prefix, limit=50)
+        return {"status": "ok", "experiment": prefix}
+    except SystemExit:
+        # run_evals calls sys.exit if dataset is empty — catch it
+        return {"status": "skipped", "reason": "dataset empty or not found"}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ── Granola Token Refresh ────────────────────────────────────
 
 @app.post("/granola-token-refresh")
@@ -270,6 +369,22 @@ async def trigger_embed_backfill():
     thread = threading.Thread(target=_run, daemon=True)
     thread.start()
     return {"status": "started", "message": "embed backfill running in background, check logs for progress"}
+
+
+@app.post("/knowledge-search-index-backfill")
+async def trigger_search_index_backfill():
+    """Add _search_people/_search_projects tokens to existing KG docs.
+    Required once after deploying Firestore-native query changes."""
+    if not config.KNOWLEDGE_GRAPH_ENABLED:
+        return {"status": "skipped", "reason": "knowledge graph disabled"}
+
+    def _run():
+        from knowledge_graph import search_index_backfill
+        search_index_backfill()
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    return {"status": "started", "message": "search index backfill running in background, check logs for progress"}
 
 
 def _run_backfill():
@@ -974,7 +1089,7 @@ def _process_message_background(text, user_id, space, audio_attachments=None):
         pending_task_actions = []
         if config.AGENTIC_MODE_ENABLED:
             from agent import run_agent_loop
-            response, pending_task_actions = run_agent_loop(text, history)
+            response, pending_task_actions = run_agent_loop(text, history, thread_id=conversation_id)
             if pending_task_actions:
                 store_pending_task_actions(
                     pending_task_actions,
@@ -983,7 +1098,7 @@ def _process_message_background(text, user_id, space, audio_attachments=None):
                 response = _append_task_approval_block(response, pending_task_actions)
         else:
             context_data = _build_context(text)
-            response = chat_response(text, history, context_data)
+            response = chat_response(text, history, context_data, thread_id=conversation_id)
             response = _remove_task_tags(response)
 
         _t2 = time.time()
