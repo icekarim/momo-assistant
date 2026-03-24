@@ -11,3 +11,4 @@ cachetools==5.5.0
 numpy
 mcp
 httpx
+langsmith

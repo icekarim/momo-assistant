@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 import google.generativeai as genai
 
 import config
+from langsmith_config import traceable, traced_chat_send
 
 genai.configure(api_key=config.GEMINI_API_KEY)
 
@@ -244,6 +245,7 @@ def _get_all_tools() -> list:
 # ── Tool executor ────────────────────────────────────────────
 
 
+@traceable(run_type="tool", name="agent-tool")
 def execute_tool(name: str, args: dict, pending_task_actions: list[dict] | None = None) -> str:
     """Dispatch a tool call to the appropriate service function.
 
@@ -463,6 +465,7 @@ def _build_history(conversation_history: list[dict]) -> list[dict]:
     return history
 
 
+@traceable(name="agent-loop")
 def run_agent_loop(user_message: str, conversation_history: list[dict],
                    max_iterations: int = 6) -> tuple[str, list[dict]]:
     """Run the agentic tool-use loop.
@@ -489,7 +492,7 @@ def run_agent_loop(user_message: str, conversation_history: list[dict],
     pending_task_actions: list[dict] = []
 
     try:
-        response = chat.send_message(user_message)
+        response = traced_chat_send(chat, user_message, model_name=config.GEMINI_MODEL_FLASH)
     except Exception as exc:
         print(f"[agent] initial send failed: {exc}")
         traceback.print_exc()
@@ -542,7 +545,7 @@ def run_agent_loop(user_message: str, conversation_history: list[dict],
             tool_responses.append(genai.protos.Part(text="\n".join(text_parts)))
 
         try:
-            response = chat.send_message(tool_responses)
+            response = traced_chat_send(chat, tool_responses, model_name=config.GEMINI_MODEL_FLASH, iteration=iteration + 1)
         except Exception as exc:
             print(f"[agent] send_message failed on iteration {iteration + 1}: {exc}")
             if text_parts:

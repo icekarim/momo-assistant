@@ -2,6 +2,7 @@ from enum import Enum
 
 import google.generativeai as genai
 import config
+from langsmith_config import traceable, traced_generate_content, traced_chat_send
 
 genai.configure(api_key=config.GEMINI_API_KEY)
 
@@ -245,6 +246,7 @@ def _get_model(complexity: TaskComplexity = TaskComplexity.STANDARD,
     )
 
 
+@traceable(name="transcribe-audio")
 def transcribe_audio(audio_bytes: bytes, mime_type: str) -> str | None:
     """Transcribe audio using Gemini's native multimodal capabilities.
 
@@ -255,11 +257,11 @@ def transcribe_audio(audio_bytes: bytes, mime_type: str) -> str | None:
             TaskComplexity.LIGHT,
             system_prompt="You are a precise speech-to-text transcriber. Return only the spoken words, nothing else.",
         )
-        response = model.generate_content([
+        response = traced_generate_content(model, [
             "Transcribe this voice message exactly as spoken. "
             "Return only the transcription text with no preamble, labels, or formatting.",
             {"mime_type": mime_type, "data": audio_bytes},
-        ])
+        ], model_name=TASK_MODEL_MAP[TaskComplexity.LIGHT])
         text = response.text.strip()
         if text:
             print(f"Audio transcribed ({len(audio_bytes)} bytes → {len(text)} chars)")
@@ -271,6 +273,7 @@ def transcribe_audio(audio_bytes: bytes, mime_type: str) -> str | None:
         return None
 
 
+@traceable(name="morning-briefing")
 def generate_morning_briefing(emails_context, meetings_context, tasks_context,
                                granola_context="", jira_context="",
                                nudges_context=""):
@@ -317,10 +320,11 @@ def generate_morning_briefing(emails_context, meetings_context, tasks_context,
 Please create my morning briefing."""
 
     model = _get_model()
-    resp = model.generate_content(prompt)
+    resp = traced_generate_content(model, prompt, model_name=TASK_MODEL_MAP[TaskComplexity.STANDARD])
     return resp.text
 
 
+@traceable(name="chat-response")
 def chat_response(user_message, conversation_history, context_data):
     """Generate a conversational response with email/calendar/task context."""
     import time
@@ -389,8 +393,10 @@ def chat_response(user_message, conversation_history, context_data):
     start = time.time()
     print(f"[perf] gemini: model={TASK_MODEL_MAP[complexity]} tier={complexity.value} timeout={timeout_s}s context={len(context_block)} chars")
 
+    model_name = TASK_MODEL_MAP[complexity]
+
     def _do_send():
-        return chat.send_message(user_message)
+        return traced_chat_send(chat, user_message, model_name=model_name)
 
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
@@ -404,8 +410,9 @@ def chat_response(user_message, conversation_history, context_data):
             fallback_model = _get_model(TaskComplexity.STANDARD)
             fallback_chat = fallback_model.start_chat(history=history)
             fallback_timeout = TIER_TIMEOUTS[TaskComplexity.STANDARD]
+            fallback_name = TASK_MODEL_MAP[TaskComplexity.STANDARD]
             with ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(lambda: fallback_chat.send_message(user_message))
+                future = pool.submit(lambda: traced_chat_send(fallback_chat, user_message, model_name=fallback_name))
                 resp = future.result(timeout=fallback_timeout)
             return resp.text
         return "sorry, that took way too long — try again in a sec? (gemini was slow)"
@@ -415,9 +422,10 @@ def chat_response(user_message, conversation_history, context_data):
             fallback_model = _get_model(TaskComplexity.STANDARD)
             fallback_chat = fallback_model.start_chat(history=history)
             fallback_timeout = TIER_TIMEOUTS[TaskComplexity.STANDARD]
+            fallback_name = TASK_MODEL_MAP[TaskComplexity.STANDARD]
             try:
                 with ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(lambda: fallback_chat.send_message(user_message))
+                    future = pool.submit(lambda: traced_chat_send(fallback_chat, user_message, model_name=fallback_name))
                     resp = future.result(timeout=fallback_timeout)
                 return resp.text
             except FuturesTimeoutError:
@@ -429,6 +437,7 @@ def chat_response(user_message, conversation_history, context_data):
             print(f"Slow chat_response: {elapsed:.1f}s (tier: {complexity.value})")
 
 
+@traceable(name="post-meeting-debrief")
 def generate_post_meeting_debrief(meeting_title, attendees, granola_notes, end_time=""):
     """Generate a short post-meeting debrief (summary + action items)."""
     attendee_str = ", ".join(attendees) if attendees else "unknown attendees"
@@ -459,5 +468,5 @@ Do NOT include any other text on the same line as a [CREATE_TASK] tag.
 Keep it tight — this goes to Google Chat right after the meeting. No fluff."""
 
     model = _get_model()
-    resp = model.generate_content(prompt)
+    resp = traced_generate_content(model, prompt, model_name=TASK_MODEL_MAP[TaskComplexity.STANDARD])
     return resp.text
