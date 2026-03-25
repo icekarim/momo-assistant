@@ -26,7 +26,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 NOTION_TOKEN = os.environ.get("NOTION_API_KEY", "")
-DATABASE_ID = "319d79c1-41fc-819b-8c10-d569ee48cbb0"
+DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "")
 NOTION_VERSION = "2022-06-28"
 
 if not NOTION_TOKEN:

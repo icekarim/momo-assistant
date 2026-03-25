@@ -38,7 +38,7 @@ When creating a task, you MUST provide a `--description` with a clear explanatio
 - Type: Feature, Bug Fix, Performance, Refactor, DevOps
 - Effort: Small, Medium, Large
 
-### Notion Database ID: 319d79c1-41fc-819b-8c10-d569ee48cbb0
+### Notion Database ID: set via NOTION_DATABASE_ID env var in .env
 
 ## Project context
 - Stack: Python, FastAPI, Gemini, Google Workspace APIs, Firestore, Cloud Run

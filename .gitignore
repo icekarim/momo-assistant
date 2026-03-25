@@ -1,9 +1,16 @@
 .env
+.env.*
+.env.local
 token.json
 granola_token.json
 client_secret.json
+service_account.json
+.mcp.json
+.auto_pr_state.json
 __pycache__/
 *.pyc
 .venv/
 venv/
 .cursor/
+PLAN_*.md
+test_generated*.py
