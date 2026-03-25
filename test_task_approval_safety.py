@@ -107,7 +107,7 @@ class TestTaskApprovalSafety(unittest.TestCase):
         sent_text = mock_send_message.call_args.args[1]
         self.assertIn("didn't queue this new task change", sent_text)
         self.assertIn("update *Update weekly report* (set due 2026-03-27)", sent_text)
-        self.assertNotIn("Follow up on QVC migration", sent_text)
+        self.assertNotIn("Follow up on project sync", sent_text)
         mock_add_turn.assert_any_call("space:spaces/123", "assistant", sent_text)
 
     @patch("main.store_pending_task_actions")
