@@ -105,5 +105,8 @@ JIRA_JQL_FILTER = os.getenv(
 # ── Owner ────────────────────────────────────────────────────
 OWNER_NAME = os.getenv("OWNER_NAME", "")
 
+# ── API Security ────────────────────────────────────────────
+MOMO_API_SECRET = os.getenv("MOMO_API_SECRET", "")
+
 # ── Server ───────────────────────────────────────────────────
 PORT = int(os.getenv("PORT", "8080"))

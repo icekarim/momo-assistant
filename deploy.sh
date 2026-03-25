@@ -47,6 +47,7 @@ JIRA_SITE_URL="${JIRA_SITE_URL:-$(grep '^JIRA_SITE_URL=' .env 2>/dev/null | cut 
 JIRA_USER_EMAIL="${JIRA_USER_EMAIL:-$(grep '^JIRA_USER_EMAIL=' .env 2>/dev/null | cut -d= -f2)}"
 JIRA_API_TOKEN="${JIRA_API_TOKEN:-$(grep '^JIRA_API_TOKEN=' .env 2>/dev/null | cut -d= -f2)}"
 LANGSMITH_API_KEY="${LANGSMITH_API_KEY:-$(grep '^LANGSMITH_API_KEY=' .env 2>/dev/null | cut -d= -f2)}"
+MOMO_API_SECRET="${MOMO_API_SECRET:-$(grep '^MOMO_API_SECRET=' .env 2>/dev/null | cut -d= -f2)}"
 
 gcloud run deploy $SERVICE_NAME \
   --source . \
@@ -56,7 +57,7 @@ gcloud run deploy $SERVICE_NAME \
   --set-env-vars="GEMINI_API_KEY=${GEMINI_API_KEY},GCP_PROJECT_ID=$PROJECT_ID,CHAT_SPACE_ID=${CHAT_SPACE_ID},GRANOLA_ENABLED=true" \
   --set-env-vars="JIRA_ENABLED=${JIRA_ENABLED:-false},JIRA_SITE_URL=${JIRA_SITE_URL},JIRA_USER_EMAIL=${JIRA_USER_EMAIL},JIRA_API_TOKEN=${JIRA_API_TOKEN}" \
   --set-env-vars="LANGSMITH_TRACING=true,LANGSMITH_API_KEY=${LANGSMITH_API_KEY},LANGSMITH_PROJECT=momo" \
-  --set-env-vars="OWNER_NAME=${OWNER_NAME:-}" \
+  --set-env-vars="OWNER_NAME=${OWNER_NAME:-},MOMO_API_SECRET=${MOMO_API_SECRET}" \
   --set-env-vars="^##^GOOGLE_TOKEN_JSON=${GOOGLE_TOKEN_JSON}##GRANOLA_TOKEN_JSON=${GRANOLA_TOKEN_JSON}" \
   --memory=1Gi \
   --timeout=300 \

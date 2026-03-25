@@ -52,6 +52,25 @@ from conversation_store import (
 
 app = FastAPI(title="Momo")
 
+# ── API Secret Middleware ────────────────────────────────────
+# Protects all endpoints except /health, /, and /chat (Google Chat webhook)
+
+_OPEN_PATHS = {"/health", "/", "/chat"}
+
+
+@app.middleware("http")
+async def api_secret_middleware(request: Request, call_next):
+    if not config.MOMO_API_SECRET:
+        return await call_next(request)
+    if request.url.path in _OPEN_PATHS:
+        return await call_next(request)
+    if request.headers.get("X-Momo-Secret") != config.MOMO_API_SECRET:
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "Forbidden: invalid or missing X-Momo-Secret header"},
+        )
+    return await call_next(request)
+
 
 @app.on_event("startup")
 async def startup_warmup():
