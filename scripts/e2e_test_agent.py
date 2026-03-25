@@ -50,14 +50,14 @@ load_dotenv(PROJECT_ROOT / ".env")
 MODEL = os.getenv("E2E_TEST_MODEL", "gemini-3.1-pro-preview")
 VENV_PYTHON = str(PROJECT_ROOT / ".venv" / "bin" / "python")
 
-GCP_PROJECT = os.getenv("GCP_PROJECT_ID", "***REMOVED-GCP-PROJECT***")
+GCP_PROJECT = os.getenv("GCP_PROJECT_ID", "")
 CLOUD_RUN_SERVICE = os.getenv("CLOUD_RUN_SERVICE", "momo")
 CLOUD_RUN_REGION = os.getenv("CLOUD_RUN_REGION", "us-central1")
-CLOUD_RUN_URL = os.getenv("CLOUD_RUN_URL", "https://***REMOVED-CLOUD-RUN-URL***")
-FIRESTORE_DB = os.getenv("FIRESTORE_DATABASE", "testing")
+CLOUD_RUN_URL = os.getenv("CLOUD_RUN_URL", "")
+FIRESTORE_DB = os.getenv("FIRESTORE_DATABASE", "")
 
 NOTION_TOKEN = os.getenv("NOTION_API_KEY", "")
-NOTION_TEST_DB_ID = "***REMOVED-NOTION-TEST-DB-ID***"
+NOTION_TEST_DB_ID = os.getenv("NOTION_TEST_DB_ID", "")
 NOTION_VERSION = "2022-06-28"
 
 SYSTEM_PROMPT = textwrap.dedent("""\
