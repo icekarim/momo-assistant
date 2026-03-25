@@ -220,12 +220,15 @@ def run_evals(prefix: str = "momo-eval", limit: int | None = None):
         return {}
 
     results = client.evaluate(
-        target=passthrough,
+        passthrough,
         data=DATASET_NAME,
         evaluators=[hallucination_check, tool_efficiency, response_quality],
         experiment_prefix=prefix,
         max_concurrency=4,
     )
+
+    # Collect results before they're consumed by the iterator
+    collected_results = list(results)
 
     print("\nDone! View results at: https://smith.langchain.com")
     print(f"Look for experiment: {prefix}")
@@ -236,10 +239,14 @@ def run_evals(prefix: str = "momo-eval", limit: int | None = None):
     efficiency_scores = []
     quality_scores = []
 
-    for result in results:
-        for ev_result in result.get("evaluation_results", {}).get("results", []):
-            key = ev_result.get("key", "")
-            score = ev_result.get("score")
+    for result in collected_results:
+        eval_results = getattr(result, "evaluation_results", None)
+        if eval_results is None:
+            continue
+        result_list = getattr(eval_results, "results", None) or []
+        for ev_result in result_list:
+            key = getattr(ev_result, "key", "")
+            score = getattr(ev_result, "score", None)
             if score is None:
                 continue
             if key == "hallucination":

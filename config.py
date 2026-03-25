@@ -102,5 +102,8 @@ JIRA_JQL_FILTER = os.getenv(
     "AND statusCategory != Done ORDER BY updated DESC",
 )
 
+# ── Owner ────────────────────────────────────────────────────
+OWNER_NAME = os.getenv("OWNER_NAME", "")
+
 # ── Server ───────────────────────────────────────────────────
 PORT = int(os.getenv("PORT", "8080"))

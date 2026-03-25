@@ -47,6 +47,7 @@ from conversation_store import (
     get_pending_task_actions,
     clear_pending_task_actions,
     store_pending_task_actions,
+    store_pending_task_actions_if_empty,
 )
 
 app = FastAPI(title="Momo")
@@ -831,6 +832,32 @@ def _build_pending_selection_help(intent: str, actions: list[dict]) -> str:
     )
 
 
+def _build_pending_conflict_reply(pending_request: dict) -> str:
+    """Explain that a new task request was not queued because one is already pending."""
+    prefix = "you already have a pending Google Tasks approval"
+    if pending_request.get("meeting_title"):
+        prefix += f" from *{pending_request['meeting_title']}*"
+    prefix += ", so i didn't queue this new task change."
+    return (
+        f"{prefix}\n\n"
+        "reply `yes` to apply it or `no` to cancel it, then resend your new task request.\n\n"
+        f"{_build_task_approval_block(pending_request['actions'])}"
+    )
+
+
+def _persist_pending_request(scope_id: str, pending_request: dict, actions: list[dict]) -> None:
+    """Update or clear the pending request for a scope."""
+    if actions:
+        store_pending_task_actions(
+            actions,
+            scope_id=scope_id,
+            meeting_title=pending_request.get("meeting_title", ""),
+            approval_message=pending_request.get("approval_message", ""),
+        )
+        return
+    clear_pending_task_actions(scope_id=scope_id)
+
+
 async def handle_message(ev: dict) -> dict:
     """Process an incoming chat message (text and/or voice).
     Returns an immediate ack and processes the real response in a background
@@ -897,6 +924,7 @@ async def handle_message(ev: dict) -> dict:
                     if idx not in selected_indices
                 ]
                 target_space = space or config.CHAT_SPACE_ID
+                _persist_pending_request(pending_scope_id, pending_request, remaining_actions)
                 thread = threading.Thread(
                     target=_apply_pending_task_actions_background,
                     args=(
@@ -917,18 +945,13 @@ async def handle_message(ev: dict) -> dict:
                     if idx not in selected_indices
                 ]
                 if remaining_actions:
-                    store_pending_task_actions(
-                        remaining_actions,
-                        scope_id=pending_scope_id,
-                        meeting_title=pending_request.get("meeting_title", ""),
-                        approval_message=pending_request.get("approval_message", ""),
-                    )
+                    _persist_pending_request(pending_scope_id, pending_request, remaining_actions)
                     reply = (
                         "got it — removed that task from pending approval.\n\n"
                         + _build_task_approval_block(remaining_actions)
                     )
                 else:
-                    clear_pending_task_actions(scope_id=pending_scope_id)
+                    _persist_pending_request(pending_scope_id, pending_request, remaining_actions)
                     reply = "Got it — canceled that pending task request."
                 return _make_response(reply, is_addon)
 
@@ -1014,15 +1037,8 @@ def _apply_pending_task_actions_background(
             lines.extend(f"  • {e}" for e in errors)
 
         if remaining_actions:
-            store_pending_task_actions(
-                remaining_actions,
-                scope_id=scope_id,
-                meeting_title=meeting_title,
-            )
             lines.append("")
             lines.append(_build_task_approval_block(remaining_actions))
-        else:
-            clear_pending_task_actions(scope_id=scope_id)
 
         reply = "\n".join(lines) if lines else "No task changes were applied."
         formatted = format_for_google_chat(reply)
@@ -1091,11 +1107,20 @@ def _process_message_background(text, user_id, space, audio_attachments=None):
             from agent import run_agent_loop
             response, pending_task_actions = run_agent_loop(text, history, thread_id=conversation_id)
             if pending_task_actions:
-                store_pending_task_actions(
+                pending_scope_id = _user_task_scope(user_id, space)
+                approval_response = _append_task_approval_block(response, pending_task_actions)
+                if store_pending_task_actions_if_empty(
                     pending_task_actions,
-                    scope_id=_user_task_scope(user_id, space),
-                )
-                response = _append_task_approval_block(response, pending_task_actions)
+                    scope_id=pending_scope_id,
+                    approval_message=approval_response,
+                ):
+                    response = approval_response
+                else:
+                    existing_pending = get_pending_task_actions(scope_id=pending_scope_id)
+                    if existing_pending:
+                        response = _build_pending_conflict_reply(existing_pending)
+                    else:
+                        response = "sorry, something went wrong queueing that task change — try again?"
         else:
             context_data = _build_context(text)
             response = chat_response(text, history, context_data, thread_id=conversation_id)
