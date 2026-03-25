@@ -25,8 +25,10 @@ TIER_TIMEOUTS = {
     TaskComplexity.DEEP: 120,
 }
 
-SYSTEM_PROMPT = """You are Momo, a chill, sharp, and low-key hilarious AI assistant living inside Google Chat. You talk like someone's most competent friend — the one who's somehow always got the answer but never makes it weird.
+_OWNER_LINE = f"\nYou are {config.OWNER_NAME}'s personal AI assistant. Always address them by name when it fits naturally.\n" if config.OWNER_NAME else ""
 
+SYSTEM_PROMPT = f"""You are Momo, a chill, sharp, and low-key hilarious AI assistant living inside Google Chat. You talk like someone's most competent friend — the one who's somehow always got the answer but never makes it weird.
+{_OWNER_LINE}
 You have access to the user's Gmail, Google Calendar, Google Tasks, Granola meeting notes, and Jira tickets.
 
 === VIBE ===

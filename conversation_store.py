@@ -211,6 +211,30 @@ def store_pending_task_actions(actions, scope_id="latest", meeting_title="", app
     )
 
 
+def store_pending_task_actions_if_empty(actions, scope_id="latest", meeting_title="", approval_message=""):
+    """Create a pending task request only if the scope has no live request."""
+    db = get_db()
+    doc_ref = db.collection(config.FIRESTORE_PENDING_TASKS_COLLECTION).document(
+        _pending_task_doc_id(scope_id)
+    )
+    payload = {
+        "actions": actions,
+        "meeting_title": meeting_title,
+        "approval_message": approval_message,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    try:
+        doc_ref.create(payload)
+        return True
+    except Exception:
+        existing = get_pending_task_actions(scope_id=scope_id)
+        if existing:
+            return False
+        doc_ref.set(payload)
+        return True
+
+
 def get_pending_task_actions(scope_id="latest"):
     """Retrieve pending task actions for a scope.
 
@@ -230,6 +254,9 @@ def get_pending_task_actions(scope_id="latest"):
             created_dt = datetime.fromisoformat(created)
             age_hours = (datetime.now(timezone.utc) - created_dt).total_seconds() / 3600
             if age_hours > 24:
+                db.collection(config.FIRESTORE_PENDING_TASKS_COLLECTION).document(
+                    _pending_task_doc_id(scope_id)
+                ).delete()
                 return None
         except (ValueError, TypeError):
             pass
