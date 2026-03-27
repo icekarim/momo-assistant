@@ -68,6 +68,11 @@ GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "models/gemini-embe
 SEMANTIC_SEARCH_THRESHOLD = float(os.getenv("SEMANTIC_SEARCH_THRESHOLD", "0.60"))
 SEMANTIC_SEARCH_LIMIT = int(os.getenv("SEMANTIC_SEARCH_LIMIT", "15"))
 
+# ── User Memory ─────────────────────────────────────────────
+USER_MEMORY_ENABLED = os.getenv("USER_MEMORY_ENABLED", "true").lower() == "true"
+FIRESTORE_USER_MEMORY_COLLECTION = "user_memories"
+USER_MEMORY_MAX_PER_USER = int(os.getenv("USER_MEMORY_MAX_PER_USER", "50"))
+
 # ── Agentic Mode ─────────────────────────────────────────────
 AGENTIC_MODE_ENABLED = os.getenv("AGENTIC_MODE_ENABLED", "true").lower() == "true"
 

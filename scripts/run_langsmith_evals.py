@@ -1,14 +1,20 @@
-"""Run LangSmith evaluations against the momo-prod-traces dataset.
+"""Run LangSmith evaluations against Momo datasets.
 
-Scores every example with three LLM-as-judge evaluators:
-  1. Hallucination Check — did Momo fabricate data?
-  2. Tool Efficiency     — were the right tools called?
-  3. Response Quality    — accuracy, tone, formatting, completeness
+Supports two datasets:
+  - momo-eval-golden: curated examples with ideal trajectories (default)
+  - momo-prod-traces: production trace samples
+
+Evaluators:
+  1. Correctness       — binary PASS/FAIL against correctness criteria
+  2. Trajectory Metrics — step_ratio, tool_call_ratio, required/forbidden tools
+  3. Hallucination     — did Momo fabricate data?
+  4. Response Quality   — accuracy, tone, formatting, completeness
 
 Usage:
-    python scripts/run_langsmith_evals.py                    # eval all examples
-    python scripts/run_langsmith_evals.py --limit 20         # eval latest 20
-    python scripts/run_langsmith_evals.py --prefix v2-prompt # custom experiment name
+    python scripts/run_langsmith_evals.py                           # golden dataset, all
+    python scripts/run_langsmith_evals.py --category calendar       # only calendar evals
+    python scripts/run_langsmith_evals.py --dataset prod --limit 20 # prod traces
+    python scripts/run_langsmith_evals.py --prefix v2-prompt        # custom experiment name
 """
 
 import argparse
@@ -22,16 +28,36 @@ load_dotenv()
 
 import google.generativeai as genai
 from langsmith import Client
+from langsmith.schemas import Run, Example
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 client = Client()
 
-DATASET_NAME = "momo-prod-traces"
+GOLDEN_DATASET = "momo-eval-golden"
+PROD_DATASET = "momo-prod-traces"
 JUDGE_MODEL = "gemini-2.0-flash"
 
 
 # ── Evaluator prompts ────────────────────────────────────────────
+
+CORRECTNESS_PROMPT = """\
+You are evaluating an AI assistant called Momo. Given the user's message, Momo's response, and the correctness criteria below, determine if the response PASSES or FAILS.
+
+<trace>
+User message: {input}
+
+Momo's response: {output}
+</trace>
+
+<criteria>
+{criteria}
+</criteria>
+
+A response PASSES if it meets ALL the criteria. It FAILS if it violates ANY criterion.
+
+Respond with ONLY one of: "PASS" or "FAIL" followed by a brief reason on the next line.
+"""
 
 HALLUCINATION_PROMPT = """\
 You are evaluating an AI assistant called Momo that has access to tools (Gmail, Calendar, Tasks, Knowledge Graph, Jira).
@@ -51,33 +77,6 @@ Scoring:
 - Return "hallucination" if the output references specific emails, meetings, tasks, people, dates, or decisions that do not appear in the inputs.
 
 Respond with ONLY one of: "no hallucination" or "hallucination"
-"""
-
-TOOL_EFFICIENCY_PROMPT = """\
-You are evaluating the tool usage of an AI agent called Momo. Momo has these tools:
-- get_todays_calendar, get_calendar_for_date
-- get_open_tasks, create_task, update_task, complete_task, delete_task
-- get_recent_emails, search_emails
-- search_knowledge_graph
-- get_meeting_notes (Granola)
-- get_jira_tickets, get_jira_issue, search_jira_tickets
-
-Given the user's message and Momo's response, evaluate whether the agent likely used tools efficiently. Consider what data would be needed to produce the response.
-
-<trace>
-User message: {input}
-
-Momo's response: {output}
-</trace>
-
-Score on a scale of 1-5:
-- 5: Perfect — response shows exactly the right data was fetched, nothing unnecessary
-- 4: Good — minor inefficiency but got the job done well
-- 3: Acceptable — got the answer but likely fetched too much or missed something
-- 2: Poor — response suggests wrong tools were used or critical data is missing
-- 1: Bad — response clearly lacks data that should have been fetched, or is completely off
-
-Respond with ONLY a number from 1 to 5.
 """
 
 RESPONSE_QUALITY_PROMPT = """\
@@ -108,9 +107,9 @@ Respond with ONLY a number from 1 to 5.
 
 # ── Judge function ───────────────────────────────────────────────
 
-def _judge(prompt: str, input_text: str, output_text: str) -> str:
+def _judge(prompt: str, **kwargs) -> str:
     """Call Gemini to judge a trace."""
-    filled = prompt.format(input=input_text, output=output_text)
+    filled = prompt.format(**kwargs)
     model = genai.GenerativeModel(model_name=JUDGE_MODEL)
     resp = model.generate_content(filled)
     return resp.text.strip()
@@ -122,7 +121,6 @@ def _extract_input(inputs: dict) -> str:
         return inputs["user_message"]
     if "message" in inputs:
         return inputs["message"]
-    # Fall back to stringifying the whole input
     return str(inputs)
 
 
@@ -139,13 +137,91 @@ def _extract_output(outputs: dict) -> str:
     return str(outputs)
 
 
-# ── Evaluator functions for client.evaluate() ────────────────────
+# ── Evaluators ───────────────────────────────────────────────────
 
-def hallucination_check(inputs: dict, outputs: dict, **kwargs) -> dict:
+def correctness_check(run: Run, example: Example) -> dict:
+    """Binary correctness: does the response satisfy the correctness criteria?"""
+    criteria = (example.outputs or {}).get("correctness_criteria", "")
+    if not criteria:
+        return {"key": "correctness", "score": 1, "comment": "no criteria defined"}
+
+    input_text = _extract_input(run.inputs or {})
+    output_text = _extract_output(run.outputs or {})
+    result = _judge(CORRECTNESS_PROMPT, input=input_text, output=output_text, criteria=criteria)
+    passed = result.strip().upper().startswith("PASS")
+    return {
+        "key": "correctness",
+        "score": 1 if passed else 0,
+        "comment": result,
+    }
+
+
+def trajectory_metrics(run: Run, example: Example) -> list[dict]:
+    """Compute trajectory efficiency metrics from trace metadata and example ideal trajectory."""
+    ideal = (example.outputs or {}).get("ideal_trajectory", {})
+    if not ideal:
+        return []
+
+    # Extract actual metrics from run metadata (set by Phase 1 instrumentation)
+    metadata = {}
+    if run.extra:
+        metadata = run.extra.get("metadata", {})
+
+    actual_steps = metadata.get("iteration_count", 0)
+    actual_tool_count = metadata.get("total_tool_calls", 0)
+    actual_tools = set(metadata.get("tool_sequence", []))
+
+    ideal_steps = ideal.get("ideal_step_count", 1)
+    ideal_tool_count = ideal.get("ideal_tool_count", 1)
+    required_tools = set(ideal.get("required_tools", []))
+    forbidden_tools = set(ideal.get("forbidden_tools", []))
+
+    results = []
+
+    # step_ratio: 1.0 = perfect, <1.0 means took more steps than ideal
+    if ideal_steps > 0 and actual_steps > 0:
+        step_ratio = actual_steps / ideal_steps
+        results.append({
+            "key": "step_ratio",
+            "score": min(1.0, 1.0 / step_ratio) if step_ratio > 0 else 0,
+            "comment": f"actual={actual_steps} ideal={ideal_steps} ratio={step_ratio:.2f}",
+        })
+
+    # tool_call_ratio: 1.0 = perfect, <1.0 means used more tools than ideal
+    if ideal_tool_count > 0 and actual_tool_count > 0:
+        tool_ratio = actual_tool_count / ideal_tool_count
+        results.append({
+            "key": "tool_call_ratio",
+            "score": min(1.0, 1.0 / tool_ratio) if tool_ratio > 0 else 0,
+            "comment": f"actual={actual_tool_count} ideal={ideal_tool_count} ratio={tool_ratio:.2f}",
+        })
+
+    # required_tools_hit: did the agent call all required tools?
+    if required_tools:
+        missing = required_tools - actual_tools
+        results.append({
+            "key": "required_tools_hit",
+            "score": 1.0 if not missing else 0.0,
+            "comment": f"missing={sorted(missing)}" if missing else "all required tools called",
+        })
+
+    # forbidden_tools_clean: did the agent avoid forbidden tools?
+    if forbidden_tools:
+        violated = forbidden_tools & actual_tools
+        results.append({
+            "key": "forbidden_tools_clean",
+            "score": 1.0 if not violated else 0.0,
+            "comment": f"violated={sorted(violated)}" if violated else "no forbidden tools called",
+        })
+
+    return results
+
+
+def hallucination_check(run: Run, example: Example) -> dict:
     """Score whether the response hallucinates data."""
-    input_text = _extract_input(inputs)
-    output_text = _extract_output(outputs)
-    result = _judge(HALLUCINATION_PROMPT, input_text, output_text)
+    input_text = _extract_input(run.inputs or {})
+    output_text = _extract_output(run.outputs or {})
+    result = _judge(HALLUCINATION_PROMPT, input=input_text, output=output_text)
     is_hallucination = "hallucination" in result.lower() and "no hallucination" not in result.lower()
     return {
         "key": "hallucination",
@@ -154,66 +230,72 @@ def hallucination_check(inputs: dict, outputs: dict, **kwargs) -> dict:
     }
 
 
-def tool_efficiency(inputs: dict, outputs: dict, **kwargs) -> dict:
-    """Score tool usage efficiency 1-5."""
-    input_text = _extract_input(inputs)
-    output_text = _extract_output(outputs)
-    result = _judge(TOOL_EFFICIENCY_PROMPT, input_text, output_text)
-    match = re.search(r"[1-5]", result)
-    score = int(match.group()) if match else 3
-    return {
-        "key": "tool_efficiency",
-        "score": score / 5.0,  # normalize to 0-1 for LangSmith
-        "comment": f"Score: {score}/5",
-    }
-
-
-def response_quality(inputs: dict, outputs: dict, **kwargs) -> dict:
+def response_quality(run: Run, example: Example) -> dict:
     """Score response quality 1-5."""
-    input_text = _extract_input(inputs)
-    output_text = _extract_output(outputs)
-    result = _judge(RESPONSE_QUALITY_PROMPT, input_text, output_text)
+    input_text = _extract_input(run.inputs or {})
+    output_text = _extract_output(run.outputs or {})
+    result = _judge(RESPONSE_QUALITY_PROMPT, input=input_text, output=output_text)
     match = re.search(r"[1-5]", result)
     score = int(match.group()) if match else 3
     return {
         "key": "response_quality",
-        "score": score / 5.0,  # normalize to 0-1 for LangSmith
+        "score": score / 5.0,
         "comment": f"Score: {score}/5",
     }
 
 
 # ── Main ─────────────────────────────────────────────────────────
 
-def run_evals(prefix: str = "momo-eval", limit: int | None = None):
+def run_evals(prefix: str = "momo-eval", limit: int | None = None,
+              dataset: str = "golden", category: str | None = None):
     """Run all evaluators against the dataset."""
+
+    dataset_name = GOLDEN_DATASET if dataset == "golden" else PROD_DATASET
 
     # Verify dataset exists
     try:
-        dataset = client.read_dataset(dataset_name=DATASET_NAME)
+        ds = client.read_dataset(dataset_name=dataset_name)
     except Exception:
-        print(f"Dataset '{DATASET_NAME}' not found.")
-        print("Send some messages to Momo first — the automation will populate the dataset.")
-        raise SystemExit("dataset not found or empty")
+        print(f"Dataset '{dataset_name}' not found.")
+        if dataset == "golden":
+            print("Run: python scripts/seed_eval_dataset.py")
+        else:
+            print("Send some messages to Momo first — the automation will populate the dataset.")
+        raise SystemExit(1)
 
-    example_count = client.list_examples(dataset_id=dataset.id)
-    examples = list(example_count)
+    # Fetch examples, optionally filtered by category split
+    if category:
+        examples = list(client.list_examples(dataset_id=ds.id, splits=[category]))
+    else:
+        examples = list(client.list_examples(dataset_id=ds.id))
+
+    if limit:
+        examples = examples[:limit]
     total = len(examples)
 
     if total == 0:
-        print(f"Dataset '{DATASET_NAME}' is empty. Send some messages to Momo first.")
-        raise SystemExit("dataset not found or empty")
+        print(f"No examples found in '{dataset_name}'"
+              + (f" for category '{category}'" if category else "") + ".")
+        raise SystemExit(1)
 
-    eval_count = min(limit, total) if limit else total
-    print(f"Dataset: {DATASET_NAME} ({total} examples, evaluating {eval_count})")
-    print(f"Judge model: {JUDGE_MODEL}")
-    print(f"Experiment prefix: {prefix}")
-    print(f"Evaluators: hallucination, tool_efficiency, response_quality")
+    # Determine which evaluators to run based on dataset type
+    evaluators = [hallucination_check, response_quality]
+    evaluator_names = ["hallucination", "response_quality"]
+
+    if dataset == "golden":
+        evaluators = [correctness_check, trajectory_metrics, hallucination_check, response_quality]
+        evaluator_names = ["correctness", "trajectory", "hallucination", "response_quality"]
+
+    print(f"Dataset:    {dataset_name} ({total} examples)")
+    if category:
+        print(f"Category:   {category}")
+    print(f"Judge:      {JUDGE_MODEL}")
+    print(f"Prefix:     {prefix}")
+    print(f"Evaluators: {', '.join(evaluator_names)}")
     print()
 
-    # Define the target function — just returns the existing outputs
-    # (we're evaluating existing data, not re-running the agent)
+    # Passthrough target — returns existing outputs (we're evaluating stored data)
     def passthrough(inputs: dict) -> dict:
-        # Find the matching example to return its stored output
         for ex in examples:
             if ex.inputs == inputs:
                 return ex.outputs or {}
@@ -221,23 +303,29 @@ def run_evals(prefix: str = "momo-eval", limit: int | None = None):
 
     results = client.evaluate(
         passthrough,
-        data=DATASET_NAME,
-        evaluators=[hallucination_check, tool_efficiency, response_quality],
+        data=dataset_name if not category else examples,
+        evaluators=evaluators,
         experiment_prefix=prefix,
         max_concurrency=4,
     )
 
-    # Collect results before they're consumed by the iterator
     collected_results = list(results)
 
-    print("\nDone! View results at: https://smith.langchain.com")
-    print(f"Look for experiment: {prefix}")
+    print(f"\nDone! View results at: https://smith.langchain.com")
+    print(f"Experiment: {prefix}")
 
-    # Print summary
+    # ── Summary ──────────────────────────────────────────────
     print("\n── Summary ─────────────────────────────────")
-    hallucination_scores = []
-    efficiency_scores = []
-    quality_scores = []
+
+    scores = {
+        "correctness": [],
+        "hallucination": [],
+        "response_quality": [],
+        "step_ratio": [],
+        "tool_call_ratio": [],
+        "required_tools_hit": [],
+        "forbidden_tools_clean": [],
+    }
 
     for result in collected_results:
         eval_results = getattr(result, "evaluation_results", None)
@@ -247,29 +335,58 @@ def run_evals(prefix: str = "momo-eval", limit: int | None = None):
         for ev_result in result_list:
             key = getattr(ev_result, "key", "")
             score = getattr(ev_result, "score", None)
-            if score is None:
-                continue
-            if key == "hallucination":
-                hallucination_scores.append(score)
-            elif key == "tool_efficiency":
-                efficiency_scores.append(score * 5)
-            elif key == "response_quality":
-                quality_scores.append(score * 5)
+            if score is not None and key in scores:
+                scores[key].append(score)
 
-    if hallucination_scores:
-        clean = sum(1 for s in hallucination_scores if s == 1)
-        print(f"  Hallucination:    {clean}/{len(hallucination_scores)} clean ({clean/len(hallucination_scores)*100:.0f}%)")
-    if efficiency_scores:
-        avg = sum(efficiency_scores) / len(efficiency_scores)
-        print(f"  Tool Efficiency:  {avg:.1f}/5 avg")
-    if quality_scores:
-        avg = sum(quality_scores) / len(quality_scores)
-        print(f"  Response Quality: {avg:.1f}/5 avg")
+    # Correctness (binary)
+    if scores["correctness"]:
+        passed = sum(1 for s in scores["correctness"] if s == 1)
+        total_c = len(scores["correctness"])
+        print(f"  Correctness:         {passed}/{total_c} pass ({passed/total_c*100:.0f}%)")
+
+    # Hallucination (binary)
+    if scores["hallucination"]:
+        clean = sum(1 for s in scores["hallucination"] if s == 1)
+        total_h = len(scores["hallucination"])
+        print(f"  Hallucination:       {clean}/{total_h} clean ({clean/total_h*100:.0f}%)")
+
+    # Trajectory metrics
+    if scores["step_ratio"]:
+        avg = sum(scores["step_ratio"]) / len(scores["step_ratio"])
+        print(f"  Step Ratio:          {avg:.2f} avg (1.0 = ideal)")
+
+    if scores["tool_call_ratio"]:
+        avg = sum(scores["tool_call_ratio"]) / len(scores["tool_call_ratio"])
+        print(f"  Tool Call Ratio:     {avg:.2f} avg (1.0 = ideal)")
+
+    if scores["required_tools_hit"]:
+        hit = sum(1 for s in scores["required_tools_hit"] if s == 1)
+        total_r = len(scores["required_tools_hit"])
+        print(f"  Required Tools Hit:  {hit}/{total_r} ({hit/total_r*100:.0f}%)")
+
+    if scores["forbidden_tools_clean"]:
+        clean = sum(1 for s in scores["forbidden_tools_clean"] if s == 1)
+        total_f = len(scores["forbidden_tools_clean"])
+        print(f"  Forbidden Avoided:   {clean}/{total_f} ({clean/total_f*100:.0f}%)")
+
+    # Response quality (1-5)
+    if scores["response_quality"]:
+        avg = sum(scores["response_quality"]) * 5 / len(scores["response_quality"])
+        print(f"  Response Quality:    {avg:.1f}/5 avg")
+
+    # Solve rate: correctness-weighted across all examples
+    if scores["correctness"]:
+        solve_rate = sum(scores["correctness"]) / len(scores["correctness"])
+        print(f"\n  Solve Rate:          {solve_rate*100:.0f}%")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run LangSmith evals on Momo traces")
+    parser = argparse.ArgumentParser(description="Run LangSmith evals on Momo")
     parser.add_argument("--prefix", default="momo-eval", help="Experiment name prefix")
     parser.add_argument("--limit", type=int, default=None, help="Max examples to evaluate")
+    parser.add_argument("--dataset", choices=["golden", "prod"], default="golden",
+                        help="Dataset to evaluate: golden (curated) or prod (production traces)")
+    parser.add_argument("--category", default=None,
+                        help="Filter by category split (calendar, retrieval, tool_use, memory, conversation, multi_tool)")
     args = parser.parse_args()
-    run_evals(prefix=args.prefix, limit=args.limit)
+    run_evals(prefix=args.prefix, limit=args.limit, dataset=args.dataset, category=args.category)

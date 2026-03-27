@@ -15,7 +15,10 @@ from datetime import datetime, timedelta
 import google.generativeai as genai
 
 import config
-from langsmith_config import traceable, traced_chat_send, set_trace_metadata, _get_run_tree
+from langsmith_config import (
+    traceable, traced_chat_send, set_trace_metadata, _get_run_tree,
+    add_trace_tags, log_eval_failure,
+)
 
 genai.configure(api_key=config.GEMINI_API_KEY)
 
@@ -36,6 +39,21 @@ _TOOL_TIMEOUTS = {
     "get_jira_tickets": 12,
     "get_jira_issue": 12,
     "search_jira_tickets": 12,
+    "remember_this": 5,
+    "forget_this": 10,
+}
+
+# ── Behavior categories for eval tagging ─────────────────────
+# Maps category name → set of tools. A trace is tagged with a category
+# if any of that category's tools were called during the agent loop.
+
+_TOOL_CATEGORIES = {
+    "calendar": {"get_todays_calendar", "get_calendar_for_date"},
+    "tool_use": {"create_task", "update_task", "complete_task", "delete_task"},
+    "retrieval": {"get_recent_emails", "search_emails", "search_knowledge_graph",
+                  "get_meeting_notes", "search_jira_tickets"},
+    "memory": {"search_knowledge_graph", "remember_this", "forget_this"},
+    "jira": {"get_jira_tickets", "get_jira_issue", "search_jira_tickets"},
 }
 
 # ── Schema helper ────────────────────────────────────────────
@@ -233,6 +251,48 @@ def _build_optional_tools() -> list:
             }),
         ))
 
+    if config.USER_MEMORY_ENABLED:
+        extra_decls.append(genai.protos.FunctionDeclaration(
+            name="remember_this",
+            description=(
+                "Store a user correction or preference for future conversations. "
+                "Use when the user corrects you, states a preference, or asks you "
+                "to remember something."
+            ),
+            parameters=_schema({
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "Clear, concise statement of what to remember",
+                    },
+                    "memory_type": {
+                        "type": "string",
+                        "description": "Type: 'correction', 'preference', or 'fact'",
+                    },
+                },
+                "required": ["content"],
+            }),
+        ))
+        extra_decls.append(genai.protos.FunctionDeclaration(
+            name="forget_this",
+            description=(
+                "Remove a previously stored memory. Use when the user says "
+                "'forget that...', 'never mind about...', or wants to undo "
+                "a remembered preference or correction."
+            ),
+            parameters=_schema({
+                "type": "object",
+                "properties": {
+                    "content_hint": {
+                        "type": "string",
+                        "description": "Description of which memory to forget (fuzzy match)",
+                    },
+                },
+                "required": ["content_hint"],
+            }),
+        ))
+
     if not extra_decls:
         return []
     return [genai.protos.Tool(function_declarations=extra_decls)]
@@ -246,14 +306,16 @@ def _get_all_tools() -> list:
 
 
 @traceable(run_type="tool", name="agent-tool")
-def execute_tool(name: str, args: dict, pending_task_actions: list[dict] | None = None) -> str:
+def execute_tool(name: str, args: dict, pending_task_actions: list[dict] | None = None,
+                 user_id: str | None = None, user_message: str | None = None) -> str:
     """Dispatch a tool call to the appropriate service function.
 
     Returns a string result for the agent to consume, or an error message.
     """
     t0 = time.time()
     try:
-        result = _dispatch(name, args, pending_task_actions=pending_task_actions)
+        result = _dispatch(name, args, pending_task_actions=pending_task_actions,
+                           user_id=user_id, user_message=user_message)
         elapsed = time.time() - t0
         print(f"[agent] tool '{name}': {elapsed:.2f}s ({len(result)} chars)")
         return result
@@ -263,7 +325,8 @@ def execute_tool(name: str, args: dict, pending_task_actions: list[dict] | None 
         return f"Error calling {name}: {str(exc)}"
 
 
-def _dispatch(name: str, args: dict, pending_task_actions: list[dict] | None = None) -> str:
+def _dispatch(name: str, args: dict, pending_task_actions: list[dict] | None = None,
+              user_id: str | None = None, user_message: str | None = None) -> str:
     """Route a tool call to the correct service function."""
 
     if name == "get_todays_calendar":
@@ -346,12 +409,43 @@ def _dispatch(name: str, args: dict, pending_task_actions: list[dict] | None = N
         from jira_service import search_jira_tickets
         return search_jira_tickets(args["query"]) or "No matching Jira tickets found."
 
+    if name == "remember_this":
+        from user_memory import add_memory
+        result = add_memory(
+            user_id=user_id or "unknown",
+            content=args["content"],
+            memory_type=args.get("memory_type", "preference"),
+            source_message=user_message or "",
+        )
+        return json.dumps(result)
+
+    if name == "forget_this":
+        from user_memory import remove_memory
+        result = remove_memory(
+            user_id=user_id or "unknown",
+            content_hint=args["content_hint"],
+        )
+        if result:
+            return json.dumps(result)
+        return json.dumps({"status": "not_found", "message": "No matching memory found."})
+
     return f"Unknown tool: {name}"
 
 
 # ── Agent system prompt ──────────────────────────────────────
 
 _OWNER_LINE = f"\nYou are {config.OWNER_NAME}'s personal AI assistant. Always address them by name when it fits naturally.\n" if config.OWNER_NAME else ""
+
+_MEMORY_SECTION = """
+=== USER MEMORY ===
+You can remember things about the user across conversations using the remember_this and forget_this tools.
+When the user corrects you ("no, actually...", "that's wrong...") or asks you to remember something ("remember that I prefer..."), use remember_this to store it.
+When the user asks you to forget something ("forget that...", "never mind about..."), use forget_this.
+User memories are automatically loaded into every conversation in the [USER MEMORIES] block — always respect them.
+Don't over-remember. Only store clear corrections, preferences, or important facts the user wants you to retain. Don't store passing comments or one-time requests.
+Briefly confirm when you store or forget a memory.
+If the user asks what you remember about them, summarize the memories from the [USER MEMORIES] block.
+""" if config.USER_MEMORY_ENABLED else ""
 
 AGENT_SYSTEM_PROMPT = f"""You are Momo, a chill, sharp, and low-key hilarious AI assistant living inside Google Chat. You talk like someone's most competent friend — the one who's somehow always got the answer but never makes it weird.
 {_OWNER_LINE}
@@ -385,7 +479,7 @@ Never say a task was already created, updated, completed, or deleted before appr
 When a tool returns an error, tell the user naturally — don't retry endlessly.
 
 The search_knowledge_graph tool searches across ALL of Momo's memory — meetings, emails, calendar events, tasks, chat history, and Granola notes. Use it for any "what happened", "what did we discuss", "who said what", "what was decided" type questions.
-
+{_MEMORY_SECTION}
 === WHAT YOU DON'T DO ===
 You don't talk like a corporate FAQ page. Ever.
 You don't over-explain or repeat yourself.
@@ -437,7 +531,7 @@ Keep responses scannable. Google Chat supports *bold* and basic formatting. Use 
 # ── Agent loop ───────────────────────────────────────────────
 
 
-def _build_history(conversation_history: list[dict]) -> list[dict]:
+def _build_history(conversation_history: list[dict], user_memories_context: str = "") -> list[dict]:
     """Convert stored conversation history to Gemini chat format."""
     from datetime import timedelta as _td
 
@@ -459,6 +553,10 @@ def _build_history(conversation_history: list[dict]) -> list[dict]:
         {"role": "model", "parts": ["got it, i know the date. what's up?"]},
     ]
 
+    if user_memories_context:
+        history.append({"role": "user", "parts": [user_memories_context]})
+        history.append({"role": "model", "parts": ["got it, i'll keep those in mind."]})
+
     recent = conversation_history[-20:] if len(conversation_history) > 20 else conversation_history
     for turn in recent:
         role = "model" if turn["role"] == "assistant" else "user"
@@ -467,10 +565,34 @@ def _build_history(conversation_history: list[dict]) -> list[dict]:
     return history
 
 
+def _flush_trace_metrics(metrics: dict, t0: float):
+    """Write accumulated trajectory metrics to the current LangSmith trace."""
+    elapsed = time.time() - t0
+    set_trace_metadata(
+        iteration_count=metrics["iteration_count"],
+        total_tool_calls=metrics["total_tool_calls"],
+        unique_tools=list(metrics["unique_tools"]),
+        tool_sequence=metrics["tool_names"],
+        total_latency_s=round(elapsed, 3),
+        tool_details=metrics["tool_calls"],
+        errors=metrics["errors"],
+    )
+    # Auto-tag the trace with behavior categories based on tools used
+    behavior_tags = set()
+    for category, tool_set in _TOOL_CATEGORIES.items():
+        if metrics["unique_tools"] & tool_set:
+            behavior_tags.add(category)
+    if len(metrics["unique_tools"]) >= 3:
+        behavior_tags.add("multi_tool")
+    if behavior_tags:
+        add_trace_tags(*behavior_tags)
+
+
 @traceable(name="agent-loop", tags=["chat", "user-initiated"])
 def run_agent_loop(user_message: str, conversation_history: list[dict],
                    max_iterations: int = 6,
-                   thread_id: str | None = None) -> tuple[str, list[dict]]:
+                   thread_id: str | None = None,
+                   user_id: str | None = None) -> tuple[str, list[dict]]:
     """Run the agentic tool-use loop.
 
     Sends the user message to Gemini with tool declarations.  If Gemini
@@ -488,11 +610,30 @@ def run_agent_loop(user_message: str, conversation_history: list[dict],
         tools=tools,
     )
 
-    history = _build_history(conversation_history)
+    # Load user memories for context injection
+    user_memories_context = ""
+    if config.USER_MEMORY_ENABLED and user_id:
+        try:
+            from user_memory import get_user_memories, format_memories_for_context
+            memories = get_user_memories(user_id)
+            user_memories_context = format_memories_for_context(memories)
+        except Exception as exc:
+            print(f"[agent] failed to load user memories: {exc}")
+
+    history = _build_history(conversation_history, user_memories_context=user_memories_context)
     chat = model.start_chat(history=history)
 
     t0 = time.time()
     print(f"[agent] starting loop (max_iterations={max_iterations})")
+
+    _trace_metrics = {
+        "iteration_count": 0,
+        "tool_calls": [],       # list of {"name", "elapsed_s", "success"}
+        "tool_names": [],       # ordered tool names called
+        "total_tool_calls": 0,
+        "unique_tools": set(),
+        "errors": [],
+    }
 
     pending_task_actions: list[dict] = []
 
@@ -501,9 +642,13 @@ def run_agent_loop(user_message: str, conversation_history: list[dict],
     except Exception as exc:
         print(f"[agent] initial send failed: {exc}")
         traceback.print_exc()
+        _trace_metrics["errors"].append(f"initial_send: {exc}")
+        _flush_trace_metrics(_trace_metrics, t0)
         return "sorry, something went wrong talking to gemini — try again in a sec?", pending_task_actions
 
     for iteration in range(max_iterations):
+        _trace_metrics["iteration_count"] = iteration + 1
+
         candidate = response.candidates[0] if response.candidates else None
         if not candidate:
             break
@@ -516,6 +661,7 @@ def run_agent_loop(user_message: str, conversation_history: list[dict],
             if text_parts:
                 final = "\n".join(text_parts)
                 print(f"[agent] done in {iteration + 1} iteration(s), {time.time() - t0:.2f}s total")
+                _flush_trace_metrics(_trace_metrics, t0)
                 return final, pending_task_actions
             break
 
@@ -538,17 +684,36 @@ def run_agent_loop(user_message: str, conversation_history: list[dict],
                         _PARENT_RUN_TREE.set(rt)
                     except (ImportError, AttributeError):
                         pass
-                return execute_tool(name, args, pending)
+                return execute_tool(name, args, pending,
+                                    user_id=user_id, user_message=user_message)
 
+            _tool_t0 = time.time()
+            tool_success = True
             try:
                 with ThreadPoolExecutor(max_workers=1) as pool:
                     future = pool.submit(_run_tool, fc.name, dict(fc.args), pending_task_actions)
                     result_str = future.result(timeout=timeout)
+                    if result_str.startswith(("Tool '", "Error calling")):
+                        tool_success = False
             except FuturesTimeoutError:
                 result_str = f"Tool '{fc.name}' timed out after {timeout}s"
                 print(f"[agent] tool '{fc.name}' timed out")
+                tool_success = False
+                _trace_metrics["errors"].append(f"timeout: {fc.name}")
             except Exception as exc:
                 result_str = f"Tool '{fc.name}' failed: {str(exc)}"
+                tool_success = False
+                _trace_metrics["errors"].append(f"exception: {fc.name}: {exc}")
+
+            # Record tool metrics for trajectory evaluation
+            _trace_metrics["tool_calls"].append({
+                "name": fc.name,
+                "elapsed_s": round(time.time() - _tool_t0, 3),
+                "success": tool_success,
+            })
+            _trace_metrics["tool_names"].append(fc.name)
+            _trace_metrics["unique_tools"].add(fc.name)
+            _trace_metrics["total_tool_calls"] += 1
 
             tool_responses.append(
                 genai.protos.Part(
@@ -566,6 +731,8 @@ def run_agent_loop(user_message: str, conversation_history: list[dict],
             response = traced_chat_send(chat, tool_responses, model_name=config.GEMINI_MODEL_FLASH, iteration=iteration + 1)
         except Exception as exc:
             print(f"[agent] send_message failed on iteration {iteration + 1}: {exc}")
+            _trace_metrics["errors"].append(f"send_message: {exc}")
+            _flush_trace_metrics(_trace_metrics, t0)
             if text_parts:
                 return "\n".join(text_parts), pending_task_actions
             return "sorry, hit a snag pulling your data — try again?", pending_task_actions
@@ -581,5 +748,17 @@ def run_agent_loop(user_message: str, conversation_history: list[dict],
 
     elapsed = time.time() - t0
     print(f"[agent] loop ended after {max_iterations} iterations, {elapsed:.2f}s total")
+
+    _flush_trace_metrics(_trace_metrics, t0)
+
+    # Log exhausted loops as eval failure candidates
+    if not final_text:
+        log_eval_failure(
+            user_message=user_message,
+            expected_behavior="Agent should produce a text response",
+            actual_behavior=f"Exhausted {max_iterations} iterations without text response. "
+                            f"Tools called: {_trace_metrics['tool_names']}",
+            category="agent_loop_exhaustion",
+        )
 
     return final_text or "i pulled a lot of info but couldn't put it together — try asking differently?", pending_task_actions

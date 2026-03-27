@@ -337,6 +337,23 @@ async def trigger_evals():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/promote-eval-failures")
+async def trigger_promote_eval_failures():
+    """Auto-promote staged production failures to the eval regression dataset.
+
+    Reads pending failures from Firestore eval_failures collection and adds
+    them to the momo-eval-golden dataset for regression testing."""
+    try:
+        from scripts.promote_failures_to_evals import auto_promote
+        result = auto_promote()
+        return {"status": "ok", **result}
+    except SystemExit:
+        return {"status": "skipped", "reason": "dataset not found"}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ── Granola Token Refresh ────────────────────────────────────
 
 @app.post("/granola-token-refresh")
@@ -1124,7 +1141,7 @@ def _process_message_background(text, user_id, space, audio_attachments=None):
         pending_task_actions = []
         if config.AGENTIC_MODE_ENABLED:
             from agent import run_agent_loop
-            response, pending_task_actions = run_agent_loop(text, history, thread_id=conversation_id)
+            response, pending_task_actions = run_agent_loop(text, history, thread_id=conversation_id, user_id=user_id)
             if pending_task_actions:
                 pending_scope_id = _user_task_scope(user_id, space)
                 approval_response = _append_task_approval_block(response, pending_task_actions)
