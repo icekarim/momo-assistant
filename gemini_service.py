@@ -403,6 +403,7 @@ def chat_response(user_message, conversation_history, context_data, thread_id=No
     def _do_send():
         return traced_chat_send(chat, user_message, model_name=model_name)
 
+    _fallback_used = False
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(_do_send)
@@ -412,6 +413,7 @@ def chat_response(user_message, conversation_history, context_data, thread_id=No
     except FuturesTimeoutError:
         print(f"Gemini {complexity.value} timed out after {timeout_s}s")
         if complexity == TaskComplexity.DEEP:
+            _fallback_used = True
             fallback_model = _get_model(TaskComplexity.STANDARD)
             fallback_chat = fallback_model.start_chat(history=history)
             fallback_timeout = TIER_TIMEOUTS[TaskComplexity.STANDARD]
@@ -423,6 +425,7 @@ def chat_response(user_message, conversation_history, context_data, thread_id=No
         return "sorry, that took way too long — try again in a sec? (gemini was slow)"
     except Exception as e:
         if complexity == TaskComplexity.DEEP:
+            _fallback_used = True
             print(f"Pro model failed ({e}), falling back to Flash")
             fallback_model = _get_model(TaskComplexity.STANDARD)
             fallback_chat = fallback_model.start_chat(history=history)
@@ -438,6 +441,13 @@ def chat_response(user_message, conversation_history, context_data, thread_id=No
         raise
     finally:
         elapsed = time.time() - start
+        set_trace_metadata(
+            model_used=model_name,
+            complexity_tier=complexity.value,
+            total_latency_s=round(elapsed, 3),
+            context_length_chars=len(context_block),
+            fallback_used=_fallback_used,
+        )
         if elapsed > 30:
             print(f"Slow chat_response: {elapsed:.1f}s (tier: {complexity.value})")
 
