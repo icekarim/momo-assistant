@@ -160,7 +160,7 @@ def trajectory_metrics(run: Run, example: Example) -> list[dict]:
     """Compute trajectory efficiency metrics from trace metadata and example ideal trajectory."""
     ideal = (example.outputs or {}).get("ideal_trajectory", {})
     if not ideal:
-        return []
+        return {"key": "trajectory", "score": True, "comment": "no ideal trajectory defined — skipped"}
 
     # Extract actual metrics from run metadata (set by Phase 1 instrumentation)
     metadata = {}
@@ -214,6 +214,8 @@ def trajectory_metrics(run: Run, example: Example) -> list[dict]:
             "comment": f"violated={sorted(violated)}" if violated else "no forbidden tools called",
         })
 
+    if not results:
+        return {"key": "trajectory", "score": True, "comment": "no trajectory data — skipped"}
     return results
 
 
@@ -328,13 +330,13 @@ def run_evals(prefix: str = "momo-eval", limit: int | None = None,
     }
 
     for result in collected_results:
-        eval_results = getattr(result, "evaluation_results", None)
+        eval_results = result.get("evaluation_results") if isinstance(result, dict) else getattr(result, "evaluation_results", None)
         if eval_results is None:
             continue
-        result_list = getattr(eval_results, "results", None) or []
-        for ev_result in result_list:
-            key = getattr(ev_result, "key", "")
-            score = getattr(ev_result, "score", None)
+        result_list = eval_results.get("results") if isinstance(eval_results, dict) else getattr(eval_results, "results", None)
+        for ev_result in (result_list or []):
+            key = ev_result.key if hasattr(ev_result, "key") else ev_result.get("key", "")
+            score = ev_result.score if hasattr(ev_result, "score") else ev_result.get("score")
             if score is not None and key in scores:
                 scores[key].append(score)
 
