@@ -349,6 +349,7 @@ def _store_entries(entries: list[dict], source_type: str, source_id: str,
         try:
             text = _build_embedding_text(entry, source_type=source_type)
             doc["embedding"] = _get_embedding(text)
+            doc["embedding_model"] = config.GEMINI_EMBEDDING_MODEL
         except Exception as exc:
             print(f"  Knowledge graph: embedding generation failed ({exc}), storing without")
         collection.add(doc)
@@ -843,28 +844,42 @@ def semantic_search(query: str, limit: int | None = None,
     return [indexed_entities[i] for i in top_indices]
 
 
-def embed_backfill() -> dict:
-    """Add embeddings to existing KG entities that don't have one.
+def embed_backfill(include_stale: bool = False) -> dict:
+    """Add embeddings to KG entities that are missing or stale.
 
-    Returns counts of updated and skipped entities.
+    Args:
+        include_stale: If True, also re-embed entities whose embedding_model
+                       doesn't match the current config.GEMINI_EMBEDDING_MODEL.
+
+    Returns counts of updated, skipped, re-embedded, and failed entities.
     """
     import time as _time
 
     db = get_db()
     docs = list(db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION).stream())
+    current_model = config.GEMINI_EMBEDDING_MODEL
 
-    updated, skipped, failed = 0, 0, 0
+    updated, skipped, reembedded, failed = 0, 0, 0, 0
     for doc in docs:
         data = doc.to_dict()
-        if "embedding" in data:
+        has_embedding = "embedding" in data
+        is_stale = has_embedding and data.get("embedding_model") != current_model
+
+        if has_embedding and not (include_stale and is_stale):
             skipped += 1
             continue
 
         try:
             text = _build_embedding_text(data, source_type=data.get("source_type", ""))
             embedding = _get_embedding(text)
-            doc.reference.update({"embedding": embedding})
-            updated += 1
+            doc.reference.update({
+                "embedding": embedding,
+                "embedding_model": current_model,
+            })
+            if is_stale:
+                reembedded += 1
+            else:
+                updated += 1
         except Exception as exc:
             print(f"  Embed backfill failed for {doc.id}: {exc}")
             failed += 1
@@ -873,8 +888,51 @@ def embed_backfill() -> dict:
     with _embedding_cache_lock:
         _embedding_cache.clear()
 
-    print(f"Embed backfill: {updated} updated, {skipped} already had embeddings, {failed} failed")
-    return {"updated": updated, "skipped": skipped, "failed": failed}
+    print(f"Embed backfill: {updated} new, {reembedded} re-embedded, {skipped} skipped, {failed} failed")
+    return {"updated": updated, "reembedded": reembedded, "skipped": skipped, "failed": failed}
+
+
+def embedding_health() -> dict:
+    """Return coverage stats for the embedding system."""
+    db = get_db()
+    docs = list(db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION).stream())
+
+    total = len(docs)
+    with_embedding = 0
+    without_embedding = 0
+    model_counts: dict[str, int] = {}
+    oldest_at = None
+    newest_at = None
+
+    for doc in docs:
+        data = doc.to_dict()
+        if data.get("embedding"):
+            with_embedding += 1
+            model = data.get("embedding_model", "unknown")
+            model_counts[model] = model_counts.get(model, 0) + 1
+            extracted = data.get("extracted_at")
+            if extracted:
+                if oldest_at is None or extracted < oldest_at:
+                    oldest_at = extracted
+                if newest_at is None or extracted > newest_at:
+                    newest_at = extracted
+        else:
+            without_embedding += 1
+
+    stale = total - model_counts.get(config.GEMINI_EMBEDDING_MODEL, 0) - without_embedding
+    coverage_pct = round(with_embedding / total * 100, 1) if total else 0
+
+    return {
+        "total_entities": total,
+        "with_embedding": with_embedding,
+        "without_embedding": without_embedding,
+        "coverage_pct": coverage_pct,
+        "current_model": config.GEMINI_EMBEDDING_MODEL,
+        "model_breakdown": model_counts,
+        "stale_model_count": stale,
+        "oldest_entity": oldest_at,
+        "newest_entity": newest_at,
+    }
 
 
 def search_index_backfill() -> dict:

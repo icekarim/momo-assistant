@@ -392,16 +392,26 @@ async def trigger_knowledge_backfill():
     return {"status": "started", "message": "backfill running in background, check logs for progress"}
 
 
+@app.get("/embedding-health")
+async def get_embedding_health():
+    """Return coverage stats for the embedding system."""
+    if not config.KNOWLEDGE_GRAPH_ENABLED:
+        return {"status": "skipped", "reason": "knowledge graph disabled"}
+    from knowledge_graph import embedding_health
+    return embedding_health()
+
+
 @app.post("/knowledge-embed-backfill")
-async def trigger_embed_backfill():
+async def trigger_embed_backfill(include_stale: bool = False):
     """Add vector embeddings to existing KG entities that don't have one.
+    Pass ?include_stale=true to also re-embed entities on an older model.
     Returns immediately and processes in a background thread."""
     if not config.KNOWLEDGE_GRAPH_ENABLED:
         return {"status": "skipped", "reason": "knowledge graph disabled"}
 
     def _run():
         from knowledge_graph import embed_backfill
-        embed_backfill()
+        embed_backfill(include_stale=include_stale)
 
     thread = threading.Thread(target=_run, daemon=True)
     thread.start()
