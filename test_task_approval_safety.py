@@ -156,5 +156,149 @@ class TestTaskApprovalSafety(unittest.TestCase):
         thread_instance.start.assert_called_once()
 
 
+class TestParsePendingTaskReply(unittest.TestCase):
+    """Unit tests for the pending-task reply parser, covering semantic
+    inversion (''no just X''), decline action verbs, keep-only patterns,
+    and compound-word fuzzy matching."""
+
+    ACTIONS = [
+        {"action": "create", "title": "Send Foot Locker SDK secret and key"},
+        {"action": "create", "title": "Ask Maggie about ClientA support"},
+    ]
+
+    # --- Exact approve / decline ---
+
+    def test_yes_approves_all(self):
+        result = main._parse_pending_task_reply("yes", self.ACTIONS)
+        self.assertEqual(result["intent"], "confirm")
+        self.assertEqual(result["selected_indices"], {0, 1})
+        self.assertFalse(result["dismiss_rest"])
+
+    def test_no_declines_all(self):
+        result = main._parse_pending_task_reply("no", self.ACTIONS)
+        self.assertEqual(result["intent"], "decline")
+        self.assertEqual(result["selected_indices"], {0, 1})
+
+    # --- Semantic inversion: "no just X" keeps only X ---
+
+    def test_no_just_the_maggie_task(self):
+        result = main._parse_pending_task_reply(
+            "no just the maggie task", self.ACTIONS
+        )
+        self.assertEqual(result["intent"], "confirm")
+        self.assertEqual(result["selected_indices"], {1})
+        self.assertTrue(result["dismiss_rest"])
+
+    def test_no_only_the_maggie_task(self):
+        result = main._parse_pending_task_reply(
+            "no only the maggie task", self.ACTIONS
+        )
+        self.assertEqual(result["intent"], "confirm")
+        self.assertEqual(result["selected_indices"], {1})
+        self.assertTrue(result["dismiss_rest"])
+
+    def test_no_keep_the_maggie_task(self):
+        result = main._parse_pending_task_reply(
+            "no, keep the maggie task", self.ACTIONS
+        )
+        self.assertEqual(result["intent"], "confirm")
+        self.assertEqual(result["selected_indices"], {1})
+        self.assertTrue(result["dismiss_rest"])
+
+    # --- Decline action verbs ---
+
+    def test_dont_need_the_footlocker_task(self):
+        result = main._parse_pending_task_reply(
+            "dont need the footlocker task", self.ACTIONS
+        )
+        self.assertEqual(result["intent"], "decline")
+        self.assertEqual(result["selected_indices"], {0})
+
+    def test_drop_the_footlocker_task(self):
+        result = main._parse_pending_task_reply(
+            "drop the foot locker task", self.ACTIONS
+        )
+        self.assertEqual(result["intent"], "decline")
+        self.assertEqual(result["selected_indices"], {0})
+
+    def test_remove_foot_locker(self):
+        result = main._parse_pending_task_reply(
+            "remove the foot locker one", self.ACTIONS
+        )
+        self.assertEqual(result["intent"], "decline")
+        self.assertEqual(result["selected_indices"], {0})
+
+    def test_get_rid_of_footlocker(self):
+        result = main._parse_pending_task_reply(
+            "get rid of the footlocker task", self.ACTIONS
+        )
+        self.assertEqual(result["intent"], "decline")
+        self.assertEqual(result["selected_indices"], {0})
+
+    # --- Keep-only standalone patterns ---
+
+    def test_just_the_maggie_task(self):
+        result = main._parse_pending_task_reply(
+            "just the maggie task", self.ACTIONS
+        )
+        self.assertEqual(result["intent"], "confirm")
+        self.assertEqual(result["selected_indices"], {1})
+        self.assertTrue(result["dismiss_rest"])
+
+    def test_keep_the_maggie_task(self):
+        result = main._parse_pending_task_reply(
+            "keep the maggie task", self.ACTIONS
+        )
+        self.assertEqual(result["intent"], "confirm")
+        self.assertEqual(result["selected_indices"], {1})
+        self.assertTrue(result["dismiss_rest"])
+
+    def test_only_the_maggie_task(self):
+        result = main._parse_pending_task_reply(
+            "only the maggie task", self.ACTIONS
+        )
+        self.assertEqual(result["intent"], "confirm")
+        self.assertEqual(result["selected_indices"], {1})
+        self.assertTrue(result["dismiss_rest"])
+
+    def test_i_just_want_the_maggie_task(self):
+        result = main._parse_pending_task_reply(
+            "i just want the maggie task", self.ACTIONS
+        )
+        self.assertEqual(result["intent"], "confirm")
+        self.assertEqual(result["selected_indices"], {1})
+        self.assertTrue(result["dismiss_rest"])
+
+    # --- Compound word matching ---
+
+    def test_footlocker_matches_foot_locker(self):
+        result = main._parse_pending_task_reply(
+            "cancel the footlocker task", self.ACTIONS
+        )
+        self.assertEqual(result["intent"], "decline")
+        self.assertEqual(result["selected_indices"], {0})
+
+    # --- Numbered partial approve/decline ---
+
+    def test_approve_2(self):
+        result = main._parse_pending_task_reply("approve 2", self.ACTIONS)
+        self.assertEqual(result["intent"], "confirm")
+        self.assertEqual(result["selected_indices"], {1})
+        self.assertFalse(result["dismiss_rest"])
+
+    def test_cancel_1(self):
+        result = main._parse_pending_task_reply("cancel 1", self.ACTIONS)
+        self.assertEqual(result["intent"], "decline")
+        self.assertEqual(result["selected_indices"], {0})
+
+    # --- Unrelated messages pass through ---
+
+    def test_unrelated_message_returns_no_intent(self):
+        result = main._parse_pending_task_reply(
+            "whats the weather today", self.ACTIONS
+        )
+        self.assertIsNone(result["intent"])
+
+
 if __name__ == "__main__":
     unittest.main()
