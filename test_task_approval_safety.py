@@ -300,5 +300,80 @@ class TestParsePendingTaskReply(unittest.TestCase):
         self.assertIsNone(result["intent"])
 
 
+class TestStripLlmApprovalBlock(unittest.TestCase):
+    """Ensure _strip_llm_approval_block removes LLM-generated duplicates."""
+
+    def test_strips_single_item_block(self):
+        text = (
+            "queued the task.\n\n"
+            "📝 Approve this Google Tasks change\n"
+            "  1. create Ask BJ's about paymenttype fix\n"
+            "\n"
+            "Reply yes to approve, or no to cancel"
+        )
+        result = main._strip_llm_approval_block(text)
+        self.assertNotIn("Approve", result)
+        self.assertNotIn("Reply yes", result)
+        self.assertIn("queued the task", result)
+
+    def test_strips_multi_item_block(self):
+        text = (
+            "got it, here are the tasks.\n\n"
+            "📝 Approve these Google Tasks changes\n"
+            "  1. create Task A\n"
+            "  2. create Task B\n"
+            "\n"
+            "Reply yes to apply all 2 changes in Google Tasks, or no to cancel"
+        )
+        result = main._strip_llm_approval_block(text)
+        self.assertNotIn("Approve", result)
+        self.assertIn("got it", result)
+
+    def test_leaves_clean_text_alone(self):
+        text = "queued the task to ask about paymenttype fix."
+        result = main._strip_llm_approval_block(text)
+        self.assertEqual(result, text)
+
+
+class TestPhantomApprovalGuard(unittest.TestCase):
+    """Ensure bare 'yes'/'no' with no pending tasks doesn't fall through to agent."""
+
+    @patch("main._get_pending_task_request")
+    def test_bare_yes_with_no_pending_returns_nothing_pending(
+        self, mock_get_pending
+    ):
+        mock_get_pending.return_value = (None, None)
+        response = asyncio.run(
+            main.handle_message(
+                {
+                    "text": "yes",
+                    "user_id": "users/456",
+                    "space": "spaces/123",
+                    "is_addon": False,
+                    "attachments": [],
+                }
+            )
+        )
+        self.assertIn("nothing pending", response.get("text", ""))
+
+    @patch("main._get_pending_task_request")
+    def test_bare_no_with_no_pending_returns_nothing_pending(
+        self, mock_get_pending
+    ):
+        mock_get_pending.return_value = (None, None)
+        response = asyncio.run(
+            main.handle_message(
+                {
+                    "text": "no",
+                    "user_id": "users/456",
+                    "space": "spaces/123",
+                    "is_addon": False,
+                    "attachments": [],
+                }
+            )
+        )
+        self.assertIn("nothing pending", response.get("text", ""))
+
+
 if __name__ == "__main__":
     unittest.main()
