@@ -160,7 +160,8 @@ TAGS (must appear on their own line, at the END of your response):
 [DELETE_TASK] find="Task title"
 
 Rules:
-- "due" and "notes" are optional — omit if not mentioned
+- "notes" is optional — omit if not mentioned
+- "due" defaults to today's date if the user doesn't specify one — always include a due date
 - For UPDATE, only include fields being changed
 - Use MULTIPLE tags for bulk operations (one per task)
 - Use the EXACT task title from context when referencing existing tasks
