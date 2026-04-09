@@ -623,6 +623,46 @@ _DECLINE_WORDS = {
 }
 _APPROVE_PREFIXES = tuple(sorted(_APPROVE_WORDS, key=len, reverse=True))
 _DECLINE_PREFIXES = tuple(sorted(_DECLINE_WORDS, key=len, reverse=True))
+
+# Verbs that mean "decline this specific task" without a leading no/cancel.
+_DECLINE_ACTION_WORDS = {
+    "drop",
+    "remove",
+    "ditch",
+    "scratch",
+    "lose",
+    "dont need",
+    "don't need",
+    "i dont need",
+    "i don't need",
+    "get rid of",
+    "dont want",
+    "don't want",
+    "i dont want",
+    "i don't want",
+    "no need for",
+}
+_DECLINE_ACTION_PREFIXES = tuple(sorted(_DECLINE_ACTION_WORDS, key=len, reverse=True))
+
+# Qualifiers after a decline word that invert the meaning to "keep only X".
+_KEEP_ONLY_QUALIFIERS = ("but keep", "but only", "but just", "keep", "just", "only")
+
+# Standalone keep-only patterns (no leading decline word required).
+_KEEP_ACTION_WORDS = {
+    "i just want",
+    "i only want",
+    "i just need",
+    "i only need",
+    "keep only",
+    "only keep",
+    "keep just",
+    "just keep",
+    "keep",
+    "just",
+    "only",
+}
+_KEEP_ACTION_PREFIXES = tuple(sorted(_KEEP_ACTION_WORDS, key=len, reverse=True))
+
 _ORDINAL_WORDS = {
     "first": 1,
     "second": 2,
@@ -638,7 +678,7 @@ _ORDINAL_WORDS = {
 _REFERENCE_FILLER_WORDS = {
     "a", "an", "the", "this", "that", "these", "those",
     "task", "tasks", "item", "items", "one", "ones",
-    "just", "only", "please", "pls", "do", "for", "me",
+    "please", "pls", "do", "for", "me",
 }
 
 
@@ -659,14 +699,14 @@ def _extract_pending_task_command(lower: str) -> tuple[str | None, str]:
     for phrase in _APPROVE_PREFIXES:
         if normalized == phrase:
             return "confirm", ""
-        if normalized.startswith(f"{phrase} "):
-            return "confirm", normalized[len(phrase):].lstrip(" ,:-")
+        if normalized.startswith(f"{phrase} ") or normalized.startswith(f"{phrase},"):
+            return "confirm", normalized[len(phrase):].lstrip(" ,;:-")
 
     for phrase in _DECLINE_PREFIXES:
         if normalized == phrase:
             return "decline", ""
-        if normalized.startswith(f"{phrase} "):
-            return "decline", normalized[len(phrase):].lstrip(" ,:-")
+        if normalized.startswith(f"{phrase} ") or normalized.startswith(f"{phrase},"):
+            return "decline", normalized[len(phrase):].lstrip(" ,;:-")
 
     return None, ""
 
@@ -694,6 +734,7 @@ def _match_action_by_reference(reference: str, actions: list[dict]) -> set[int] 
     if not ref_tokens:
         return None
 
+    ref_compact = ref_phrase.replace(" ", "")
     substring_matches = set()
     overlap_matches = set()
 
@@ -703,7 +744,15 @@ def _match_action_by_reference(reference: str, actions: list[dict]) -> set[int] 
             if not candidate_tokens:
                 continue
 
-            if ref_phrase and ref_phrase in candidate_phrase:
+            candidate_compact = candidate_phrase.replace(" ", "")
+
+            # Substring match: handles normal case and compound words
+            # e.g. "footlocker" matches "foot locker", "foot locker" matches "footlocker"
+            if ref_phrase and (
+                ref_phrase in candidate_phrase
+                or ref_compact in candidate_compact
+                or candidate_compact in ref_compact
+            ):
                 substring_matches.add(idx)
                 continue
 
@@ -767,28 +816,98 @@ def _select_pending_action_indices(reference: str, actions: list[dict]) -> set[i
 
 
 def _parse_pending_task_reply(lower: str, actions: list[dict]) -> dict:
-    """Parse an approval/cancel reply and resolve which actions it targets."""
+    """Parse an approval/cancel reply and resolve which actions it targets.
+
+    Returns a dict with keys:
+      intent: "confirm" | "decline" | None
+      selected_indices: set of action indices the intent applies to
+      ambiguous: True if we detected intent but couldn't resolve the target
+      dismiss_rest: True if non-selected actions should be cleared (not kept pending)
+    """
     exact_intent = _check_pending_task_intent(lower)
     if exact_intent:
         return {
             "intent": exact_intent,
             "selected_indices": set(range(len(actions))),
             "ambiguous": False,
+            "dismiss_rest": False,
         }
 
     intent, remainder = _extract_pending_task_command(lower)
-    if not intent:
-        return {"intent": None, "selected_indices": set(), "ambiguous": False}
 
-    selected_indices = _select_pending_action_indices(remainder, actions)
-    if selected_indices is None:
-        return {"intent": intent, "selected_indices": set(), "ambiguous": True}
+    # "no just X" / "no only X" / "no, keep X" → approve only X, dismiss rest.
+    # The user is declining *everything else*, not the referenced task.
+    if intent == "decline" and remainder:
+        for qualifier in _KEEP_ONLY_QUALIFIERS:
+            if remainder == qualifier or remainder.startswith(f"{qualifier} "):
+                keep_ref = remainder[len(qualifier):].lstrip(" ,:-") if remainder.startswith(f"{qualifier} ") else ""
+                selected = _select_pending_action_indices(keep_ref, actions)
+                if selected is None:
+                    return {"intent": "confirm", "selected_indices": set(), "ambiguous": True, "dismiss_rest": True}
+                return {
+                    "intent": "confirm",
+                    "selected_indices": selected,
+                    "ambiguous": False,
+                    "dismiss_rest": True,
+                }
 
-    return {
-        "intent": intent,
-        "selected_indices": selected_indices,
-        "ambiguous": False,
-    }
+    if intent:
+        selected_indices = _select_pending_action_indices(remainder, actions)
+        if selected_indices is None:
+            return {"intent": intent, "selected_indices": set(), "ambiguous": True, "dismiss_rest": False}
+        return {
+            "intent": intent,
+            "selected_indices": selected_indices,
+            "ambiguous": False,
+            "dismiss_rest": False,
+        }
+
+    # No standard approve/decline prefix — check action-verb patterns.
+    normalized = re.sub(r"\s+", " ", lower).strip().rstrip(".,!?")
+
+    # Decline action verbs: "drop X", "remove X", "dont need X", etc.
+    for phrase in _DECLINE_ACTION_PREFIXES:
+        if normalized == phrase:
+            return {
+                "intent": "decline",
+                "selected_indices": set(range(len(actions))),
+                "ambiguous": False,
+                "dismiss_rest": False,
+            }
+        if normalized.startswith(f"{phrase} "):
+            action_ref = normalized[len(phrase):].lstrip(" ,:-")
+            selected = _select_pending_action_indices(action_ref, actions)
+            if selected is None:
+                return {"intent": "decline", "selected_indices": set(), "ambiguous": True, "dismiss_rest": False}
+            return {
+                "intent": "decline",
+                "selected_indices": selected,
+                "ambiguous": False,
+                "dismiss_rest": False,
+            }
+
+    # Keep-only patterns: "just X", "keep X", "only X", "i just want X"
+    for phrase in _KEEP_ACTION_PREFIXES:
+        if normalized == phrase:
+            return {
+                "intent": "confirm",
+                "selected_indices": set(range(len(actions))),
+                "ambiguous": False,
+                "dismiss_rest": True,
+            }
+        if normalized.startswith(f"{phrase} "):
+            keep_ref = normalized[len(phrase):].lstrip(" ,:-")
+            selected = _select_pending_action_indices(keep_ref, actions)
+            if selected is None:
+                return {"intent": "confirm", "selected_indices": set(), "ambiguous": True, "dismiss_rest": True}
+            return {
+                "intent": "confirm",
+                "selected_indices": selected,
+                "ambiguous": False,
+                "dismiss_rest": True,
+            }
+
+    return {"intent": None, "selected_indices": set(), "ambiguous": False, "dismiss_rest": False}
 
 
 def _user_task_scope(user_id: str, space: str) -> str:
@@ -856,7 +975,7 @@ def _build_task_approval_block(actions: list[dict]) -> str:
     else:
         lines.append(
             f"_Reply *yes* to apply all {len(actions)} changes in Google Tasks, "
-            "*approve 2* to apply only item #2, or *no* to cancel_"
+            "*approve 2* to apply only item #2, *remove 1* to drop item #1, or *no* to cancel_"
         )
     return "\n".join(lines)
 
@@ -965,7 +1084,7 @@ async def handle_message(ev: dict) -> dict:
                     action for idx, action in enumerate(pending_request["actions"])
                     if idx in selected_indices
                 ]
-                remaining_actions = [
+                remaining_actions = [] if parsed_reply.get("dismiss_rest") else [
                     action for idx, action in enumerate(pending_request["actions"])
                     if idx not in selected_indices
                 ]
