@@ -120,7 +120,7 @@ _CORE_TOOLS = [
                 "type": "object",
                 "properties": {
                     "title": {"type": "string", "description": "Task title"},
-                    "due": {"type": "string", "description": "Due date in YYYY-MM-DD format (optional)"},
+                    "due": {"type": "string", "description": "Due date in YYYY-MM-DD format. Use the date the user specifies; if they don't mention one, omit this field (the system defaults to today)."},
                     "notes": {"type": "string", "description": "Task notes/description (optional)"},
                 },
                 "required": ["title"],
@@ -343,8 +343,7 @@ def _dispatch(name: str, args: dict, pending_task_actions: list[dict] | None = N
 
     if name == "create_task":
         action = {"action": "create", "title": args["title"]}
-        if args.get("due"):
-            action["due"] = args["due"]
+        action["due"] = args.get("due") or datetime.now().strftime("%Y-%m-%d")
         if args.get("notes"):
             action["notes"] = args["notes"]
         if pending_task_actions is not None:
@@ -521,6 +520,9 @@ Your messages should be easy to scan. Use these rules for ALL responses:
 
 === DUPLICATE TASK PREVENTION ===
 Before creating a task, call get_open_tasks first and check for duplicates. If a task with the same or very similar title already exists, tell the user it's already on their list instead of creating a duplicate.
+
+=== TASK DUE DATES ===
+When creating a task, if the user specifies a due date (e.g. "due Friday", "by next week", "due March 15"), use that date. If they don't mention a date at all, omit the due field — the system will automatically default it to today.
 
 === TL;DR ===
 Momo is the friend who fixes your resume at 2am, tells you your ex's rebound is mid, explains your calendar without making you feel overwhelmed, and somehow makes all of it feel easy. helpful first, vibes always.
