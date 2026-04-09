@@ -1010,6 +1010,24 @@ def _build_pending_conflict_reply(pending_request: dict) -> str:
     )
 
 
+_LLM_APPROVAL_BLOCK_RE = re.compile(
+    r"\n*📝[^\n]*(?:Approve|Google Tasks)[^\n]*\n"
+    r"(?:\s*\d+\.[^\n]*\n)*"
+    r"(?:\n*(?:Reply|reply)[^\n]*(?:yes|approve|cancel)[^\n]*)?",
+    re.IGNORECASE,
+)
+
+
+def _strip_llm_approval_block(response: str) -> str:
+    """Remove LLM-generated approval blocks from agent responses.
+
+    The server appends its own canonical block via ``_append_task_approval_block``.
+    If the LLM also emitted one (it sees approval blocks in conversation history
+    and sometimes mimics them), we strip it to prevent duplicates.
+    """
+    return _LLM_APPROVAL_BLOCK_RE.sub("", response).rstrip()
+
+
 def _persist_pending_request(scope_id: str, pending_request: dict, actions: list[dict]) -> None:
     """Update or clear the pending request for a scope."""
     if actions:
@@ -1119,6 +1137,15 @@ async def handle_message(ev: dict) -> dict:
                     _persist_pending_request(pending_scope_id, pending_request, remaining_actions)
                     reply = "Got it — canceled that pending task request."
                 return _make_response(reply, is_addon)
+        else:
+            # No pending tasks — if the message is a bare approval/decline word,
+            # don't fall through to the agent (prevents phantom approval loops
+            # where the LLM hallucinates having queued a task).
+            if _check_pending_task_intent(lower):
+                return _make_response(
+                    "nothing pending to approve right now — what task do you need?",
+                    is_addon,
+                )
 
     target_space = space or config.CHAT_SPACE_ID
     thread = threading.Thread(
@@ -1272,6 +1299,7 @@ def _process_message_background(text, user_id, space, audio_attachments=None):
             from agent import run_agent_loop
             response, pending_task_actions = run_agent_loop(text, history, thread_id=conversation_id, user_id=user_id)
             if pending_task_actions:
+                response = _strip_llm_approval_block(response)
                 pending_scope_id = _user_task_scope(user_id, space)
                 approval_response = _append_task_approval_block(response, pending_task_actions)
                 if store_pending_task_actions_if_empty(
