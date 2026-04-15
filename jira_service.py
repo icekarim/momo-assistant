@@ -61,7 +61,8 @@ def fetch_active_jira_tickets() -> str:
 
 def search_jira_tickets(query: str) -> str:
     """Search Jira tickets with a text query (wrapped in JQL text search)."""
-    jql = f'text ~ "{query}" ORDER BY updated DESC'
+    sanitized = query.replace("\\", "\\\\").replace('"', '\\"')
+    jql = f'text ~ "{sanitized}" ORDER BY updated DESC'
     issues = _search(jql, max_results=20, fields=_ISSUE_FIELDS)
     return _format_issues(issues)
 

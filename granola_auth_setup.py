@@ -45,7 +45,8 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         error = query.get("error", [None])[0]
         if error:
             _auth_error = error
-            body = f"<html><body><h2>Auth failed: {error}</h2></body></html>".encode()
+            import html as _html
+            body = f"<html><body><h2>Auth failed: {_html.escape(error)}</h2></body></html>".encode()
         else:
             _auth_code = query.get("code", [None])[0]
             body = b"<html><body><h2>Granola auth complete - you can close this tab.</h2></body></html>"

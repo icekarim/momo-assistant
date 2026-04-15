@@ -14,3 +14,5 @@ venv/
 .cursor/
 PLAN_*.md
 test_generated*.py
+.DS_Store
+**/.DS_Store

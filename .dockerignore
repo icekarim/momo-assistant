@@ -1,5 +1,11 @@
 .env
+.env.*
 token.json
+granola_token.json
+client_secret.json
+service_account.json
+.mcp.json
+.auto_pr_state.json
 .git
 .gitignore
 __pycache__
@@ -8,3 +14,5 @@ __pycache__
 venv
 *.md
 .cursor
+.DS_Store
+.github

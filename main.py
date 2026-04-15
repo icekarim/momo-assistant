@@ -14,6 +14,7 @@ Endpoints:
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
+import html
 import traceback
 import threading
 
@@ -75,6 +76,8 @@ async def api_secret_middleware(request: Request, call_next):
 @app.on_event("startup")
 async def startup_warmup():
     """Pre-initialize Google credentials, discovery docs, and KG embeddings on startup."""
+    if not config.MOMO_API_SECRET:
+        print("WARNING: MOMO_API_SECRET is not set — all protected endpoints are exposed without auth")
     from google_auth import warmup
     warmup()
     try:
@@ -195,7 +198,7 @@ async def trigger_briefing():
         return result
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.post("/email-alerts")
@@ -206,7 +209,7 @@ async def trigger_email_alerts():
         return result
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # ── Post-Meeting Debrief Trigger ─────────────────────────────
@@ -220,7 +223,7 @@ async def trigger_meeting_debrief():
         return result
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # ── Pre-Meeting Prep Trigger ─────────────────────────────────
@@ -235,7 +238,7 @@ async def trigger_meeting_prep():
         return result
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # ── KG + Meeting Prep E2E Test ────────────────────────────────
@@ -334,7 +337,7 @@ async def trigger_evals():
         return {"status": "skipped", "reason": "dataset empty or not found"}
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.post("/promote-eval-failures")
@@ -351,7 +354,7 @@ async def trigger_promote_eval_failures():
         return {"status": "skipped", "reason": "dataset not found"}
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # ── Granola Token Refresh ────────────────────────────────────
@@ -406,7 +409,7 @@ async def granola_auth_start(request: Request):
     except Exception as e:
         traceback.print_exc()
         return HTMLResponse(
-            f"<html><body><h2>Granola re-auth failed</h2><p>{e}</p></body></html>",
+            f"<html><body><h2>Granola re-auth failed</h2><p>{html.escape(str(e))}</p></body></html>",
             status_code=500,
         )
 
@@ -425,7 +428,7 @@ async def granola_auth_callback(code: str = "", state: str = "", error: str = ""
     """OAuth callback from Granola after user authenticates."""
     if error:
         return HTMLResponse(
-            f"<html><body><h2>Granola auth failed</h2><p>{error}</p></body></html>",
+            f"<html><body><h2>Granola auth failed</h2><p>{html.escape(error)}</p></body></html>",
             status_code=400,
         )
 
@@ -442,7 +445,7 @@ async def granola_auth_callback(code: str = "", state: str = "", error: str = ""
     except Exception as e:
         traceback.print_exc()
         return HTMLResponse(
-            f"<html><body><h2>Token exchange failed</h2><p>{e}</p></body></html>",
+            f"<html><body><h2>Token exchange failed</h2><p>{html.escape(str(e))}</p></body></html>",
             status_code=500,
         )
 
