@@ -205,6 +205,10 @@ def _refresh():
     except Exception as exc:
         print(f"Granola: token refresh failed: {exc}")
         _cached_token = None
+        try:
+            send_reauth_alert()
+        except Exception:
+            pass
 
 
 def _discover_token_endpoint() -> str | None:
@@ -389,10 +393,15 @@ def build_meeting_id_map() -> dict[str, str]:
     """Fetch this week's Granola meetings and return a {lowercase_title: id} map.
 
     Called once before processing meetings so we don't re-list per meeting.
+    Raises RuntimeError when the Granola API is unreachable (auth failure,
+    network error, etc.) so callers can distinguish "no meetings this week"
+    from "Granola is down".
     """
     import re
     xml = list_granola_meetings("this_week")
     if not xml:
+        if _cached_token is None:
+            raise RuntimeError("Granola token unavailable (auth refresh may have failed)")
         return {}
 
     id_map: dict[str, str] = {}
@@ -436,3 +445,185 @@ def format_granola_notes_for_context(notes: str) -> str:
     if not notes:
         return "No meeting notes available from Granola."
     return notes
+
+
+# ── Web-based OAuth re-auth (self-healing) ───────────────────
+
+
+_FIRESTORE_REAUTH_COLLECTION = "granola_auth_pending"
+_FIRESTORE_REAUTH_ALERT_DOC = "last_reauth_alert"
+_REAUTH_ALERT_COOLDOWN_HOURS = 12
+
+
+def _generate_pkce_pair() -> tuple[str, str]:
+    import base64, hashlib
+    verifier = base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode()
+    digest = hashlib.sha256(verifier.encode()).digest()
+    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+    return verifier, challenge
+
+
+async def _discover_oauth_metadata_async():
+    base = config.GRANOLA_MCP_URL.rstrip("/")
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        for url in [
+            f"{base}/.well-known/oauth-authorization-server",
+            f"{httpx.URL(base).scheme}://{httpx.URL(base).host}/.well-known/oauth-authorization-server",
+        ]:
+            try:
+                resp = await client.get(url)
+                if resp.status_code == 200:
+                    return resp.json()
+            except Exception:
+                continue
+    return None
+
+
+async def _register_dcr_client_async(registration_endpoint: str, redirect_uri: str) -> dict:
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        resp = await client.post(
+            registration_endpoint,
+            json={
+                "client_name": "Momo Assistant (auto-heal)",
+                "redirect_uris": [redirect_uri],
+                "grant_types": ["authorization_code"],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "none",
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def start_web_reauth(redirect_uri: str) -> str | None:
+    """Initiate a browser-based OAuth flow.
+
+    Stores PKCE verifier and OAuth metadata in Firestore so the callback
+    can complete the exchange. Returns the authorization URL to redirect
+    the user to, or None on failure.
+    """
+    import secrets
+
+    meta = await _discover_oauth_metadata_async()
+    if not meta:
+        print("Granola reauth: could not discover OAuth metadata")
+        return None
+
+    reg_endpoint = meta.get("registration_endpoint")
+    if not reg_endpoint:
+        print("Granola reauth: no registration_endpoint in OAuth metadata")
+        return None
+
+    reg = await _register_dcr_client_async(reg_endpoint, redirect_uri)
+    client_id = reg["client_id"]
+
+    verifier, challenge = _generate_pkce_pair()
+    state = secrets.token_urlsafe(32)
+
+    db = _get_db()
+    db.collection(_FIRESTORE_REAUTH_COLLECTION).document(state).set({
+        "code_verifier": verifier,
+        "client_id": client_id,
+        "token_endpoint": meta["token_endpoint"],
+        "redirect_uri": redirect_uri,
+        "created_at": time.time(),
+    })
+
+    auth_url = (
+        f"{meta['authorization_endpoint']}"
+        f"?response_type=code"
+        f"&client_id={client_id}"
+        f"&redirect_uri={redirect_uri}"
+        f"&code_challenge={challenge}"
+        f"&code_challenge_method=S256"
+        f"&state={state}"
+    )
+    return auth_url
+
+
+async def complete_web_reauth(code: str, state: str) -> bool:
+    """Exchange the authorization code for tokens and store them.
+
+    Returns True on success.
+    """
+    global _cached_token, _token_loaded_at
+
+    db = _get_db()
+    doc = db.collection(_FIRESTORE_REAUTH_COLLECTION).document(state).get()
+    if not doc.exists:
+        print("Granola reauth: invalid or expired state parameter")
+        return False
+
+    data = doc.to_dict()
+    if time.time() - data.get("created_at", 0) > 600:
+        print("Granola reauth: state expired (>10 minutes)")
+        db.collection(_FIRESTORE_REAUTH_COLLECTION).document(state).delete()
+        return False
+
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        resp = await client.post(
+            data["token_endpoint"],
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": data["redirect_uri"],
+                "client_id": data["client_id"],
+                "code_verifier": data["code_verifier"],
+            },
+        )
+        resp.raise_for_status()
+        tokens = resp.json()
+
+    tokens["_token_endpoint"] = data["token_endpoint"]
+    tokens["_client_id"] = data["client_id"]
+    tokens["_expires_at"] = time.time() + tokens.get("expires_in", 21600)
+
+    _cached_token = tokens
+    _token_loaded_at = time.time()
+    _persist_token(tokens)
+
+    db.collection(_FIRESTORE_REAUTH_COLLECTION).document(state).delete()
+    print("Granola reauth: token acquired and stored successfully")
+    return True
+
+
+def send_reauth_alert(service_url: str = "") -> bool:
+    """Send a Chat alert with a one-click re-auth link.
+
+    Throttled to one alert per REAUTH_ALERT_COOLDOWN_HOURS to avoid spam.
+    Returns True if an alert was sent.
+    """
+    if not config.CHAT_SPACE_ID:
+        return False
+
+    url = service_url or config.MOMO_SERVICE_URL
+    if not url:
+        print("Granola reauth: no MOMO_SERVICE_URL configured, can't send reauth link")
+        return False
+
+    db = _get_db()
+    alert_ref = db.collection(_FIRESTORE_REAUTH_COLLECTION).document(_FIRESTORE_REAUTH_ALERT_DOC)
+    alert_doc = alert_ref.get()
+    if alert_doc.exists:
+        last_sent = alert_doc.to_dict().get("sent_at", 0)
+        if time.time() - last_sent < _REAUTH_ALERT_COOLDOWN_HOURS * 3600:
+            return False
+
+    reauth_url = f"{url.rstrip('/')}/granola-auth/start"
+    message = (
+        "🔴 *Granola connection expired*\n\n"
+        "my meeting notes integration lost its auth token and i can't pull "
+        "Granola notes for debriefs or meeting prep.\n\n"
+        f"👉 <{reauth_url}|*click here to reconnect Granola*> (takes 10 seconds)\n\n"
+        "i'll resume pulling meeting notes automatically once you re-auth."
+    )
+
+    try:
+        from chat_service import send_chat_message
+        send_chat_message(config.CHAT_SPACE_ID, message)
+        alert_ref.set({"sent_at": time.time()})
+        print("Granola reauth: alert sent to Chat")
+        return True
+    except Exception as exc:
+        print(f"Granola reauth: failed to send alert: {exc}")
+        return False

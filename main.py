@@ -13,7 +13,7 @@ Endpoints:
 """
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 import traceback
 import threading
 
@@ -55,7 +55,7 @@ app = FastAPI(title="Momo")
 # ── API Secret Middleware ────────────────────────────────────
 # Protects all endpoints except /health, /, and /chat (Google Chat webhook)
 
-_OPEN_PATHS = {"/health", "/", "/chat"}
+_OPEN_PATHS = {"/health", "/", "/chat", "/granola-auth/start", "/granola-auth/callback"}
 
 
 @app.middleware("http")
@@ -360,22 +360,115 @@ async def trigger_promote_eval_failures():
 async def granola_token_refresh():
     """Proactively refresh the Granola OAuth token.
 
-    Designed to be called by Cloud Scheduler every 4 hours to keep the
-    refresh_token alive. Granola access tokens last 6h; refreshing before
-    expiry prevents the refresh_token from going stale.
+    Called by Cloud Scheduler every 4 hours to keep the refresh_token alive.
+    If refresh fails, automatically sends a re-auth link to Chat.
     """
     if not config.GRANOLA_ENABLED:
         return {"status": "skipped", "reason": "granola disabled"}
 
     try:
-        from granola_service import _load_token, _cached_token
+        from granola_service import _load_token, _cached_token, send_reauth_alert
         token = _load_token()
         if token:
             return {"status": "ok", "message": "Granola token is valid"}
         else:
-            return {"status": "error", "message": "Granola token refresh failed — re-run granola_auth_setup.py"}
+            alerted = send_reauth_alert()
+            return {
+                "status": "error",
+                "message": "Granola token refresh failed",
+                "reauth_alert_sent": alerted,
+            }
     except Exception as e:
+        try:
+            from granola_service import send_reauth_alert
+            send_reauth_alert()
+        except Exception:
+            pass
         return {"status": "error", "message": f"Granola token refresh failed: {str(e)}"}
+
+
+# ── Granola Self-Serve Re-Auth ───────────────────────────────
+
+@app.get("/granola-auth/start")
+async def granola_auth_start(request: Request):
+    """Browser-based Granola re-authentication.
+
+    The user clicks a link from a Chat alert, authenticates with Granola
+    in their browser, and gets redirected back here. No local scripts needed.
+    """
+    from granola_service import start_web_reauth
+
+    base_url = str(request.base_url).rstrip("/")
+    redirect_uri = f"{base_url}/granola-auth/callback"
+
+    try:
+        auth_url = await start_web_reauth(redirect_uri)
+    except Exception as e:
+        traceback.print_exc()
+        return HTMLResponse(
+            f"<html><body><h2>Granola re-auth failed</h2><p>{e}</p></body></html>",
+            status_code=500,
+        )
+
+    if not auth_url:
+        return HTMLResponse(
+            "<html><body><h2>Could not start Granola re-auth</h2>"
+            "<p>OAuth discovery failed. Check that GRANOLA_MCP_URL is correct.</p></body></html>",
+            status_code=500,
+        )
+
+    return RedirectResponse(auth_url)
+
+
+@app.get("/granola-auth/callback")
+async def granola_auth_callback(code: str = "", state: str = "", error: str = ""):
+    """OAuth callback from Granola after user authenticates."""
+    if error:
+        return HTMLResponse(
+            f"<html><body><h2>Granola auth failed</h2><p>{error}</p></body></html>",
+            status_code=400,
+        )
+
+    if not code or not state:
+        return HTMLResponse(
+            "<html><body><h2>Missing code or state parameter</h2></body></html>",
+            status_code=400,
+        )
+
+    from granola_service import complete_web_reauth
+
+    try:
+        success = await complete_web_reauth(code, state)
+    except Exception as e:
+        traceback.print_exc()
+        return HTMLResponse(
+            f"<html><body><h2>Token exchange failed</h2><p>{e}</p></body></html>",
+            status_code=500,
+        )
+
+    if not success:
+        return HTMLResponse(
+            "<html><body><h2>Re-auth failed</h2>"
+            "<p>Invalid or expired state. Try clicking the re-auth link again.</p></body></html>",
+            status_code=400,
+        )
+
+    if config.CHAT_SPACE_ID:
+        try:
+            from chat_service import send_chat_message
+            send_chat_message(
+                config.CHAT_SPACE_ID,
+                "✅ *Granola reconnected!* meeting notes and debriefs are back online.",
+            )
+        except Exception:
+            pass
+
+    return HTMLResponse(
+        "<html><body style='font-family: system-ui; text-align: center; padding: 60px;'>"
+        "<h1>&#10004; Granola reconnected</h1>"
+        "<p>Momo will resume pulling meeting notes automatically. You can close this tab.</p>"
+        "</body></html>"
+    )
 
 
 # ── Knowledge Graph Backfill ─────────────────────────────────

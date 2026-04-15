@@ -113,5 +113,8 @@ OWNER_NAME = os.getenv("OWNER_NAME", "")
 # ── API Security ────────────────────────────────────────────
 MOMO_API_SECRET = os.getenv("MOMO_API_SECRET", "")
 
+# ── Service URL (for self-serve OAuth re-auth links) ─────────
+MOMO_SERVICE_URL = os.getenv("MOMO_SERVICE_URL", "")
+
 # ── Server ───────────────────────────────────────────────────
 PORT = int(os.getenv("PORT", "8080"))
