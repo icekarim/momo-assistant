@@ -49,6 +49,9 @@ JIRA_API_TOKEN="${JIRA_API_TOKEN:-$(grep '^JIRA_API_TOKEN=' .env 2>/dev/null | c
 LANGSMITH_API_KEY="${LANGSMITH_API_KEY:-$(grep '^LANGSMITH_API_KEY=' .env 2>/dev/null | cut -d= -f2)}"
 MOMO_API_SECRET="${MOMO_API_SECRET:-$(grep '^MOMO_API_SECRET=' .env 2>/dev/null | cut -d= -f2)}"
 
+# Get existing URL for MOMO_SERVICE_URL (pre-deploy for first-time, updated post-deploy)
+EXISTING_URL=$(gcloud run services describe $SERVICE_NAME --region=$REGION --format='value(status.url)' 2>/dev/null || echo "")
+
 gcloud run deploy $SERVICE_NAME \
   --source . \
   --region $REGION \
@@ -58,6 +61,7 @@ gcloud run deploy $SERVICE_NAME \
   --set-env-vars="JIRA_ENABLED=${JIRA_ENABLED:-false},JIRA_SITE_URL=${JIRA_SITE_URL},JIRA_USER_EMAIL=${JIRA_USER_EMAIL},JIRA_API_TOKEN=${JIRA_API_TOKEN}" \
   --set-env-vars="LANGSMITH_TRACING=true,LANGSMITH_API_KEY=${LANGSMITH_API_KEY},LANGSMITH_PROJECT=momo" \
   --set-env-vars="OWNER_NAME=${OWNER_NAME:-},MOMO_API_SECRET=${MOMO_API_SECRET}" \
+  --set-env-vars="MOMO_SERVICE_URL=${EXISTING_URL}" \
   --set-env-vars="^##^GOOGLE_TOKEN_JSON=${GOOGLE_TOKEN_JSON}##GRANOLA_TOKEN_JSON=${GRANOLA_TOKEN_JSON}" \
   --memory=1Gi \
   --timeout=300 \
@@ -67,6 +71,13 @@ gcloud run deploy $SERVICE_NAME \
 
 # Get the URL
 URL=$(gcloud run services describe $SERVICE_NAME --region=$REGION --format='value(status.url)')
+
+# Update MOMO_SERVICE_URL if it changed (first deploy or domain change)
+if [ -n "$URL" ] && [ "$URL" != "$EXISTING_URL" ]; then
+  echo "Updating MOMO_SERVICE_URL to $URL..."
+  gcloud run services update $SERVICE_NAME --region=$REGION \
+    --update-env-vars="MOMO_SERVICE_URL=${URL}" --quiet
+fi
 
 echo ""
 echo "Momo deployed successfully!"
