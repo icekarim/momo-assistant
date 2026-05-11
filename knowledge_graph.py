@@ -384,10 +384,30 @@ def extract_and_store_background(source_type: str, source_id: str,
     thread.start()
 
 
+def extract_and_store_via_bg_tasks(bg_tasks, source_type: str, source_id: str,
+                                   source_title: str, source_date: str,
+                                   content: str,
+                                   attendees: list[str] | None = None):
+    """Cloud-Run-safe variant: queue extraction onto FastAPI BackgroundTasks
+    so Cloud Run keeps the instance billed/CPU-alive until completion.
+
+    Prefer this over extract_and_store_background inside request handlers."""
+    bg_tasks.add_task(
+        _safe_extract,
+        source_type, source_id, source_title, source_date, content, attendees,
+    )
+
+
 def _safe_extract(source_type, source_id, source_title, source_date, content, attendees):
     try:
-        extract_and_store(source_type, source_id, source_title, source_date,
-                          content, attendees)
+        extract_and_store(
+            source_type=source_type,
+            source_id=source_id,
+            source_title=source_title,
+            source_date=source_date,
+            content=content,
+            attendees=attendees,
+        )
     except Exception:
         print("  Knowledge graph background extraction failed:")
         traceback.print_exc()
@@ -396,11 +416,15 @@ def _safe_extract(source_type, source_id, source_title, source_date, content, at
 # ── Source-specific extraction helpers ───────────────────────
 
 
-def extract_from_calendar_events(events: list[dict]):
+def extract_from_calendar_events(events: list[dict], bg_tasks=None):
     """Extract knowledge from calendar events (background, per-event).
 
     Skips all-day events (holidays, OOO). Uses the Google Calendar event ID
     as source_id so dedup prevents re-extraction of the same event.
+
+    When bg_tasks is supplied (FastAPI BackgroundTasks), extraction is queued
+    onto it so Cloud Run keeps CPU alive until completion. Otherwise falls back
+    to daemon threads.
     """
     if not config.KNOWLEDGE_GRAPH_ENABLED or not events:
         return
@@ -422,7 +446,7 @@ def extract_from_calendar_events(events: list[dict]):
         if event.get("description"):
             parts.append(f"Description: {event['description']}")
 
-        extract_and_store_background(
+        kwargs = dict(
             source_type="calendar",
             source_id=event.get("id", ""),
             source_title=event.get("title", ""),
@@ -430,13 +454,21 @@ def extract_from_calendar_events(events: list[dict]):
             content="\n".join(parts),
             attendees=attendees,
         )
+        if bg_tasks is not None:
+            extract_and_store_via_bg_tasks(bg_tasks, **kwargs)
+        else:
+            extract_and_store_background(**kwargs)
 
 
-def extract_from_tasks(tasks: list[dict]):
+def extract_from_tasks(tasks: list[dict], bg_tasks=None):
     """Extract knowledge from the current task list (batched, once per day).
 
     Tasks are small individually, so we batch them into one extraction call.
     Uses a date-based source_id so it runs once per day.
+
+    When bg_tasks is supplied (FastAPI BackgroundTasks), extraction is queued
+    onto it so Cloud Run keeps CPU alive until completion. Otherwise falls back
+    to daemon threads.
     """
     if not config.KNOWLEDGE_GRAPH_ENABLED or not tasks:
         return
@@ -458,7 +490,7 @@ def extract_from_tasks(tasks: list[dict]):
 
     content = f"Open tasks as of {today}:\n" + "\n".join(lines)
 
-    extract_and_store_background(
+    kwargs = dict(
         source_type="tasks",
         source_id=source_id,
         source_title=f"Task snapshot {today}",
@@ -466,13 +498,22 @@ def extract_from_tasks(tasks: list[dict]):
         content=content,
         attendees=[],
     )
+    if bg_tasks is not None:
+        extract_and_store_via_bg_tasks(bg_tasks, **kwargs)
+    else:
+        extract_and_store_background(**kwargs)
 
 
-def extract_from_granola_notes(granola_context: str, source_date: str | None = None):
+def extract_from_granola_notes(granola_context: str, source_date: str | None = None,
+                               bg_tasks=None):
     """Extract knowledge from Granola meeting notes context.
 
     Used by the morning briefing to capture yesterday's notes that may not
     have been caught by the post-meeting debrief pipeline.
+
+    When bg_tasks is supplied (FastAPI BackgroundTasks), extraction is queued
+    onto it so Cloud Run keeps CPU alive until completion. Otherwise falls back
+    to daemon threads.
     """
     if not config.KNOWLEDGE_GRAPH_ENABLED:
         return
@@ -482,7 +523,7 @@ def extract_from_granola_notes(granola_context: str, source_date: str | None = N
     date = source_date or datetime.now().strftime("%Y-%m-%d")
     source_id = f"granola-briefing-{date}"
 
-    extract_and_store_background(
+    kwargs = dict(
         source_type="meeting_notes",
         source_id=source_id,
         source_title=f"Granola meeting notes ({date})",
@@ -490,6 +531,10 @@ def extract_from_granola_notes(granola_context: str, source_date: str | None = N
         content=granola_context,
         attendees=[],
     )
+    if bg_tasks is not None:
+        extract_and_store_via_bg_tasks(bg_tasks, **kwargs)
+    else:
+        extract_and_store_background(**kwargs)
 
 
 # ── Query functions ──────────────────────────────────────────
