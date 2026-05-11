@@ -194,9 +194,13 @@ def _extract_briefing_sources_to_kg(meetings, tasks, granola_ctx, bg_tasks=None)
         print(f"  KG extraction from briefing sources failed: {e}")
 
 
-def run_proactive_email_alerts():
+def run_proactive_email_alerts(bg_tasks=None):
     """Notify user when a new client/important email arrives.
-    Uses Gemini to triage emails the same way Momo would in conversation."""
+    Uses Gemini to triage emails the same way Momo would in conversation.
+
+    When invoked from a FastAPI handler, pass `bg_tasks` so KG extraction
+    runs via BackgroundTasks (survives cpu-throttling=true); otherwise
+    falls back to fire-and-forget daemon threads."""
     if not config.EMAIL_ALERTS_ENABLED:
         return {"status": "skipped", "reason": "email alerts disabled"}
     if not config.CHAT_SPACE_ID:
@@ -230,8 +234,11 @@ def run_proactive_email_alerts():
         mark_email_alert_sent(email)
         sent_count += 1
 
-        from knowledge_graph import extract_and_store_background
-        extract_and_store_background(
+        from knowledge_graph import (
+            extract_and_store_background,
+            extract_and_store_via_bg_tasks,
+        )
+        kg_kwargs = dict(
             source_type="email",
             source_id=email["id"],
             source_title=email.get("subject", ""),
@@ -239,6 +246,10 @@ def run_proactive_email_alerts():
             content=email.get("body", ""),
             attendees=[email.get("from", "")],
         )
+        if bg_tasks is not None:
+            extract_and_store_via_bg_tasks(bg_tasks, **kg_kwargs)
+        else:
+            extract_and_store_background(**kg_kwargs)
 
     return {
         "status": "sent" if sent_count else "no_alerts",

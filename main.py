@@ -195,10 +195,10 @@ async def trigger_briefing(background_tasks: BackgroundTasks):
 
 
 @app.post("/email-alerts")
-async def trigger_email_alerts():
+async def trigger_email_alerts(background_tasks: BackgroundTasks):
     """Called by Cloud Scheduler to proactively alert on important/client emails."""
     try:
-        result = run_proactive_email_alerts()
+        result = run_proactive_email_alerts(bg_tasks=background_tasks)
         return result
     except Exception as e:
         traceback.print_exc()
