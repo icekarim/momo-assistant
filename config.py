@@ -8,6 +8,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = "gemini-3-flash-preview"
 GEMINI_MODEL_FLASH = os.getenv("GEMINI_MODEL_FLASH", "gemini-3-flash-preview")
 GEMINI_MODEL_PRO = os.getenv("GEMINI_MODEL_PRO", "gemini-3.1-pro-preview")
+# Truncated to 2048 to fit Firestore's flat vector index limit.
+GEMINI_EMBEDDING_DIM = int(os.getenv("GEMINI_EMBEDDING_DIM", "2048"))
 
 # ── Gmail ────────────────────────────────────────────────────
 GMAIL_QUERY = "is:unread in:inbox"

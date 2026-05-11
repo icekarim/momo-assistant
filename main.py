@@ -91,13 +91,6 @@ async def startup_warmup():
     except Exception as e:
         print(f"Discovery cache warmup failed (will retry on first request): {e}")
 
-    # Pre-load KG embeddings so first semantic search is fast
-    if config.KNOWLEDGE_GRAPH_ENABLED:
-        def _warm_kg():
-            from knowledge_graph import warm_embedding_cache
-            warm_embedding_cache()
-        threading.Thread(target=_warm_kg, daemon=True).start()
-
 
 # ── Helpers for Workspace Add-on format ──────────────────────
 
