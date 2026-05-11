@@ -16,6 +16,8 @@ from email.utils import parsedate_to_datetime
 import google.generativeai as genai
 from cachetools import TTLCache
 from google.cloud.firestore_v1.base_query import FieldFilter
+from google.cloud.firestore_v1.base_vector_query import DistanceMeasure
+from google.cloud.firestore_v1.vector import Vector
 
 import config
 from conversation_store import get_db
@@ -56,16 +58,6 @@ def _get_embedding(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list[flo
         output_dimensionality=config.GEMINI_EMBEDDING_DIM,
     )
     return result["embedding"]
-
-
-def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    """Compute cosine similarity between two vectors (fallback, prefer _batch_cosine)."""
-    import numpy as np
-    a_arr, b_arr = np.array(a), np.array(b)
-    norm_a, norm_b = np.linalg.norm(a_arr), np.linalg.norm(b_arr)
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return float(np.dot(a_arr, b_arr) / (norm_a * norm_b))
 
 
 _EMAIL_RE = re.compile(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}")
@@ -345,9 +337,8 @@ def _store_entries(entries: list[dict], source_type: str, source_id: str,
             "extracted_at": now_iso,
         }
         try:
-            from google.cloud.firestore_v1.vector import Vector as _Vector
             text = _build_embedding_text(entry, source_type=source_type)
-            doc["embedding"] = _Vector(_get_embedding(text))
+            doc["embedding"] = Vector(_get_embedding(text))
             doc["embedding_model"] = config.GEMINI_EMBEDDING_MODEL
         except Exception as exc:
             print(f"  Knowledge graph: embedding generation failed ({exc}), storing without")
@@ -753,10 +744,7 @@ def semantic_search(query: str, limit: int | None = None,
     don't support a similarity-cutoff predicate yet. Set threshold to 0 (or
     None falling back to config) to skip the filter.
     """
-    from google.cloud.firestore_v1.vector import Vector
-    from google.cloud.firestore_v1.base_vector_query import DistanceMeasure
-
-    limit = limit or config.SEMANTIC_SEARCH_LIMIT
+    limit = limit if limit is not None else config.SEMANTIC_SEARCH_LIMIT
     threshold = threshold if threshold is not None else config.SEMANTIC_SEARCH_THRESHOLD
 
     try:
@@ -823,9 +811,8 @@ def embed_backfill(include_stale: bool = False) -> dict:
             continue
 
         try:
-            from google.cloud.firestore_v1.vector import Vector as _Vector
             text = _build_embedding_text(data, source_type=data.get("source_type", ""))
-            embedding = _Vector(_get_embedding(text))
+            embedding = Vector(_get_embedding(text))
             doc.reference.update({
                 "embedding": embedding,
                 "embedding_model": current_model,
