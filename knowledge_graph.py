@@ -56,6 +56,7 @@ def _get_embedding(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list[flo
         model=config.GEMINI_EMBEDDING_MODEL,
         content=text,
         task_type=task_type,
+        output_dimensionality=config.GEMINI_EMBEDDING_DIM,
     )
     return result["embedding"]
 
