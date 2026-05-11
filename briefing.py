@@ -23,6 +23,10 @@ from conversation_store import (
     has_debrief_been_sent,
     mark_debrief_sent,
 )
+from knowledge_graph import (
+    extract_and_store_background,
+    extract_and_store_via_bg_tasks,
+)
 import config
 
 
@@ -234,10 +238,6 @@ def run_proactive_email_alerts(bg_tasks=None):
         mark_email_alert_sent(email)
         sent_count += 1
 
-        from knowledge_graph import (
-            extract_and_store_background,
-            extract_and_store_via_bg_tasks,
-        )
         kg_kwargs = dict(
             source_type="email",
             source_id=email["id"],
@@ -510,10 +510,6 @@ def run_post_meeting_debrief(bg_tasks=None):
             sent_count += 1
             print(f"    Debrief sent for: {title}")
             if granola_notes:
-                from knowledge_graph import (
-                    extract_and_store_background,
-                    extract_and_store_via_bg_tasks,
-                )
                 if bg_tasks is not None:
                     extract_and_store_via_bg_tasks(
                         bg_tasks,

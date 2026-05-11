@@ -429,8 +429,6 @@ def extract_from_calendar_events(events: list[dict], bg_tasks=None):
     if not config.KNOWLEDGE_GRAPH_ENABLED or not events:
         return
 
-    _dispatch = extract_and_store_via_bg_tasks if bg_tasks is not None else extract_and_store_background
-
     today = datetime.now().strftime("%Y-%m-%d")
     for event in events:
         if event.get("is_all_day"):
@@ -457,9 +455,9 @@ def extract_from_calendar_events(events: list[dict], bg_tasks=None):
             attendees=attendees,
         )
         if bg_tasks is not None:
-            _dispatch(bg_tasks, **kwargs)
+            extract_and_store_via_bg_tasks(bg_tasks, **kwargs)
         else:
-            _dispatch(**kwargs)
+            extract_and_store_background(**kwargs)
 
 
 def extract_from_tasks(tasks: list[dict], bg_tasks=None):
