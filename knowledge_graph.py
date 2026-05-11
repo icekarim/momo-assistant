@@ -23,9 +23,6 @@ from conversation_store import get_db
 _kg_cache = TTLCache(maxsize=128, ttl=300)
 _kg_cache_lock = threading.Lock()
 
-_embedding_cache = TTLCache(maxsize=1, ttl=1800)  # 30 min — embeddings rarely change
-_embedding_cache_lock = threading.Lock()
-
 genai.configure(api_key=config.GEMINI_API_KEY)
 
 
@@ -348,8 +345,9 @@ def _store_entries(entries: list[dict], source_type: str, source_id: str,
             "extracted_at": now_iso,
         }
         try:
+            from google.cloud.firestore_v1.vector import Vector as _Vector
             text = _build_embedding_text(entry, source_type=source_type)
-            doc["embedding"] = _get_embedding(text)
+            doc["embedding"] = _Vector(_get_embedding(text))
             doc["embedding_model"] = config.GEMINI_EMBEDDING_MODEL
         except Exception as exc:
             print(f"  Knowledge graph: embedding generation failed ({exc}), storing without")
@@ -357,8 +355,6 @@ def _store_entries(entries: list[dict], source_type: str, source_id: str,
 
     with _kg_cache_lock:
         _kg_cache.clear()
-    with _embedding_cache_lock:
-        _embedding_cache.clear()
 
 
 def extract_and_store(source_type: str, source_id: str, source_title: str,
@@ -743,73 +739,22 @@ def update_entity_status(doc_id: str, new_status: str):
     })
     with _kg_cache_lock:
         _kg_cache.clear()
-    with _embedding_cache_lock:
-        _embedding_cache.clear()
 
 
 # ── Semantic search ──────────────────────────────────────────
 
 
-def _get_all_embeddings() -> tuple[list[dict], "np.ndarray | None"]:
-    """Cached bulk read of all KG entities + pre-computed embedding matrix.
-
-    Returns (entities, matrix) where matrix is a numpy array of shape
-    (N, embedding_dim) for entities that have embeddings. Cached for 30 min.
-    """
-    import numpy as np
-
-    with _embedding_cache_lock:
-        cached = _embedding_cache.get("all")
-    if cached is not None:
-        return cached
-
-    t0 = __import__("time").time()
-    db = get_db()
-    docs = db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION).stream()
-    entities = [_doc_to_dict(doc) for doc in docs]
-
-    # Pre-compute numpy matrix for vectorized cosine similarity
-    indexed_entities = []
-    vectors = []
-    for e in entities:
-        emb = e.get("embedding")
-        if emb:
-            indexed_entities.append(e)
-            vectors.append(emb)
-
-    matrix = np.array(vectors, dtype=np.float32) if vectors else None
-
-    # Pre-compute norms for fast cosine similarity
-    if matrix is not None:
-        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0  # avoid division by zero
-        matrix = matrix / norms  # normalize once, reuse on every query
-
-    result = (indexed_entities, matrix)
-    with _embedding_cache_lock:
-        _embedding_cache["all"] = result
-
-    elapsed = __import__("time").time() - t0
-    print(f"Knowledge graph: loaded {len(indexed_entities)} embeddings in {elapsed:.2f}s")
-    return result
-
-
-def warm_embedding_cache():
-    """Pre-load the embedding cache. Call on startup to avoid cold-start latency."""
-    try:
-        _get_all_embeddings()
-    except Exception as exc:
-        print(f"Knowledge graph: embedding cache warmup failed: {exc}")
-
-
 def semantic_search(query: str, limit: int | None = None,
                     threshold: float | None = None) -> list[dict]:
-    """Search the knowledge graph using vectorized cosine similarity.
+    """Semantic search over the knowledge graph using Firestore's native
+    vector search (FindNearest with COSINE distance).
 
-    Embeds the query, compares against the pre-computed normalized embedding
-    matrix in a single numpy operation, and returns the top matches.
+    Note: threshold is applied client-side because Firestore vector queries
+    don't support a similarity-cutoff predicate yet. Set threshold to 0 (or
+    None falling back to config) to skip the filter.
     """
-    import numpy as np
+    from google.cloud.firestore_v1.vector import Vector
+    from google.cloud.firestore_v1.base_vector_query import DistanceMeasure
 
     limit = limit or config.SEMANTIC_SEARCH_LIMIT
     threshold = threshold if threshold is not None else config.SEMANTIC_SEARCH_THRESHOLD
@@ -817,32 +762,39 @@ def semantic_search(query: str, limit: int | None = None,
     try:
         query_embedding = _get_embedding(query, task_type="RETRIEVAL_QUERY")
     except Exception as exc:
-        print(f"Knowledge graph: query embedding failed ({exc}), falling back to empty")
+        print(f"Knowledge graph: query embedding failed ({exc})")
         return []
 
-    indexed_entities, matrix = _get_all_embeddings()
+    db = get_db()
+    collection = db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
 
-    if matrix is None or len(indexed_entities) == 0:
-        return []
+    # Over-fetch when a similarity threshold is set, since Firestore returns
+    # the K nearest unconditionally — we'll filter below.
+    fetch_limit = limit * 3 if threshold > 0 else limit
 
-    # Vectorized cosine similarity: one matrix-vector dot product
-    q = np.array(query_embedding, dtype=np.float32)
-    q_norm = np.linalg.norm(q)
-    if q_norm == 0:
-        return []
-    q = q / q_norm
+    vector_query = collection.find_nearest(
+        vector_field="embedding",
+        query_vector=Vector(query_embedding),
+        distance_measure=DistanceMeasure.COSINE,
+        limit=fetch_limit,
+        distance_result_field="_distance",
+    )
 
-    scores = matrix @ q  # (N,) — all similarities in one operation
+    results = []
+    for doc in vector_query.stream():
+        entity = _doc_to_dict(doc)
+        # COSINE distance in Firestore = 1 - cosine_similarity, so similarity
+        # >= threshold  <==>  distance <= 1 - threshold
+        distance = entity.pop("_distance", None)
+        if distance is not None and threshold > 0:
+            similarity = 1.0 - distance
+            if similarity < threshold:
+                continue
+        results.append(entity)
+        if len(results) >= limit:
+            break
 
-    # Filter and sort
-    mask = scores >= threshold
-    if not mask.any():
-        return []
-
-    indices = np.where(mask)[0]
-    top_indices = indices[np.argsort(scores[indices])[::-1][:limit]]
-
-    return [indexed_entities[i] for i in top_indices]
+    return results
 
 
 def embed_backfill(include_stale: bool = False) -> dict:
@@ -871,11 +823,13 @@ def embed_backfill(include_stale: bool = False) -> dict:
             continue
 
         try:
+            from google.cloud.firestore_v1.vector import Vector as _Vector
             text = _build_embedding_text(data, source_type=data.get("source_type", ""))
-            embedding = _get_embedding(text)
+            embedding = _Vector(_get_embedding(text))
             doc.reference.update({
                 "embedding": embedding,
                 "embedding_model": current_model,
+                "embedding_dim": config.GEMINI_EMBEDDING_DIM,
             })
             if is_stale:
                 reembedded += 1
@@ -885,9 +839,6 @@ def embed_backfill(include_stale: bool = False) -> dict:
             print(f"  Embed backfill failed for {doc.id}: {exc}")
             failed += 1
         _time.sleep(0.1)
-
-    with _embedding_cache_lock:
-        _embedding_cache.clear()
 
     print(f"Embed backfill: {updated} new, {reembedded} re-embedded, {skipped} skipped, {failed} failed")
     return {"updated": updated, "reembedded": reembedded, "skipped": skipped, "failed": failed}
