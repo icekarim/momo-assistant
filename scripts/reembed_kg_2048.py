@@ -14,6 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config
+from google.cloud.firestore_v1.vector import Vector
 from knowledge_graph import _build_embedding_text, _get_embedding
 from conversation_store import get_db
 
@@ -45,7 +46,7 @@ def main():
                     f"expected {target_dim} dim, got {len(new_embedding)}"
                 )
             doc.reference.update({
-                "embedding": new_embedding,
+                "embedding": Vector(new_embedding),
                 "embedding_model": config.GEMINI_EMBEDDING_MODEL,
                 "embedding_dim": target_dim,
             })

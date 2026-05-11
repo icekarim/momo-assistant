@@ -849,7 +849,10 @@ def embed_backfill(include_stale: bool = False) -> dict:
     for doc in docs:
         data = doc.to_dict()
         has_embedding = "embedding" in data
-        is_stale = has_embedding and data.get("embedding_model") != current_model
+        is_stale = has_embedding and (
+            data.get("embedding_model") != current_model
+            or data.get("embedding_dim") != config.GEMINI_EMBEDDING_DIM
+        )
 
         if has_embedding and not (include_stale and is_stale):
             skipped += 1
