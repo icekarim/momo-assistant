@@ -12,7 +12,7 @@ Endpoints:
   GET  /health                  — Health check
 """
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 import html
 import traceback
@@ -184,10 +184,10 @@ async def index():
 # ── Morning Briefing Trigger ─────────────────────────────────
 
 @app.post("/briefing")
-async def trigger_briefing():
+async def trigger_briefing(background_tasks: BackgroundTasks):
     """Called by Cloud Scheduler at 8 AM daily."""
     try:
-        result = run_morning_briefing()
+        result = run_morning_briefing(bg_tasks=background_tasks)
         return result
     except Exception as e:
         traceback.print_exc()
@@ -195,10 +195,10 @@ async def trigger_briefing():
 
 
 @app.post("/email-alerts")
-async def trigger_email_alerts():
+async def trigger_email_alerts(background_tasks: BackgroundTasks):
     """Called by Cloud Scheduler to proactively alert on important/client emails."""
     try:
-        result = run_proactive_email_alerts()
+        result = run_proactive_email_alerts(bg_tasks=background_tasks)
         return result
     except Exception as e:
         traceback.print_exc()
@@ -208,11 +208,11 @@ async def trigger_email_alerts():
 # ── Post-Meeting Debrief Trigger ─────────────────────────────
 
 @app.post("/meeting-debrief")
-async def trigger_meeting_debrief():
+async def trigger_meeting_debrief(background_tasks: BackgroundTasks):
     """Called by Cloud Scheduler every ~10 min during work hours.
     Sends short debriefs for recently ended meetings using Granola notes."""
     try:
-        result = run_post_meeting_debrief()
+        result = run_post_meeting_debrief(bg_tasks=background_tasks)
         return result
     except Exception as e:
         traceback.print_exc()
@@ -1418,6 +1418,7 @@ def _process_message_background(text, user_id, space, audio_attachments=None):
             from datetime import datetime as _dt
             from knowledge_graph import extract_and_store_background
             _now = _dt.now()
+            # TODO(phase-2): if /chat moves to request-based billing, thread BackgroundTasks through here
             extract_and_store_background(
                 source_type="chat",
                 source_id=f"chat-{user_id}-{_now.strftime('%Y%m%d%H%M%S')}",
