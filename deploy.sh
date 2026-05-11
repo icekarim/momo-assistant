@@ -63,7 +63,7 @@ gcloud run deploy $SERVICE_NAME \
   --set-env-vars="OWNER_NAME=${OWNER_NAME:-},MOMO_API_SECRET=${MOMO_API_SECRET}" \
   --set-env-vars="MOMO_SERVICE_URL=${EXISTING_URL}" \
   --set-env-vars="^##^GOOGLE_TOKEN_JSON=${GOOGLE_TOKEN_JSON}##GRANOLA_TOKEN_JSON=${GRANOLA_TOKEN_JSON}" \
-  --memory=1Gi \
+  --memory=2Gi \
   --timeout=300 \
   --no-cpu-throttling \
   --min-instances=0 \
