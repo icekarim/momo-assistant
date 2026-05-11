@@ -36,7 +36,7 @@ def _store_proactive_message(message: str, space_id: str) -> None:
         print(f"  Failed to store proactive message in conversation history: {exc}")
 
 
-def run_morning_briefing(space_id: str | None = None):
+def run_morning_briefing(space_id: str | None = None, bg_tasks=None):
     """Full morning briefing pipeline.
     Fetches emails, meetings, tasks, Granola notes, and nudges in parallel."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -153,7 +153,7 @@ def run_morning_briefing(space_id: str | None = None):
         print(summary)
 
     # Feed calendar events, tasks, and Granola notes into the knowledge graph
-    _extract_briefing_sources_to_kg(meetings, tasks, granola_ctx)
+    _extract_briefing_sources_to_kg(meetings, tasks, granola_ctx, bg_tasks=bg_tasks)
 
     print("Momo's morning briefing delivered.")
     return {
@@ -164,12 +164,16 @@ def run_morning_briefing(space_id: str | None = None):
     }
 
 
-def _extract_briefing_sources_to_kg(meetings, tasks, granola_ctx):
+def _extract_briefing_sources_to_kg(meetings, tasks, granola_ctx, bg_tasks=None):
     """Feed morning briefing data into the knowledge graph (background).
 
     Calendar events and tasks are extracted here; emails are already handled
     by the proactive email alert pipeline. Granola notes from the briefing
     are extracted to catch meetings the debrief pipeline may have missed.
+
+    When bg_tasks is supplied (FastAPI BackgroundTasks), extraction is queued
+    onto it so Cloud Run keeps CPU alive until completion. Otherwise falls back
+    to daemon threads.
     """
     try:
         from knowledge_graph import (
@@ -179,13 +183,13 @@ def _extract_briefing_sources_to_kg(meetings, tasks, granola_ctx):
         )
         if meetings:
             print("  KG: extracting from calendar events...")
-            extract_from_calendar_events(meetings)
+            extract_from_calendar_events(meetings, bg_tasks=bg_tasks)
         if tasks:
             print("  KG: extracting from tasks...")
-            extract_from_tasks(tasks)
+            extract_from_tasks(tasks, bg_tasks=bg_tasks)
         if granola_ctx:
             print("  KG: extracting from Granola notes...")
-            extract_from_granola_notes(granola_ctx)
+            extract_from_granola_notes(granola_ctx, bg_tasks=bg_tasks)
     except Exception as e:
         print(f"  KG extraction from briefing sources failed: {e}")
 
@@ -370,7 +374,7 @@ def _notes_are_substantive(granola_notes: str) -> bool:
     return word_count >= config.MEETING_DEBRIEF_MIN_NOTE_WORDS
 
 
-def run_post_meeting_debrief():
+def run_post_meeting_debrief(bg_tasks=None):
     """Check for recently ended meetings and send short debriefs with Granola notes.
 
     Notes-gated: a debrief is only sent once Granola notes are available AND
@@ -381,6 +385,9 @@ def run_post_meeting_debrief():
     If Granola itself is erroring (auth, network, etc.) the debrief is sent
     without notes after MEETING_DEBRIEF_GRACE_MINUTES so the user isn't left
     with nothing.
+
+    When bg_tasks is supplied (FastAPI BackgroundTasks), KG extraction is
+    queued onto it so Cloud Run keeps CPU alive until completion.
     """
     if not config.GRANOLA_ENABLED:
         return {"status": "skipped", "reason": "granola disabled"}
@@ -492,15 +499,29 @@ def run_post_meeting_debrief():
             sent_count += 1
             print(f"    Debrief sent for: {title}")
             if granola_notes:
-                from knowledge_graph import extract_and_store_background
-                extract_and_store_background(
-                    source_type="meeting",
-                    source_id=event_id,
-                    source_title=title,
-                    source_date=now.strftime("%Y-%m-%d"),
-                    content=granola_notes,
-                    attendees=attendees,
+                from knowledge_graph import (
+                    extract_and_store_background,
+                    extract_and_store_via_bg_tasks,
                 )
+                if bg_tasks is not None:
+                    extract_and_store_via_bg_tasks(
+                        bg_tasks,
+                        source_type="meeting",
+                        source_id=event_id,
+                        source_title=title,
+                        source_date=now.strftime("%Y-%m-%d"),
+                        content=granola_notes,
+                        attendees=attendees,
+                    )
+                else:
+                    extract_and_store_background(
+                        source_type="meeting",
+                        source_id=event_id,
+                        source_title=title,
+                        source_date=now.strftime("%Y-%m-%d"),
+                        content=granola_notes,
+                        attendees=attendees,
+                    )
         except Exception as e:
             print(f"    Debrief generation/send failed for '{title}': {e}")
 
