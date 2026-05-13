@@ -1180,12 +1180,19 @@ async def handle_message(ev: dict, background_tasks: BackgroundTasks) -> dict:
             space or config.CHAT_SPACE_ID,
         )
         if pending_request:
+            # Conversation history must reflect approval-flow turns or the
+            # agent later sees only the "Reply yes to apply..." prompt and
+            # asks again ("phantom approval" loop).
+            approval_conversation_id = conversation_scope(
+                user_id=user_id,
+                space=space or config.CHAT_SPACE_ID,
+            )
             parsed_reply = _parse_pending_task_reply(lower, pending_request["actions"])
             if parsed_reply["ambiguous"]:
-                return _make_response(
-                    _build_pending_selection_help(parsed_reply["intent"], pending_request["actions"]),
-                    is_addon,
-                )
+                clarification = _build_pending_selection_help(parsed_reply["intent"], pending_request["actions"])
+                add_turn(approval_conversation_id, "user", text)
+                add_turn(approval_conversation_id, "assistant", clarification)
+                return _make_response(clarification, is_addon)
             if parsed_reply["intent"] == "confirm":
                 selected_indices = parsed_reply["selected_indices"]
                 selected_actions = [
@@ -1198,6 +1205,7 @@ async def handle_message(ev: dict, background_tasks: BackgroundTasks) -> dict:
                 ]
                 target_space = space or config.CHAT_SPACE_ID
                 _persist_pending_request(pending_scope_id, pending_request, remaining_actions)
+                add_turn(approval_conversation_id, "user", text)
                 background_tasks.add_task(
                     _apply_pending_task_actions_background,
                     selected_actions,
@@ -1205,6 +1213,7 @@ async def handle_message(ev: dict, background_tasks: BackgroundTasks) -> dict:
                     pending_request.get("meeting_title", ""),
                     target_space,
                     pending_scope_id,
+                    approval_conversation_id,
                 )
                 return _make_response("", is_addon)
             if parsed_reply["intent"] == "decline":
@@ -1222,6 +1231,8 @@ async def handle_message(ev: dict, background_tasks: BackgroundTasks) -> dict:
                 else:
                     _persist_pending_request(pending_scope_id, pending_request, remaining_actions)
                     reply = "Got it — canceled that pending task request."
+                add_turn(approval_conversation_id, "user", text)
+                add_turn(approval_conversation_id, "assistant", reply)
                 return _make_response(reply, is_addon)
         else:
             # No pending tasks — if the message is a bare approval/decline word,
@@ -1248,8 +1259,13 @@ def _apply_pending_task_actions_background(
     meeting_title,
     space,
     scope_id,
+    conversation_id=None,
 ):
-    """Apply approved pending task mutations and report back."""
+    """Apply approved pending task mutations and report back.
+
+    conversation_id, when supplied, is used to log the confirmation reply
+    into conversation history so the agent doesn't later forget that the
+    user already approved (phantom approval loop)."""
     try:
         results = []
         skipped = []
@@ -1319,10 +1335,15 @@ def _apply_pending_task_actions_background(
         reply = "\n".join(lines) if lines else "No task changes were applied."
         formatted = format_for_google_chat(reply)
         send_chat_message(space, formatted)
+        if conversation_id:
+            add_turn(conversation_id, "assistant", reply)
     except Exception as e:
         traceback.print_exc()
         try:
-            send_chat_message(space, f"sorry, something went wrong applying that task request: {str(e)}")
+            error_reply = f"sorry, something went wrong applying that task request: {str(e)}"
+            send_chat_message(space, error_reply)
+            if conversation_id:
+                add_turn(conversation_id, "assistant", error_reply)
         except Exception:
             print(f"Failed to send error message: {e}")
 

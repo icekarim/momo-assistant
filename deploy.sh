@@ -65,7 +65,7 @@ gcloud run deploy $SERVICE_NAME \
   --set-env-vars="^##^GOOGLE_TOKEN_JSON=${GOOGLE_TOKEN_JSON}##GRANOLA_TOKEN_JSON=${GRANOLA_TOKEN_JSON}" \
   --memory=2Gi \
   --timeout=300 \
-  --cpu-throttling \
+  --no-cpu-throttling \
   --min-instances=0 \
   --max-instances=3
 
