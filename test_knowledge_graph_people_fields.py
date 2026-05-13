@@ -2,17 +2,31 @@ import sys
 import unittest
 from unittest.mock import MagicMock, patch
 
-sys.modules["google"] = MagicMock()
-sys.modules["google.cloud"] = MagicMock()
-sys.modules["google.cloud.firestore"] = MagicMock()
-sys.modules["google.cloud.firestore_v1"] = MagicMock()
-sys.modules["google.generativeai"] = MagicMock()
-# Submodules referenced via `from ... import ...` in knowledge_graph
-sys.modules["google.cloud.firestore_v1.base_query"] = MagicMock()
-sys.modules["google.cloud.firestore_v1.base_vector_query"] = MagicMock()
-sys.modules["google.cloud.firestore_v1.vector"] = MagicMock()
+_MOCKED_MODULES = (
+    "google",
+    "google.cloud",
+    "google.cloud.firestore",
+    "google.cloud.firestore_v1",
+    # Submodules referenced via `from ... import ...` in knowledge_graph
+    "google.cloud.firestore_v1.base_query",
+    "google.cloud.firestore_v1.base_vector_query",
+    "google.cloud.firestore_v1.vector",
+    "google.generativeai",
+)
 
-import knowledge_graph
+_saved_modules = {name: sys.modules.get(name) for name in _MOCKED_MODULES}
+for name in _MOCKED_MODULES:
+    sys.modules[name] = MagicMock()
+
+try:
+    import knowledge_graph
+finally:
+    for name in _MOCKED_MODULES:
+        original = _saved_modules[name]
+        if original is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = original
 
 
 class TestKnowledgeGraphPeopleFields(unittest.TestCase):
