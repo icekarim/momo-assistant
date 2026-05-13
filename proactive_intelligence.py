@@ -196,12 +196,7 @@ def _build_meeting_prep(meeting: dict) -> str | None:
     print(build_prep_diagnostics(meeting, included_evidence, excluded_evidence, query_labels))
 
     attendees_str = ", ".join(attendee_names)
-
-    if not all_entries:
-        # No KG context — generate a minimal prep with just attendee + time info
-        knowledge_context = "(No prior context found for these attendees or topics.)"
-    else:
-        knowledge_context = format_prep_evidence_context(included_evidence)
+    knowledge_context = format_prep_evidence_context(included_evidence)
 
     prompt = _PREP_PROMPT.format(
         title=meeting["title"],
