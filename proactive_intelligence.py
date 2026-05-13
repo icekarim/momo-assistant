@@ -104,19 +104,25 @@ Meeting: {title}
 Attendees: {attendees}
 Starts: {start_time}
 
-Here is everything Momo knows about the people and topics involved (from past meetings, emails, and conversations):
+Use ONLY evidence items below. Each item has an ID like [E1].
+Every bullet MUST cite at least one evidence ID, like [E1].
+Do NOT mention a person, task, project, blocker, departure, deadline, or decision unless evidence explicitly supports it.
+Do NOT combine facts across evidence items unless they share the same person or project explicitly.
+If evidence is weak or empty, say no strong prep context.
+Keep 3-6 bullets max.
+Start with: 📋 *meeting prep — {title}*
+
+Evidence:
 
 {knowledge_context}
 
-Write a short pre-meeting prep (3-6 bullet points max). Include:
+Write a short pre-meeting prep. Include:
 - Key context about the attendees from past interactions
 - Any open commitments or action items involving these people
 - Relevant decisions or blockers from previous meetings
 - Anything the user should be prepared to discuss
 
-If there's very little context, just say so briefly — don't pad it out.
-Format for Google Chat: use *bold* for names and topics, bullet points for items.
-Start with: 📋 *meeting prep — {title}*"""
+Format for Google Chat: use *bold* for names and topics, bullet points for items."""
 
 
 def _build_meeting_prep(meeting: dict) -> str | None:
@@ -129,6 +135,7 @@ def _build_meeting_prep(meeting: dict) -> str | None:
     title = meeting.get("title", "")
     from meeting_prep_accuracy import (
         build_prep_diagnostics,
+        finalize_evidence_gated_prep,
         format_prep_evidence_context,
         plan_prep_queries,
         select_prep_evidence,
@@ -220,7 +227,7 @@ def _build_meeting_prep(meeting: dict) -> str | None:
     model = genai.GenerativeModel(model_name=config.GEMINI_MODEL_FLASH)
     try:
         resp = traced_generate_content(model, prompt, model_name=config.GEMINI_MODEL_FLASH)
-        return resp.text.strip()
+        return finalize_evidence_gated_prep(title, resp.text.strip(), included_evidence)
     except Exception as exc:
         print(f"  Meeting prep generation failed: {exc}")
         return None

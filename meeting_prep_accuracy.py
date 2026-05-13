@@ -232,6 +232,63 @@ def format_prep_evidence_context(evidence: list[PrepEvidence]) -> str:
     return "\n".join(lines)
 
 
+def finalize_evidence_gated_prep(
+    title: str,
+    raw_text: str,
+    evidence: list[PrepEvidence],
+) -> str:
+    header = f"📋 *meeting prep — {title}*"
+    evidence_by_id = {item.evidence_id: item for item in evidence}
+    valid_ids = set(evidence_by_id)
+    kept_lines: list[str] = []
+
+    for line in (raw_text or "").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped == header or stripped.lower().startswith("📋 *meeting prep"):
+            continue
+
+        cited_ids: list[str] = []
+        for match in re.finditer(r"(?<![A-Za-z0-9])\[?(E\d+)\]?(?![A-Za-z0-9])", stripped):
+            evidence_id = match.group(1)
+            if evidence_id in valid_ids and evidence_id not in cited_ids:
+                cited_ids.append(evidence_id)
+
+        if not cited_ids:
+            continue
+
+        cleaned = re.sub(
+            r"\s*(?:_)?\(?source:.*?(?:\)_|$)",
+            "",
+            stripped,
+            flags=re.IGNORECASE,
+        ).strip()
+        cleaned = re.sub(
+            r"\s*(?<![A-Za-z0-9])\[?E\d+\]?(?![A-Za-z0-9])",
+            "",
+            cleaned,
+        ).strip()
+        if not cleaned:
+            continue
+
+        sources = []
+        for evidence_id in cited_ids:
+            entry = evidence_by_id[evidence_id].entry
+            source_title = entry.get("source_title") or "unknown source"
+            source_date = entry.get("source_date") or "unknown date"
+            source = f"{source_title}, {source_date}"
+            if source not in sources:
+                sources.append(source)
+
+        kept_lines.append(f"{cleaned} _(source: {'; '.join(sources)})_")
+        if len(kept_lines) >= 6:
+            break
+
+    if not kept_lines:
+        return f"{header}\nI don't have strong prep context for this one yet."
+
+    return "\n".join([header, *kept_lines])
+
+
 def build_prep_diagnostics(
     meeting: dict[str, Any],
     included: list[PrepEvidence],
