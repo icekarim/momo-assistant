@@ -645,7 +645,7 @@ def _run_backfill():
 # ── Google Chat Webhook ──────────────────────────────────────
 
 @app.api_route("/chat", methods=["GET", "POST"])
-async def chat_webhook(request: Request):
+async def chat_webhook(request: Request, background_tasks: BackgroundTasks):
     """Receives messages from Google Chat (supports both standard and Add-on format)."""
     if request.method == "GET":
         return {"status": "ok", "message": "Momo Chat endpoint"}
@@ -679,7 +679,7 @@ async def chat_webhook(request: Request):
         return {}
 
     if event_type == "MESSAGE":
-        return await handle_message(ev)
+        return await handle_message(ev, background_tasks)
 
     return _make_response("Momo is here. Send me a message to get started.", is_addon)
 
@@ -1130,10 +1130,11 @@ def _persist_pending_request(scope_id: str, pending_request: dict, actions: list
     clear_pending_task_actions(scope_id=scope_id)
 
 
-async def handle_message(ev: dict) -> dict:
+async def handle_message(ev: dict, background_tasks: BackgroundTasks) -> dict:
     """Process an incoming chat message (text and/or voice).
-    Returns an immediate ack and processes the real response in a background
-    thread, sending it via the Chat API when ready."""
+    Returns an immediate ack and queues the real response onto FastAPI's
+    BackgroundTasks so Cloud Run keeps CPU allocated until the agent loop
+    finishes (works correctly under cpu-throttling=true)."""
     text = ev["text"]
     user_id = ev["user_id"]
     space = ev["space"]
@@ -1197,18 +1198,14 @@ async def handle_message(ev: dict) -> dict:
                 ]
                 target_space = space or config.CHAT_SPACE_ID
                 _persist_pending_request(pending_scope_id, pending_request, remaining_actions)
-                thread = threading.Thread(
-                    target=_apply_pending_task_actions_background,
-                    args=(
-                        selected_actions,
-                        remaining_actions,
-                        pending_request.get("meeting_title", ""),
-                        target_space,
-                        pending_scope_id,
-                    ),
-                    daemon=True,
+                background_tasks.add_task(
+                    _apply_pending_task_actions_background,
+                    selected_actions,
+                    remaining_actions,
+                    pending_request.get("meeting_title", ""),
+                    target_space,
+                    pending_scope_id,
                 )
-                thread.start()
                 return _make_response("", is_addon)
             if parsed_reply["intent"] == "decline":
                 selected_indices = parsed_reply["selected_indices"]
@@ -1237,12 +1234,10 @@ async def handle_message(ev: dict) -> dict:
                 )
 
     target_space = space or config.CHAT_SPACE_ID
-    thread = threading.Thread(
-        target=_process_message_background,
-        args=(text, user_id, target_space, audio_attachments),
-        daemon=True,
+    background_tasks.add_task(
+        _process_message_background,
+        text, user_id, target_space, audio_attachments,
     )
-    thread.start()
 
     return _make_response("", is_addon)
 
@@ -1414,12 +1409,22 @@ def _process_message_background(text, user_id, space, audio_attachments=None):
         add_turn(conversation_id, "user", text)
         add_turn(conversation_id, "assistant", response)
 
+        formatted = format_for_google_chat(response)
+        _t3 = time.time()
+        send_chat_message(space, formatted)
+        _t4 = time.time()
+        print(f"[perf] send_chat_message: {_t4 - _t3:.2f}s")
+
+        # KG extraction runs synchronously after the reply is sent — under
+        # cpu-throttling=true a spawned daemon thread would be CPU-starved
+        # 100ms after this BackgroundTask returns, and the work would silently
+        # drop. Running inline keeps it inside the request scope where CPU
+        # stays allocated. Adds ~2-5s post-response; user already saw the reply.
         if config.KNOWLEDGE_GRAPH_ENABLED:
             from datetime import datetime as _dt
-            from knowledge_graph import extract_and_store_background
+            from knowledge_graph import extract_and_store
             _now = _dt.now()
-            # TODO(phase-2): if /chat moves to request-based billing, thread BackgroundTasks through here
-            extract_and_store_background(
+            extract_and_store(
                 source_type="chat",
                 source_id=f"chat-{user_id}-{_now.strftime('%Y%m%d%H%M%S')}",
                 source_title="Chat message",
@@ -1428,12 +1433,7 @@ def _process_message_background(text, user_id, space, audio_attachments=None):
                 attendees=[],
             )
 
-        formatted = format_for_google_chat(response)
-        _t3 = time.time()
-        send_chat_message(space, formatted)
-        _t4 = time.time()
-        print(f"[perf] send_chat_message: {_t4 - _t3:.2f}s")
-        print(f"[perf] TOTAL: {_t4 - _t0:.2f}s")
+        print(f"[perf] TOTAL: {time.time() - _t0:.2f}s")
 
     except Exception as e:
         traceback.print_exc()
