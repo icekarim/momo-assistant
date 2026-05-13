@@ -1,12 +1,13 @@
 import unittest
+from unittest.mock import MagicMock, patch
 
 from meeting_prep_accuracy import (
     PrepEvidence,
     build_prep_diagnostics,
-    format_prep_evidence_context,
     is_generic_meeting_title,
     plan_prep_queries,
     select_prep_evidence,
+    format_prep_evidence_context,
 )
 
 
@@ -167,3 +168,36 @@ class TestMeetingPrepEvidenceScoring(unittest.TestCase):
         self.assertIn("date=2026-05-13", context)
         self.assertIn("source=last sync part 2", context)
         self.assertIn("Agnes handover", context)
+
+    def test_empty_retrieval_uses_evidence_formatter_context(self):
+        import proactive_intelligence
+
+        captured_prompts = []
+
+        def fake_generate(_model, prompt, model_name):
+            captured_prompts.append(prompt)
+            return MagicMock(text="brief")
+
+        meeting = {
+            "title": "weekly sync",
+            "attendees": [{"name": "agnes.jang@rokt.com"}],
+            "start_time": "2026-05-13T10:00:00Z",
+        }
+
+        with (
+            patch.object(proactive_intelligence, "query_by_person", return_value=[]),
+            patch.object(proactive_intelligence.genai, "GenerativeModel", return_value=object()),
+            patch.object(proactive_intelligence, "traced_generate_content", side_effect=fake_generate),
+        ):
+            brief = proactive_intelligence._build_meeting_prep(meeting)
+
+        self.assertEqual(brief, "brief")
+        self.assertTrue(captured_prompts)
+        self.assertIn(
+            "(No strong prior context found for this meeting.)",
+            captured_prompts[0],
+        )
+        self.assertNotIn(
+            "(No prior context found for these attendees or topics.)",
+            captured_prompts[0],
+        )
