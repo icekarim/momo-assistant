@@ -125,8 +125,7 @@ def _build_meeting_prep(meeting: dict) -> str | None:
     if not attendee_names:
         return None
 
-    all_entries = []
-    seen_ids = set()
+    entries_by_id = {}
     title = meeting.get("title", "")
     from meeting_prep_accuracy import (
         build_prep_diagnostics,
@@ -136,6 +135,26 @@ def _build_meeting_prep(meeting: dict) -> str | None:
     )
     query_plan = plan_prep_queries(meeting)
     query_labels = []
+
+    def _add_labeled_entry(entry: dict, label: str) -> None:
+        entry_id = entry["id"]
+        existing = entries_by_id.get(entry_id)
+        if existing is None:
+            existing = dict(entry)
+            entries_by_id[entry_id] = existing
+
+        labels = set()
+        legacy_label = existing.get("_query_label")
+        if legacy_label:
+            labels.add(legacy_label)
+        existing_labels = existing.get("_query_labels") or []
+        if isinstance(existing_labels, str):
+            existing_labels = [existing_labels]
+        labels.update(existing_labels)
+        labels.add(label)
+        sorted_labels = sorted(labels)
+        existing["_query_labels"] = sorted_labels
+        existing["_query_label"] = sorted_labels[0]
 
     # Query KG in parallel: by planned people and, when specific enough, title.
     from knowledge_graph import semantic_search as _semantic_search
@@ -157,11 +176,7 @@ def _build_meeting_prep(meeting: dict) -> str | None:
                 label = kg_futures[future]
                 try:
                     for entry in future.result():
-                        if entry["id"] not in seen_ids:
-                            seen_ids.add(entry["id"])
-                            labeled_entry = dict(entry)
-                            labeled_entry["_query_label"] = label
-                            all_entries.append(labeled_entry)
+                        _add_labeled_entry(entry, label)
                 except Exception as exc:
                     print(f"    KG query failed ({label}): {exc}")
     else:
@@ -169,9 +184,9 @@ def _build_meeting_prep(meeting: dict) -> str | None:
 
     # Also query by projects found in existing results
     projects = set()
-    for e in all_entries:
+    for e in entries_by_id.values():
         projects.update(e.get("related_projects", []))
-    project_list = list(projects)[:3]
+    project_list = sorted(projects)[:3]
 
     if project_list:
         with ThreadPoolExecutor(max_workers=len(project_list)) as pool:
@@ -184,14 +199,11 @@ def _build_meeting_prep(meeting: dict) -> str | None:
                 proj = proj_futures[future]
                 try:
                     for entry in future.result():
-                        if entry["id"] not in seen_ids:
-                            seen_ids.add(entry["id"])
-                            labeled_entry = dict(entry)
-                            labeled_entry["_query_label"] = f"project:{proj}"
-                            all_entries.append(labeled_entry)
+                        _add_labeled_entry(entry, f"project:{proj}")
                 except Exception as exc:
                     print(f"    KG project query failed: {exc}")
 
+    all_entries = list(entries_by_id.values())
     included_evidence, excluded_evidence = select_prep_evidence(meeting, all_entries)
     print(build_prep_diagnostics(meeting, included_evidence, excluded_evidence, query_labels))
 

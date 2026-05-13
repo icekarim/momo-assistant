@@ -61,6 +61,21 @@ def _entry_people(entry: dict[str, Any]) -> set[str]:
     return {token for token in people if len(token) >= 3 and token != "rokt"}
 
 
+def _entry_query_labels(entry: dict[str, Any]) -> list[str]:
+    labels: list[str] = []
+    legacy_label = entry.get("_query_label")
+    if legacy_label:
+        labels.append(str(legacy_label))
+
+    value = entry.get("_query_labels") or []
+    if isinstance(value, str):
+        value = [value]
+    for label in value:
+        if label:
+            labels.append(str(label))
+    return labels
+
+
 def is_generic_meeting_title(title: str) -> bool:
     normalized = " ".join(_tokens(title))
     if not normalized:
@@ -128,7 +143,7 @@ def score_prep_entry(meeting: dict[str, Any], entry: dict[str, Any]) -> tuple[in
     score = 0
     reasons: list[str] = []
     title = meeting.get("title", "")
-    query_label = entry.get("_query_label", "")
+    query_labels = _entry_query_labels(entry)
 
     if _norm(entry.get("source_title", "")) == _norm(title):
         score += 80
@@ -151,11 +166,11 @@ def score_prep_entry(meeting: dict[str, Any], entry: dict[str, Any]) -> tuple[in
         score += 30
         reasons.append("project appears in meeting text")
 
-    if query_label.startswith("person:"):
+    if any(label.startswith("person:") for label in query_labels):
         score += 15
         reasons.append("person query match")
 
-    if query_label.startswith("title:") and is_generic_meeting_title(title):
+    if any(label.startswith("title:") for label in query_labels) and is_generic_meeting_title(title):
         score -= 70
         reasons.append("generic title search")
 
@@ -178,17 +193,28 @@ def select_prep_evidence(
     max_items: int = 12,
     min_score: int = 25,
 ) -> tuple[list[PrepEvidence], list[PrepEvidence]]:
-    included: list[PrepEvidence] = []
-    excluded: list[PrepEvidence] = []
-    for idx, entry in enumerate(entries, start=1):
+    scored: list[tuple[int, list[str], dict[str, Any]]] = []
+    for entry in entries:
         score, reasons = score_prep_entry(meeting, entry)
-        evidence = PrepEvidence(f"E{idx}", entry, score, reasons)
-        if score >= min_score:
-            included.append(evidence)
-        else:
-            excluded.append(evidence)
+        scored.append((score, reasons, entry))
 
-    included.sort(key=lambda item: item.score, reverse=True)
+    scored.sort(
+        key=lambda item: (
+            -item[0],
+            str(item[2].get("id", "")),
+            str(item[2].get("source_date", "")),
+            str(item[2].get("source_title", "")),
+            str(item[2].get("name", "")),
+            str(item[2].get("content", "")),
+        )
+    )
+
+    evidence_items = [
+        PrepEvidence(f"E{idx}", entry, score, reasons)
+        for idx, (score, reasons, entry) in enumerate(scored, start=1)
+    ]
+    included = [item for item in evidence_items if item.score >= min_score]
+    excluded = [item for item in evidence_items if item.score < min_score]
     return included[:max_items], excluded + included[max_items:]
 
 
