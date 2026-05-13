@@ -482,3 +482,54 @@ class TestMeetingPrepEvidenceScoring(unittest.TestCase):
         self.assertIn("*Agnes* needs to finalize mapping handover.", brief)
         self.assertIn("_(source: last sync part 2, 2026-05-13)_", brief)
         self.assertNotIn("PacSun", brief)
+
+
+class TestLastSyncRegression(unittest.TestCase):
+    def test_last_sync_context_excludes_unrelated_sync_and_social_items(self):
+        meeting = {
+            "title": "last sync part 2",
+            "description": "Agenda: final handovers for Agnes Jang",
+            "attendees": [{"name": "alex.rivera@example.com"}, {"name": "morgan.reed@example.com"}],
+        }
+        entries = [
+            {
+                "id": "handover",
+                "entity_type": "commitment",
+                "name": "Agnes handover",
+                "content": "Agnes Jang needs to finalize data mapping table handover.",
+                "source_title": "last sync part 2",
+                "source_date": "2026-05-13",
+                "mentioned_people": ["Agnes Jang"],
+                "related_projects": ["Carbon"],
+            },
+            {
+                "id": "pacsun",
+                "entity_type": "blocker",
+                "name": "PacSun latency",
+                "content": "Jessica Francis is dealing with 2-second latency spikes.",
+                "source_title": "Internal Sync: Aftersell 1P for PacSun",
+                "source_date": "2026-04-21",
+                "mentioned_people": ["Jessica Francis"],
+                "related_projects": ["PacSun"],
+                "_query_label": "title:last sync part 2",
+            },
+            {
+                "id": "tekken",
+                "entity_type": "topic",
+                "name": "Tekken 3 Exhibition Matches",
+                "content": "Matthew Monjarrez and Daniel Piet played Tekken 3.",
+                "source_title": "Tekken 3 Exhibition Matches",
+                "source_date": "2026-05-11",
+                "mentioned_people": ["Matthew Monjarrez", "Daniel Piet"],
+                "related_projects": ["Tekken 3"],
+                "_query_label": "person:morgan.reed@example.com",
+            },
+        ]
+
+        included, excluded = select_prep_evidence(meeting, entries, max_items=10)
+        context = format_prep_evidence_context(included)
+
+        self.assertIn("Agnes handover", context)
+        self.assertNotIn("PacSun latency", context)
+        self.assertNotIn("Tekken", context)
+        self.assertEqual({item.entry["id"] for item in excluded}, {"pacsun", "tekken"})
