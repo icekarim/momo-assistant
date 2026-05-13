@@ -393,9 +393,9 @@ def run_post_meeting_debrief(bg_tasks=None):
     This prevents firing debriefs with partial/in-progress notes when meetings
     run over their scheduled time.
 
-    If Granola itself is erroring (auth, network, etc.) the debrief is sent
-    without notes after MEETING_DEBRIEF_GRACE_MINUTES so the user isn't left
-    with nothing.
+    If Granola notes are unavailable after MEETING_DEBRIEF_GRACE_MINUTES
+    (auth error, no match, or notes still not ready), the debrief is sent
+    without notes so the user isn't left with nothing.
 
     When bg_tasks is supplied (FastAPI BackgroundTasks), KG extraction is
     queued onto it so Cloud Run keeps CPU alive until completion.
@@ -481,17 +481,23 @@ def run_post_meeting_debrief(bg_tasks=None):
         print(f"  Checking debrief for: {title} (scheduled end was {minutes_since_end:.0f}m ago)")
 
         if not granola_notes:
-            if granola_error and minutes_since_end >= grace:
-                print(f"    Granola unavailable past grace window ({grace}m), sending without notes")
+            if minutes_since_end >= grace:
+                reason = "Granola unavailable" if granola_error else "Notes unavailable"
+                print(f"    {reason} past grace window ({grace}m), sending without notes")
             else:
                 reason = "Granola error, retrying" if granola_error else "notes not available yet"
                 print(f"    {reason}, deferring to next run")
                 deferred_count += 1
                 continue
         elif not _notes_are_substantive(granola_notes):
-            print(f"    Notes too thin ({len(granola_notes.split())} words) — meeting may still be in progress, deferring")
-            deferred_count += 1
-            continue
+            word_count = len(granola_notes.split())
+            if minutes_since_end >= grace:
+                print(f"    Notes too thin ({word_count} words) past grace window ({grace}m), sending without notes")
+                granola_notes = ""
+            else:
+                print(f"    Notes too thin ({word_count} words) — meeting may still be in progress, deferring")
+                deferred_count += 1
+                continue
 
         try:
             end_time = meeting.get("end_time", "")
@@ -538,8 +544,9 @@ def run_post_meeting_debrief(bg_tasks=None):
         attendees = [a["name"] for a in meeting.get("attendees", [])]
         print(f"  Checking debrief for: {title} (scheduled end was {minutes_since_end:.0f}m ago)")
 
-        if granola_error and minutes_since_end >= grace:
-            print(f"    Granola unavailable past grace window ({grace}m), sending without notes")
+        if minutes_since_end >= grace:
+            reason = "Granola unavailable" if granola_error else "No Granola match"
+            print(f"    {reason} past grace window ({grace}m), sending without notes")
             try:
                 end_time = meeting.get("end_time", "")
                 debrief = generate_post_meeting_debrief(title, attendees, "", end_time)
