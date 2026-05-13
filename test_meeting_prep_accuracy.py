@@ -102,6 +102,104 @@ class TestMeetingPrepAccuracyUtilities(unittest.TestCase):
         self.assertIn("I don't have strong prep context for this one yet.", brief)
         self.assertNotIn("PacSun", brief)
 
+    def test_finalize_evidence_gated_prep_normalizes_retained_lines_to_bullets(self):
+        evidence = [
+            PrepEvidence(
+                evidence_id="E1",
+                entry={"source_title": "last sync part 2", "source_date": "2026-05-13"},
+                score=90,
+                reasons=["exact source title"],
+            )
+        ]
+        raw_text = "\n".join(
+            [
+                "### Agnes handover [E1]",
+                "1. Mapping checklist needs review. [E1]",
+                "- Already a bullet stays a single bullet. [E1]",
+            ]
+        )
+
+        brief = finalize_evidence_gated_prep("last sync part 2", raw_text, evidence)
+        lines = brief.splitlines()
+
+        self.assertEqual(lines[1], "- Agnes handover _(source: last sync part 2, 2026-05-13)_")
+        self.assertEqual(lines[2], "- Mapping checklist needs review. _(source: last sync part 2, 2026-05-13)_")
+        self.assertEqual(lines[3], "- Already a bullet stays a single bullet. _(source: last sync part 2, 2026-05-13)_")
+
+    def test_finalize_evidence_gated_prep_dedupes_duplicate_sources(self):
+        evidence = [
+            PrepEvidence(
+                evidence_id="E1",
+                entry={"source_title": "last sync part 2", "source_date": "2026-05-13"},
+                score=90,
+                reasons=["exact source title"],
+            ),
+            PrepEvidence(
+                evidence_id="E2",
+                entry={"source_title": "last sync part 2", "source_date": "2026-05-13"},
+                score=80,
+                reasons=["person query match"],
+            ),
+        ]
+
+        brief = finalize_evidence_gated_prep(
+            "last sync part 2",
+            "- Agnes handover has two supporting entries. [E1] [E2] [E1]",
+            evidence,
+        )
+
+        self.assertEqual(
+            brief.splitlines()[1],
+            "- Agnes handover has two supporting entries. _(source: last sync part 2, 2026-05-13)_",
+        )
+
+    def test_finalize_evidence_gated_prep_caps_output_at_six_bullets(self):
+        evidence = [
+            PrepEvidence(
+                evidence_id="E1",
+                entry={"source_title": "last sync part 2", "source_date": "2026-05-13"},
+                score=90,
+                reasons=["exact source title"],
+            )
+        ]
+        raw_text = "\n".join(f"- Item {idx} [E1]" for idx in range(1, 9))
+
+        brief = finalize_evidence_gated_prep("last sync part 2", raw_text, evidence)
+        bullet_lines = [line for line in brief.splitlines() if line.startswith("- ")]
+
+        self.assertEqual(len(bullet_lines), 6)
+        self.assertIn("Item 6", bullet_lines[-1])
+        self.assertNotIn("Item 7", brief)
+
+    def test_finalize_evidence_gated_prep_keeps_normal_source_phrases_before_citation(self):
+        evidence = [
+            PrepEvidence(
+                evidence_id="E1",
+                entry={"source_title": "last sync part 2", "source_date": "2026-05-13"},
+                score=90,
+                reasons=["exact source title"],
+            )
+        ]
+        raw_text = "\n".join(
+            [
+                "- Ask Agnes to share source: deployment notes before Friday. [E1]",
+                "- Strip generated suffixes only. [E1] _(source: hallucinated)_",
+            ]
+        )
+
+        brief = finalize_evidence_gated_prep("last sync part 2", raw_text, evidence)
+
+        self.assertIn(
+            "- Ask Agnes to share source: deployment notes before Friday. "
+            "_(source: last sync part 2, 2026-05-13)_",
+            brief,
+        )
+        self.assertIn(
+            "- Strip generated suffixes only. _(source: last sync part 2, 2026-05-13)_",
+            brief,
+        )
+        self.assertNotIn("hallucinated", brief)
+
 
 class TestMeetingPrepRetrievalPlanning(unittest.TestCase):
     def test_large_generic_meeting_skips_title_search_and_limits_people(self):
