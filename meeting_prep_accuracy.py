@@ -47,18 +47,44 @@ def _norm(text: str) -> str:
     return " ".join(_tokens(text))
 
 
+# Tokens that look like names but are actually email/domain noise.
+# Without filtering, "alice@gmail.com" would spuriously match any text
+# containing another ".com" email (e.g. attendee email vs. organizer email
+# in the meeting description).
+_PERSON_NOISE_TOKENS = frozenset({
+    "com", "org", "net", "edu", "gov", "io", "co", "uk", "us", "ca",
+    "rokt", "gmail", "yahoo", "outlook", "hotmail", "icloud", "googlemail",
+})
+
+
+def _name_tokens(person: str) -> set[str]:
+    """Tokens that identify a person by name, with email-domain noise stripped.
+
+    For an email like ``alex.rivera@example.com`` only the local-part is tokenized,
+    and short generic domain words are dropped so they cannot create spurious
+    matches against unrelated ``.com``-bearing text.
+    """
+    if not person:
+        return set()
+    local = person.split("@", 1)[0]
+    return {
+        token for token in _tokens(local)
+        if len(token) >= 3 and token not in _PERSON_NOISE_TOKENS
+    }
+
+
 def _entry_people(entry: dict[str, Any]) -> set[str]:
-    people = set()
+    people: set[str] = set()
     for key in ("mentioned_people", "owners", "related_people"):
         value = entry.get(key) or []
         if isinstance(value, str):
             value = [value]
         for person in value:
-            people.update(_tokens(person))
+            people.update(_name_tokens(person))
     owner = entry.get("owner")
     if owner:
-        people.update(_tokens(owner))
-    return {token for token in people if len(token) >= 3 and token != "rokt"}
+        people.update(_name_tokens(owner))
+    return people
 
 
 def _entry_query_labels(entry: dict[str, Any]) -> list[str]:
@@ -95,11 +121,8 @@ def is_generic_meeting_title(title: str) -> bool:
 
 def _text_contains_person(text: str, person: str) -> bool:
     text_tokens = set(_tokens(text))
-    person_tokens = [
-        token for token in _tokens(person)
-        if len(token) >= 3 and token != "rokt"
-    ]
-    return bool(person_tokens and any(token in text_tokens for token in person_tokens))
+    person_tokens = _name_tokens(person)
+    return bool(person_tokens and not person_tokens.isdisjoint(text_tokens))
 
 
 def plan_prep_queries(meeting: dict[str, Any]) -> dict[str, Any]:
