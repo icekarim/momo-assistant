@@ -4,6 +4,7 @@ from meeting_prep_accuracy import (
     PrepEvidence,
     build_prep_diagnostics,
     is_generic_meeting_title,
+    plan_prep_queries,
 )
 
 
@@ -60,3 +61,43 @@ class TestMeetingPrepAccuracyUtilities(unittest.TestCase):
         self.assertIn("included E1 score=90", text)
         self.assertIn("excluded X1 score=-20", text)
         self.assertIn("generic title search", text)
+
+
+class TestMeetingPrepRetrievalPlanning(unittest.TestCase):
+    def test_large_generic_meeting_skips_title_search_and_limits_people(self):
+        meeting = {
+            "title": "last sync part 2",
+            "description": "Agenda: final handovers for Agnes Jang",
+            "organizer": "karim@rokt.com",
+            "attendees": [
+                {"name": "agnes.jang@rokt.com"},
+                {"name": "parth.merchant@rokt.com"},
+                {"name": "jessica.francis@rokt.com"},
+                {"name": "patrick.tsui@rokt.com"},
+                {"name": "matthew.monjarrez@rokt.com"},
+                {"name": "raghav.chawla@rokt.com"},
+                {"name": "daniel.piet@rokt.com"},
+                {"name": "caroline.kar-lai.tan@rokt.com"},
+                {"name": "ellie.park@rokt.com"},
+            ],
+        }
+
+        plan = plan_prep_queries(meeting)
+
+        self.assertFalse(plan["include_title_semantic_search"])
+        self.assertLessEqual(len(plan["people"]), 4)
+        self.assertIn("agnes.jang@rokt.com", plan["people"])
+        self.assertIn("karim@rokt.com", plan["people"])
+
+    def test_specific_meeting_allows_title_search(self):
+        meeting = {
+            "title": "PacSun integration launch review",
+            "description": "",
+            "organizer": "karim@rokt.com",
+            "attendees": [{"name": "jessica.francis@rokt.com"}],
+        }
+
+        plan = plan_prep_queries(meeting)
+
+        self.assertTrue(plan["include_title_semantic_search"])
+        self.assertIn("jessica.francis@rokt.com", plan["people"])
