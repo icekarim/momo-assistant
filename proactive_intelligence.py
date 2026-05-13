@@ -32,7 +32,6 @@ from conversation_store import (
     mark_prep_sent,
 )
 from knowledge_graph import (
-    format_knowledge_for_context,
     query_all_entries,
     query_by_person,
     query_by_project,
@@ -129,8 +128,14 @@ def _build_meeting_prep(meeting: dict) -> str | None:
     all_entries = []
     seen_ids = set()
     title = meeting.get("title", "")
-    from meeting_prep_accuracy import plan_prep_queries
+    from meeting_prep_accuracy import (
+        build_prep_diagnostics,
+        format_prep_evidence_context,
+        plan_prep_queries,
+        select_prep_evidence,
+    )
     query_plan = plan_prep_queries(meeting)
+    query_labels = []
 
     # Query KG in parallel: by planned people and, when specific enough, title.
     from knowledge_graph import semantic_search as _semantic_search
@@ -146,6 +151,7 @@ def _build_meeting_prep(meeting: dict) -> str | None:
             if query_plan["include_title_semantic_search"]:
                 title_future = pool.submit(_semantic_search, title, 10)
                 kg_futures[title_future] = f"title:{title}"
+            query_labels.extend(kg_futures.values())
 
             for future in as_completed(kg_futures):
                 label = kg_futures[future]
@@ -153,7 +159,9 @@ def _build_meeting_prep(meeting: dict) -> str | None:
                     for entry in future.result():
                         if entry["id"] not in seen_ids:
                             seen_ids.add(entry["id"])
-                            all_entries.append(entry)
+                            labeled_entry = dict(entry)
+                            labeled_entry["_query_label"] = label
+                            all_entries.append(labeled_entry)
                 except Exception as exc:
                     print(f"    KG query failed ({label}): {exc}")
     else:
@@ -171,14 +179,21 @@ def _build_meeting_prep(meeting: dict) -> str | None:
                 pool.submit(query_by_project, proj, None, 5): proj
                 for proj in project_list
             }
+            query_labels.extend(f"project:{proj}" for proj in proj_futures.values())
             for future in as_completed(proj_futures):
+                proj = proj_futures[future]
                 try:
                     for entry in future.result():
                         if entry["id"] not in seen_ids:
                             seen_ids.add(entry["id"])
-                            all_entries.append(entry)
+                            labeled_entry = dict(entry)
+                            labeled_entry["_query_label"] = f"project:{proj}"
+                            all_entries.append(labeled_entry)
                 except Exception as exc:
                     print(f"    KG project query failed: {exc}")
+
+    included_evidence, excluded_evidence = select_prep_evidence(meeting, all_entries)
+    print(build_prep_diagnostics(meeting, included_evidence, excluded_evidence, query_labels))
 
     attendees_str = ", ".join(attendee_names)
 
@@ -186,7 +201,7 @@ def _build_meeting_prep(meeting: dict) -> str | None:
         # No KG context — generate a minimal prep with just attendee + time info
         knowledge_context = "(No prior context found for these attendees or topics.)"
     else:
-        knowledge_context = format_knowledge_for_context(all_entries[:20])
+        knowledge_context = format_prep_evidence_context(included_evidence)
 
     prompt = _PREP_PROMPT.format(
         title=meeting["title"],

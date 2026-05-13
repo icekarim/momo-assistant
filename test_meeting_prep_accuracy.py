@@ -3,8 +3,10 @@ import unittest
 from meeting_prep_accuracy import (
     PrepEvidence,
     build_prep_diagnostics,
+    format_prep_evidence_context,
     is_generic_meeting_title,
     plan_prep_queries,
+    select_prep_evidence,
 )
 
 
@@ -101,3 +103,67 @@ class TestMeetingPrepRetrievalPlanning(unittest.TestCase):
 
         self.assertTrue(plan["include_title_semantic_search"])
         self.assertIn("jamie.fox@example.com", plan["people"])
+
+
+class TestMeetingPrepEvidenceScoring(unittest.TestCase):
+    def test_selects_exact_source_and_rejects_generic_sync_noise(self):
+        meeting = {
+            "title": "last sync part 2",
+            "description": "Agenda: final handovers for Agnes Jang",
+            "attendees": [{"name": "alex.rivera@example.com"}],
+        }
+        entries = [
+            {
+                "id": "good",
+                "entity_type": "update",
+                "name": "Agnes handover",
+                "content": "Agnes Jang has handover items to finalize.",
+                "source_title": "last sync part 2",
+                "source_date": "2026-05-13",
+                "mentioned_people": ["Agnes Jang"],
+                "related_people": ["Agnes Jang"],
+                "related_projects": [],
+            },
+            {
+                "id": "bad",
+                "entity_type": "topic",
+                "name": "QVC sync review",
+                "content": "QVC follow-up sync needs rescheduling.",
+                "source_title": "Re: QVC x Rokt follow up",
+                "source_date": "2026-03-24",
+                "mentioned_people": ["Stephanie"],
+                "related_people": ["Stephanie"],
+                "related_projects": ["QVC"],
+                "_query_label": "title:last sync part 2",
+            },
+        ]
+
+        included, excluded = select_prep_evidence(meeting, entries, max_items=5)
+
+        self.assertEqual([item.entry["id"] for item in included], ["good"])
+        self.assertEqual([item.entry["id"] for item in excluded], ["bad"])
+        self.assertIn("exact source title", included[0].reasons)
+        self.assertIn("generic title search", excluded[0].reasons)
+
+    def test_formats_evidence_context_with_ids(self):
+        evidence = [
+            PrepEvidence(
+                evidence_id="E1",
+                entry={
+                    "source_date": "2026-05-13",
+                    "entity_type": "commitment",
+                    "source_title": "last sync part 2",
+                    "name": "Agnes handover",
+                    "content": "Agnes Jang needs to finalize mapping handover.",
+                },
+                score=90,
+                reasons=["exact source title"],
+            )
+        ]
+
+        context = format_prep_evidence_context(evidence)
+
+        self.assertIn("[E1]", context)
+        self.assertIn("date=2026-05-13", context)
+        self.assertIn("source=last sync part 2", context)
+        self.assertIn("Agnes handover", context)
