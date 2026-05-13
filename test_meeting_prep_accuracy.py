@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 from meeting_prep_accuracy import (
     PrepEvidence,
     build_prep_diagnostics,
+    finalize_evidence_gated_prep,
     is_generic_meeting_title,
     plan_prep_queries,
     select_prep_evidence,
@@ -64,6 +65,42 @@ class TestMeetingPrepAccuracyUtilities(unittest.TestCase):
         self.assertIn("included E1 score=90", text)
         self.assertIn("excluded X1 score=-20", text)
         self.assertIn("generic title search", text)
+
+    def test_finalize_evidence_gated_prep_keeps_cited_bullets_and_drops_uncited(self):
+        evidence = [
+            PrepEvidence(
+                evidence_id="E1",
+                entry={"source_title": "last sync part 2", "source_date": "2026-05-13"},
+                score=90,
+                reasons=["exact source title"],
+            )
+        ]
+        raw_text = "\n".join(
+            [
+                "📋 *meeting prep — last sync part 2*",
+                "- *Agnes* needs to finalize the handover mapping. [E1]",
+                "- PacSun launch has an open blocker.",
+            ]
+        )
+
+        brief = finalize_evidence_gated_prep("last sync part 2", raw_text, evidence)
+
+        self.assertIn("📋 *meeting prep — last sync part 2*", brief)
+        self.assertIn("*Agnes* needs to finalize the handover mapping.", brief)
+        self.assertIn("_(source: last sync part 2, 2026-05-13)_", brief)
+        self.assertNotIn("[E1]", brief)
+        self.assertNotIn("PacSun", brief)
+
+    def test_finalize_evidence_gated_prep_uses_low_context_message_without_evidence(self):
+        brief = finalize_evidence_gated_prep(
+            "last sync part 2",
+            "- PacSun launch has an open blocker.",
+            [],
+        )
+
+        self.assertIn("📋 *meeting prep — last sync part 2*", brief)
+        self.assertIn("I don't have strong prep context for this one yet.", brief)
+        self.assertNotIn("PacSun", brief)
 
 
 class TestMeetingPrepRetrievalPlanning(unittest.TestCase):
@@ -247,7 +284,8 @@ class TestMeetingPrepEvidenceScoring(unittest.TestCase):
         ):
             brief = proactive_intelligence._build_meeting_prep(meeting)
 
-        self.assertEqual(brief, "brief")
+        self.assertIn("📋 *meeting prep — weekly sync*", brief)
+        self.assertIn("I don't have strong prep context for this one yet.", brief)
         self.assertTrue(captured_prompts)
         self.assertIn(
             "(No strong prior context found for this meeting.)",
@@ -304,3 +342,45 @@ class TestMeetingPrepEvidenceScoring(unittest.TestCase):
             captured_entries[0]["_query_labels"],
             ["person:agnes.jang@rokt.com", "title:PacSun launch"],
         )
+
+    def test_build_meeting_prep_drops_uncited_generated_bullets(self):
+        import proactive_intelligence
+
+        evidence_entry = {
+            "id": "evidence-1",
+            "entity_type": "update",
+            "name": "Agnes handover",
+            "content": "Agnes Jang needs to finalize mapping handover.",
+            "source_title": "last sync part 2",
+            "source_date": "2026-05-13",
+            "mentioned_people": ["Agnes Jang"],
+            "related_people": ["Agnes Jang"],
+        }
+        meeting = {
+            "title": "last sync part 2",
+            "description": "Agenda: final handovers for Agnes Jang",
+            "attendees": [{"name": "agnes.jang@rokt.com"}],
+            "start_time": "2026-05-13T10:00:00Z",
+        }
+        raw_brief = "\n".join(
+            [
+                "📋 *meeting prep — last sync part 2*",
+                "- *Agnes* needs to finalize mapping handover. [E1]",
+                "- PacSun launch has an unrelated open blocker.",
+            ]
+        )
+
+        with (
+            patch.object(proactive_intelligence, "query_by_person", return_value=[evidence_entry]),
+            patch.object(proactive_intelligence.genai, "GenerativeModel", return_value=object()),
+            patch.object(
+                proactive_intelligence,
+                "traced_generate_content",
+                return_value=MagicMock(text=raw_brief),
+            ),
+        ):
+            brief = proactive_intelligence._build_meeting_prep(meeting)
+
+        self.assertIn("*Agnes* needs to finalize mapping handover.", brief)
+        self.assertIn("_(source: last sync part 2, 2026-05-13)_", brief)
+        self.assertNotIn("PacSun", brief)
