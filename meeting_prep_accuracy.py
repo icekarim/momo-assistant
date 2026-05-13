@@ -179,11 +179,6 @@ def score_prep_entry(meeting: dict[str, Any], entry: dict[str, Any]) -> tuple[in
         score -= 15
         reasons.append("calendar-only weak context")
 
-    name_and_content = f"{entry.get('name', '')} {entry.get('content', '')}".lower()
-    if any(word in name_and_content for word in ("tekken", "farewell social", "social")):
-        score -= 25
-        reasons.append("social context")
-
     return score, reasons or ["weak relevance"]
 
 
