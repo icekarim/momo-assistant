@@ -240,6 +240,39 @@ class TestMeetingPrepRetrievalPlanning(unittest.TestCase):
         self.assertTrue(plan["include_title_semantic_search"])
         self.assertIn("jessica.francis@rokt.com", plan["people"])
 
+    def test_large_generic_meeting_does_not_treat_email_domain_as_a_mention(self):
+        # The description quotes the organizer's personal gmail. The ".com"
+        # token used to match every attendee's @rokt.com email, falsely
+        # promoting unrelated attendees into the "mentioned in description"
+        # bucket. Only Agnes is actually named in the text.
+        meeting = {
+            "title": "last sync part 2",
+            "description": (
+                "Piggy backing onto Parth's event. Come say bye! "
+                "agnes.jang98@gmail.com"
+            ),
+            "organizer": "agnes.jang@rokt.com",
+            "attendees": [
+                {"name": "agnes.jang@rokt.com"},
+                {"name": "jessica.francis@rokt.com"},
+                {"name": "ellie.park@rokt.com"},
+                {"name": "patrick.tsui@rokt.com"},
+                {"name": "sasha.marks@rokt.com"},
+                {"name": "matthew.monjarrez@rokt.com"},
+                {"name": "parth.merchant@rokt.com"},
+                {"name": "joe.klafka@rokt.com"},
+                {"name": "da.qu@rokt.com"},
+            ],
+        }
+
+        plan = plan_prep_queries(meeting)
+
+        self.assertIn("agnes.jang@rokt.com", plan["people"])
+        self.assertIn("parth.merchant@rokt.com", plan["people"])
+        self.assertNotIn("jessica.francis@rokt.com", plan["people"])
+        self.assertNotIn("ellie.park@rokt.com", plan["people"])
+        self.assertNotIn("patrick.tsui@rokt.com", plan["people"])
+
 
 class TestMeetingPrepEvidenceScoring(unittest.TestCase):
     def test_selects_evidence_ids_stably_independent_of_input_order(self):
