@@ -256,17 +256,14 @@ def finalize_evidence_gated_prep(
         if not cited_ids:
             continue
 
-        cleaned = re.sub(
-            r"\s*(?:_)?\(?source:.*?(?:\)_|$)",
-            "",
-            stripped,
-            flags=re.IGNORECASE,
-        ).strip()
+        cleaned = re.sub(r"\s*_?\(source:[^)]+\)_?\s*$", "", stripped, flags=re.IGNORECASE).strip()
         cleaned = re.sub(
             r"\s*(?<![A-Za-z0-9])\[?E\d+\]?(?![A-Za-z0-9])",
             "",
             cleaned,
         ).strip()
+        cleaned = re.sub(r"^#{1,6}\s*", "", cleaned).strip()
+        cleaned = re.sub(r"^(?:[-*•]\s+|\d+[.)]\s+)", "", cleaned).strip()
         if not cleaned:
             continue
 
@@ -279,7 +276,7 @@ def finalize_evidence_gated_prep(
             if source not in sources:
                 sources.append(source)
 
-        kept_lines.append(f"{cleaned} _(source: {'; '.join(sources)})_")
+        kept_lines.append(f"- {cleaned} _(source: {'; '.join(sources)})_")
         if len(kept_lines) >= 6:
             break
 
