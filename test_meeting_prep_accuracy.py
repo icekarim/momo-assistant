@@ -107,6 +107,62 @@ class TestMeetingPrepRetrievalPlanning(unittest.TestCase):
 
 
 class TestMeetingPrepEvidenceScoring(unittest.TestCase):
+    def test_selects_evidence_ids_stably_independent_of_input_order(self):
+        meeting = {
+            "title": "PacSun launch",
+            "description": "",
+            "attendees": [{"name": "agnes.jang@rokt.com"}],
+        }
+        first = {
+            "id": "a-entry",
+            "entity_type": "update",
+            "name": "Alpha update",
+            "content": "PacSun launch alpha detail.",
+            "source_title": "PacSun launch",
+            "source_date": "2026-05-13",
+        }
+        second = {
+            "id": "b-entry",
+            "entity_type": "update",
+            "name": "Beta update",
+            "content": "PacSun launch beta detail.",
+            "source_title": "PacSun launch",
+            "source_date": "2026-05-13",
+        }
+
+        included_forward, _ = select_prep_evidence(meeting, [first, second], max_items=5)
+        included_reverse, _ = select_prep_evidence(meeting, [second, first], max_items=5)
+
+        forward_ids = {item.entry["id"]: item.evidence_id for item in included_forward}
+        reverse_ids = {item.entry["id"]: item.evidence_id for item in included_reverse}
+        self.assertEqual(forward_ids, reverse_ids)
+        self.assertEqual(forward_ids, {"a-entry": "E1", "b-entry": "E2"})
+
+    def test_scores_all_query_labels_for_duplicate_entries(self):
+        meeting = {
+            "title": "weekly sync",
+            "description": "Agenda: final handovers for Agnes Jang",
+            "attendees": [{"name": "agnes.jang@rokt.com"}],
+        }
+        entries = [
+            {
+                "id": "merged",
+                "entity_type": "update",
+                "name": "Agnes handover",
+                "content": "Agnes Jang has handover items to finalize.",
+                "source_title": "weekly sync",
+                "source_date": "2026-05-13",
+                "mentioned_people": ["Agnes Jang"],
+                "_query_labels": ["person:agnes.jang@rokt.com", "title:weekly sync"],
+            }
+        ]
+
+        included, _ = select_prep_evidence(meeting, entries, max_items=5)
+
+        self.assertEqual([item.entry["id"] for item in included], ["merged"])
+        self.assertIn("person query match", included[0].reasons)
+        self.assertIn("generic title search", included[0].reasons)
+
     def test_selects_exact_source_and_rejects_generic_sync_noise(self):
         meeting = {
             "title": "last sync part 2",
@@ -200,4 +256,51 @@ class TestMeetingPrepEvidenceScoring(unittest.TestCase):
         self.assertNotIn(
             "(No prior context found for these attendees or topics.)",
             captured_prompts[0],
+        )
+
+    def test_build_meeting_prep_merges_duplicate_query_labels(self):
+        import knowledge_graph
+        import meeting_prep_accuracy
+        import proactive_intelligence
+
+        captured_entries = []
+        duplicate_entry = {
+            "id": "dup",
+            "entity_type": "update",
+            "name": "PacSun mapping",
+            "content": "PacSun launch mapping needs review.",
+            "source_title": "PacSun launch",
+            "source_date": "2026-05-13",
+            "related_projects": [],
+        }
+        original_select = meeting_prep_accuracy.select_prep_evidence
+
+        def capture_select(meeting, entries, *args, **kwargs):
+            captured_entries.extend(entries)
+            return original_select(meeting, entries, *args, **kwargs)
+
+        meeting = {
+            "title": "PacSun launch",
+            "description": "",
+            "attendees": [{"name": "agnes.jang@rokt.com"}],
+            "start_time": "2026-05-13T10:00:00Z",
+        }
+
+        with (
+            patch.object(proactive_intelligence, "query_by_person", return_value=[duplicate_entry]),
+            patch.object(knowledge_graph, "semantic_search", return_value=[duplicate_entry]),
+            patch.object(meeting_prep_accuracy, "select_prep_evidence", side_effect=capture_select),
+            patch.object(proactive_intelligence.genai, "GenerativeModel", return_value=object()),
+            patch.object(
+                proactive_intelligence,
+                "traced_generate_content",
+                return_value=MagicMock(text="brief"),
+            ),
+        ):
+            proactive_intelligence._build_meeting_prep(meeting)
+
+        self.assertEqual(len(captured_entries), 1)
+        self.assertEqual(
+            captured_entries[0]["_query_labels"],
+            ["person:agnes.jang@rokt.com", "title:PacSun launch"],
         )
