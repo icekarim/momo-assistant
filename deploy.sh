@@ -37,8 +37,20 @@ print('  Granola token synced to Firestore')
 " 2>/dev/null || echo "  (Firestore sync skipped — will use env var fallback)"
 fi
 
+if [ -f token.json ]; then
+    echo "Syncing Google token to Firestore..."
+    python3 -c "
+from google_auth import _write_credentials_to_firestore
+import json
+with open('token.json') as f:
+    credentials = json.load(f)
+_write_credentials_to_firestore(json.dumps(credentials))
+print('  Google token synced to Firestore')
+" 2>/dev/null || echo "  (Firestore sync skipped — will use env var fallback)"
+fi
+
 # Read token files into variables for passing as env vars
-GOOGLE_TOKEN_JSON=$(cat token.json)
+GOOGLE_TOKEN_JSON="${GOOGLE_TOKEN_JSON:-$(cat token.json 2>/dev/null || echo "")}"
 GRANOLA_TOKEN_JSON=$(cat granola_token.json 2>/dev/null || echo "")
 
 # Build and deploy in one step
@@ -90,3 +102,5 @@ echo "  3. Create another Cloud Scheduler job to call: ${URL}/email-alerts (e.g.
 echo "  4. Create Cloud Scheduler job for: ${URL}/meeting-debrief (e.g. */10 9-18 * * 1-5)"
 echo "  5. Create Cloud Scheduler job for: ${URL}/meeting-prep (e.g. */10 9-18 * * 1-5)"
 echo "  6. (One-time) Backfill knowledge graph: curl -X POST ${URL}/knowledge-backfill"
+echo "  7. Create Cloud Scheduler job for Google token keepalive: POST ${URL}/google-token-refresh (every ~4 hours)"
+echo "  8. Create Cloud Scheduler job for Granola token keepalive: POST ${URL}/granola-token-refresh (every 4 hours)"
