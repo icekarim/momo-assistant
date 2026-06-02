@@ -2,14 +2,17 @@
 Momo — FastAPI Application
 
 Endpoints:
-  POST /chat                    — Google Chat webhook (receives user messages)
-  POST /briefing                — Trigger morning briefing (called by Cloud Scheduler)
-  POST /email-alerts            — Trigger proactive important email checks
-  POST /meeting-debrief         — Post-meeting debrief with Granola notes (Cloud Scheduler)
-  POST /meeting-prep            — Pre-meeting prep briefs with KG context (Cloud Scheduler)
-  POST /knowledge-backfill      — Backfill knowledge graph from recent meetings/emails
-  POST /knowledge-embed-backfill — Add vector embeddings to existing KG entities
-  GET  /health                  — Health check
+  POST /chat                    - Google Chat webhook (receives user messages)
+  POST /briefing                - Trigger morning briefing (called by Cloud Scheduler)
+  POST /email-alerts            - Trigger proactive important email checks
+  POST /meeting-debrief         - Post-meeting debrief with Granola notes (Cloud Scheduler)
+  POST /meeting-prep            - Pre-meeting prep briefs with KG context (Cloud Scheduler)
+  POST /knowledge-backfill      - Backfill knowledge graph from recent meetings/emails
+  POST /knowledge-embed-backfill - Add vector embeddings to existing KG entities
+  POST /google-token-refresh    - Keep Google OAuth token alive and surface reauth
+  GET  /google-auth/start       - Browser-based Google reauth, requires one-time ticket ?t=
+  GET  /google-auth/callback    - Completes Google reauth and stores credentials
+  GET  /health                  - Health check
 """
 
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
@@ -56,7 +59,7 @@ app = FastAPI(title="Momo")
 # ── API Secret Middleware ────────────────────────────────────
 # Protects all endpoints except /health, /, and /chat (Google Chat webhook)
 
-_OPEN_PATHS = {"/health", "/", "/chat", "/granola-auth/start", "/granola-auth/callback"}
+_OPEN_PATHS = {"/health", "/", "/chat", "/granola-auth/start", "/granola-auth/callback", "/google-auth/start", "/google-auth/callback"}
 
 
 @app.middleware("http")
@@ -350,6 +353,34 @@ async def trigger_promote_eval_failures():
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+# ── Google Token Refresh ─────────────────────────────────────
+
+@app.post("/google-token-refresh")
+async def google_token_refresh():
+    """Proactively refresh the Google OAuth token.
+
+    Called by Cloud Scheduler to keep Google credentials alive and to surface
+    a re-auth link when refresh is no longer possible.
+    """
+    try:
+        from google_auth import refresh_google_credentials, is_reauth_required
+
+        refreshed = refresh_google_credentials()
+        if refreshed:
+            return {"status": "ok", "message": "Google credentials are valid"}
+
+        if is_reauth_required():
+            return {
+                "status": "reauth_required",
+                "message": "Google credentials need re-authentication",
+            }
+
+        return {"status": "error", "message": "Google credentials refresh failed"}
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "message": f"Google credentials refresh failed: {str(e)}"}
+
+
 # ── Granola Token Refresh ────────────────────────────────────
 
 @app.post("/granola-token-refresh")
@@ -463,6 +494,92 @@ async def granola_auth_callback(code: str = "", state: str = "", error: str = ""
         "<html><body style='font-family: system-ui; text-align: center; padding: 60px;'>"
         "<h1>&#10004; Granola reconnected</h1>"
         "<p>Momo will resume pulling meeting notes automatically. You can close this tab.</p>"
+        "</body></html>"
+    )
+
+
+# ── Google Self-Serve Re-Auth ───────────────────────────────
+
+@app.get("/google-auth/start")
+async def google_auth_start(request: Request, t: str = ""):
+    """Browser-based Google OAuth re-authentication."""
+    from google_auth import start_web_reauth
+
+    base_url = str(request.base_url).rstrip("/")
+    redirect_uri = f"{base_url}/google-auth/callback"
+
+    if not t:
+        return HTMLResponse(
+            "<html><body><h2>Missing or invalid re-auth link</h2>"
+            "<p>Please open the link from Chat again.</p></body></html>",
+            status_code=403,
+        )
+
+    try:
+        auth_url = await start_web_reauth(redirect_uri, t)
+    except Exception as e:
+        traceback.print_exc()
+        return HTMLResponse(
+            f"<html><body><h2>Google re-auth failed</h2><p>{html.escape(str(e))}</p></body></html>",
+            status_code=500,
+        )
+
+    if not auth_url:
+        return HTMLResponse(
+            "<html><body><h2>Re-auth link invalid or expired</h2>"
+            "<p>Please request a new link from Chat.</p></body></html>",
+            status_code=403,
+        )
+
+    return RedirectResponse(auth_url)
+
+
+@app.get("/google-auth/callback")
+async def google_auth_callback(code: str = "", state: str = "", error: str = ""):
+    """OAuth callback from Google after user authenticates."""
+    if error:
+        return HTMLResponse(
+            f"<html><body><h2>Google auth failed</h2><p>{html.escape(error)}</p></body></html>",
+            status_code=400,
+        )
+
+    if not code or not state:
+        return HTMLResponse(
+            "<html><body><h2>Missing code or state parameter</h2></body></html>",
+            status_code=400,
+        )
+
+    from google_auth import complete_web_reauth
+
+    try:
+        success = await complete_web_reauth(code, state)
+    except Exception as e:
+        traceback.print_exc()
+        return HTMLResponse(
+            f"<html><body><h2>Token exchange failed</h2><p>{html.escape(str(e))}</p></body></html>",
+            status_code=500,
+        )
+
+    if not success:
+        return HTMLResponse(
+            "<html><body><h2>Re-auth failed</h2>"
+            "<p>Invalid or expired state. Try clicking the re-auth link again.</p></body></html>",
+            status_code=400,
+        )
+
+    if config.CHAT_SPACE_ID:
+        try:
+            send_chat_message(
+                config.CHAT_SPACE_ID,
+                "✅ *Google reconnected!* gmail, calendar, and tasks are back online.",
+            )
+        except Exception:
+            pass
+
+    return HTMLResponse(
+        "<html><body style='font-family: system-ui; text-align: center; padding: 60px;'>"
+        "<h1>&#10004; Google reconnected</h1>"
+        "<p>Momo will resume syncing workspace data automatically. You can close this tab.</p>"
         "</body></html>"
     )
 
