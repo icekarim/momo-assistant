@@ -1,6 +1,9 @@
 import asyncio
 import json
+import os
+import shutil
 import sys
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -64,7 +67,8 @@ config_mock.MOMO_API_SECRET = ""
 config_mock.CHAT_SPACE_ID = "spaces/test_space"
 config_mock.MOMO_SERVICE_URL = "https://momo.example"
 config_mock.GOOGLE_SCOPES = ["scope-a"]
-config_mock.GOOGLE_TOKEN_FILE = "token.json"
+_TEST_TOKEN_DIR = tempfile.mkdtemp(prefix="momo-test-google-auth-routes-")
+config_mock.GOOGLE_TOKEN_FILE = os.path.join(_TEST_TOKEN_DIR, "token.json")
 config_mock.GRANOLA_ENABLED = True
 config_mock.KNOWLEDGE_GRAPH_ENABLED = False
 sys.modules["config"] = config_mock
@@ -98,6 +102,7 @@ import main
 
 
 def tearDownModule():
+    shutil.rmtree(_TEST_TOKEN_DIR, ignore_errors=True)
     for name in _MODULES_TO_ISOLATE:
         original = _ORIGINAL_MODULES[name]
         if original is _SENTINEL:

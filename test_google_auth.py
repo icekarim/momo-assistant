@@ -1,5 +1,8 @@
 import asyncio
+import os
+import shutil
 import sys
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -30,7 +33,8 @@ for name in _MODULES_TO_ISOLATE:
 
 config_mock = MagicMock()
 config_mock.GOOGLE_SCOPES = ["scope-a", "scope-b"]
-config_mock.GOOGLE_TOKEN_FILE = "token.json"
+_TEST_TOKEN_DIR = tempfile.mkdtemp(prefix="momo-test-google-auth-")
+config_mock.GOOGLE_TOKEN_FILE = os.path.join(_TEST_TOKEN_DIR, "token.json")
 config_mock.CHAT_SPACE_ID = "spaces/test"
 config_mock.MOMO_SERVICE_URL = "https://momo.example"
 config_mock.FIRESTORE_DATABASE = "testing"
@@ -83,6 +87,7 @@ sys.modules["google_auth"] = google_auth
 
 def tearDownModule():
     google_auth._cached_creds = None
+    shutil.rmtree(_TEST_TOKEN_DIR, ignore_errors=True)
     for name in _MODULES_TO_ISOLATE:
         original = _ORIGINAL_MODULES[name]
         if original is _SENTINEL:
@@ -106,6 +111,35 @@ class TestGoogleAuthSelfHealing(unittest.TestCase):
         google_auth.Credentials.from_authorized_user_info.reset_mock()
         google_auth.Credentials.from_authorized_user_file.reset_mock()
         google_auth.Request.reset_mock()
+
+    def test_write_credentials_to_file_never_touches_repo_token_json(self):
+        repo_token = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "token.json"
+        )
+        self.assertNotEqual(
+            os.path.abspath(google_auth.config.GOOGLE_TOKEN_FILE),
+            repo_token,
+            "tests must not point GOOGLE_TOKEN_FILE at the real repo token.json",
+        )
+
+        before = None
+        if os.path.exists(repo_token):
+            with open(repo_token, "rb") as handle:
+                before = handle.read()
+
+        google_auth._write_credentials_to_file("<MagicMock id='0xdeadbeef'>")
+
+        if before is None:
+            self.assertFalse(
+                os.path.exists(repo_token),
+                "tests must not create the real repo token.json",
+            )
+        else:
+            with open(repo_token, "rb") as handle:
+                after = handle.read()
+            self.assertEqual(
+                before, after, "tests must not modify the real repo token.json"
+            )
 
     def test_firestore_token_is_preferred_over_stale_google_token_json(self):
         firestore_creds = _make_creds(json_text='{"access_token": "fs-token"}')
