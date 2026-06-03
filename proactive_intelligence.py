@@ -32,7 +32,6 @@ from conversation_store import (
     mark_prep_sent,
 )
 from knowledge_graph import (
-    format_knowledge_for_context,
     query_all_entries,
     query_by_person,
     query_by_project,
@@ -105,19 +104,25 @@ Meeting: {title}
 Attendees: {attendees}
 Starts: {start_time}
 
-Here is everything Momo knows about the people and topics involved (from past meetings, emails, and conversations):
+Use ONLY evidence items below. Each item has an ID like [E1].
+Every bullet MUST cite at least one evidence ID, like [E1].
+Do NOT mention a person, task, project, blocker, departure, deadline, or decision unless evidence explicitly supports it.
+Do NOT combine facts across evidence items unless they share the same person or project explicitly.
+If evidence is weak or empty, say no strong prep context.
+Keep 3-6 bullets max.
+Start with: 📋 *meeting prep — {title}*
+
+Evidence:
 
 {knowledge_context}
 
-Write a short pre-meeting prep (3-6 bullet points max). Include:
+Write a short pre-meeting prep. Include:
 - Key context about the attendees from past interactions
 - Any open commitments or action items involving these people
 - Relevant decisions or blockers from previous meetings
 - Anything the user should be prepared to discuss
 
-If there's very little context, just say so briefly — don't pad it out.
-Format for Google Chat: use *bold* for names and topics, bullet points for items.
-Start with: 📋 *meeting prep — {title}*"""
+Format for Google Chat: use *bold* for names and topics, bullet points for items."""
 
 
 def _build_meeting_prep(meeting: dict) -> str | None:
@@ -126,37 +131,69 @@ def _build_meeting_prep(meeting: dict) -> str | None:
     if not attendee_names:
         return None
 
-    all_entries = []
-    seen_ids = set()
+    entries_by_id = {}
     title = meeting.get("title", "")
+    from meeting_prep_accuracy import (
+        build_prep_diagnostics,
+        finalize_evidence_gated_prep,
+        format_prep_evidence_context,
+        plan_prep_queries,
+        select_prep_evidence,
+    )
+    query_plan = plan_prep_queries(meeting)
+    query_labels = []
 
-    # Query KG in parallel: by each attendee AND by meeting title (semantic search)
+    def _add_labeled_entry(entry: dict, label: str) -> None:
+        entry_id = entry["id"]
+        existing = entries_by_id.get(entry_id)
+        if existing is None:
+            existing = dict(entry)
+            entries_by_id[entry_id] = existing
+
+        labels = set()
+        legacy_label = existing.get("_query_label")
+        if legacy_label:
+            labels.add(legacy_label)
+        existing_labels = existing.get("_query_labels") or []
+        if isinstance(existing_labels, str):
+            existing_labels = [existing_labels]
+        labels.update(existing_labels)
+        labels.add(label)
+        sorted_labels = sorted(labels)
+        existing["_query_labels"] = sorted_labels
+        existing["_query_label"] = sorted_labels[0]
+
+    # Query KG in parallel: by planned people and, when specific enough, title.
     from knowledge_graph import semantic_search as _semantic_search
-    workers = max(len(attendee_names) + 1, 4)
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        person_futures = {
-            pool.submit(query_by_person, attendee, None, 8): f"person:{attendee}"
-            for attendee in attendee_names
-        }
-        # Also search by meeting title to catch topic-based KG entries
-        title_future = pool.submit(_semantic_search, title, 10)
-        person_futures[title_future] = f"title:{title}"
+    planned_people = query_plan["people"]
+    query_count = len(planned_people) + int(query_plan["include_title_semantic_search"])
+    if query_count:
+        workers = max(query_count, 4)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            kg_futures = {
+                pool.submit(query_by_person, person, None, 8): f"person:{person}"
+                for person in planned_people
+            }
+            if query_plan["include_title_semantic_search"]:
+                title_future = pool.submit(_semantic_search, title, 10)
+                kg_futures[title_future] = f"title:{title}"
+            query_labels.extend(kg_futures.values())
 
-        for future in as_completed(person_futures):
-            label = person_futures[future]
-            try:
-                for entry in future.result():
-                    if entry["id"] not in seen_ids:
-                        seen_ids.add(entry["id"])
-                        all_entries.append(entry)
-            except Exception as exc:
-                print(f"    KG query failed ({label}): {exc}")
+            for future in as_completed(kg_futures):
+                label = kg_futures[future]
+                try:
+                    for entry in future.result():
+                        _add_labeled_entry(entry, label)
+                except Exception as exc:
+                    print(f"    KG query failed ({label}): {exc}")
+    else:
+        print("    KG query skipped: no planned meeting prep queries")
 
     # Also query by projects found in existing results
     projects = set()
-    for e in all_entries:
+    for e in entries_by_id.values():
         projects.update(e.get("related_projects", []))
-    project_list = list(projects)[:3]
+    project_list = sorted(projects)[:3]
 
     if project_list:
         with ThreadPoolExecutor(max_workers=len(project_list)) as pool:
@@ -164,22 +201,21 @@ def _build_meeting_prep(meeting: dict) -> str | None:
                 pool.submit(query_by_project, proj, None, 5): proj
                 for proj in project_list
             }
+            query_labels.extend(f"project:{proj}" for proj in proj_futures.values())
             for future in as_completed(proj_futures):
+                proj = proj_futures[future]
                 try:
                     for entry in future.result():
-                        if entry["id"] not in seen_ids:
-                            seen_ids.add(entry["id"])
-                            all_entries.append(entry)
+                        _add_labeled_entry(entry, f"project:{proj}")
                 except Exception as exc:
                     print(f"    KG project query failed: {exc}")
 
-    attendees_str = ", ".join(attendee_names)
+    all_entries = list(entries_by_id.values())
+    included_evidence, excluded_evidence = select_prep_evidence(meeting, all_entries)
+    print(build_prep_diagnostics(meeting, included_evidence, excluded_evidence, query_labels))
 
-    if not all_entries:
-        # No KG context — generate a minimal prep with just attendee + time info
-        knowledge_context = "(No prior context found for these attendees or topics.)"
-    else:
-        knowledge_context = format_knowledge_for_context(all_entries[:20])
+    attendees_str = ", ".join(attendee_names)
+    knowledge_context = format_prep_evidence_context(included_evidence)
 
     prompt = _PREP_PROMPT.format(
         title=meeting["title"],
@@ -191,7 +227,7 @@ def _build_meeting_prep(meeting: dict) -> str | None:
     model = genai.GenerativeModel(model_name=config.GEMINI_MODEL_FLASH)
     try:
         resp = traced_generate_content(model, prompt, model_name=config.GEMINI_MODEL_FLASH)
-        return resp.text.strip()
+        return finalize_evidence_gated_prep(title, resp.text.strip(), included_evidence)
     except Exception as exc:
         print(f"  Meeting prep generation failed: {exc}")
         return None

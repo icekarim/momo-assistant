@@ -197,6 +197,7 @@ Return a JSON array of objects. Each object represents one piece of knowledge:
   "content": "1-2 sentence description of what was said/decided/committed",
   "status": "open" | "completed" | "resolved" | null,
   "owner": "person responsible (if known, else null)",
+  "mentioned_people": ["people explicitly named in the content"],
   "related_people": ["list of people mentioned or involved"],
   "related_projects": ["list of projects, clients, or initiatives mentioned"],
   "tags": ["lowercase keywords for search, 3-6 tags"]
@@ -214,6 +215,7 @@ Rules:
 - Extract ONLY what is explicitly stated. Do not infer or fabricate.
 - Be specific in "content" — include names, dates, numbers when present.
 - "related_people" should include first names or full names as they appear.
+- "mentioned_people" should include only people explicitly named in CONTENT; attendees who are not mentioned should not be included there.
 - "related_projects" should include client names, product names, initiative names.
 - "tags" should be lowercase, no spaces, useful for search (e.g. "pricing", "q2", "launch").
 - If no meaningful knowledge can be extracted, return an empty array: []
@@ -307,41 +309,72 @@ def _search_tokens_for_projects(projects: list[str]) -> list[str]:
     return sorted(tokens)
 
 
+def _prepare_entry_document(
+    entry: dict,
+    source_type: str,
+    source_title: str,
+    source_date: str,
+    attendees: list[str],
+) -> dict:
+    """Build the Firestore document payload for a single extracted entry.
+
+    Separates ``mentioned_people`` (explicitly named in CONTENT) from
+    ``attendees`` (meeting participants) so retrieval can distinguish direct
+    references from passive presence. Legacy ``related_people`` and
+    ``_search_people`` fields are preserved for backwards-compatible queries.
+    """
+    people = entry.get("related_people", [])
+    owner = entry.get("owner")
+    projects = entry.get("related_projects", [])
+    mentioned_people = entry.get("mentioned_people") or people
+    now_iso = datetime.now(timezone.utc).isoformat()
+    doc = {
+        "entity_type": entry.get("entity_type", "topic"),
+        "name": entry.get("name", ""),
+        "content": entry.get("content", ""),
+        "status": entry.get("status"),
+        "owner": owner,
+        "mentioned_people": mentioned_people,
+        "attendees": attendees or [],
+        "related_people": people,
+        "related_projects": projects,
+        "tags": entry.get("tags", []),
+        # Indexed search token arrays for Firestore-native queries
+        "_search_people": _search_tokens_for_people(people, owner),
+        "_search_mentioned_people": _search_tokens_for_people(mentioned_people, owner),
+        "_search_attendees": _search_tokens_for_people(attendees or []),
+        "_search_projects": _search_tokens_for_projects(projects),
+        "source_type": source_type,
+        "source_id": "",
+        "source_title": source_title,
+        "source_date": _normalize_source_date(source_date),
+        "extracted_at": now_iso,
+    }
+    try:
+        text = _build_embedding_text(entry, source_type=source_type)
+        doc["embedding"] = Vector(_get_embedding(text))
+        doc["embedding_model"] = config.GEMINI_EMBEDDING_MODEL
+    except Exception as exc:
+        print(f"  Knowledge graph: embedding generation failed ({exc}), storing without")
+    return doc
+
+
 def _store_entries(entries: list[dict], source_type: str, source_id: str,
-                   source_title: str, source_date: str):
+                   source_title: str, source_date: str,
+                   attendees: list[str] | None = None):
     """Persist extracted entries to Firestore with embeddings and invalidate caches."""
     db = get_db()
     collection = db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
-    now_iso = datetime.now(timezone.utc).isoformat()
 
     for entry in entries:
-        people = entry.get("related_people", [])
-        owner = entry.get("owner")
-        projects = entry.get("related_projects", [])
-        doc = {
-            "entity_type": entry.get("entity_type", "topic"),
-            "name": entry.get("name", ""),
-            "content": entry.get("content", ""),
-            "status": entry.get("status"),
-            "owner": owner,
-            "related_people": people,
-            "related_projects": projects,
-            "tags": entry.get("tags", []),
-            # Indexed search token arrays for Firestore-native queries
-            "_search_people": _search_tokens_for_people(people, owner),
-            "_search_projects": _search_tokens_for_projects(projects),
-            "source_type": source_type,
-            "source_id": source_id,
-            "source_title": source_title,
-            "source_date": _normalize_source_date(source_date),
-            "extracted_at": now_iso,
-        }
-        try:
-            text = _build_embedding_text(entry, source_type=source_type)
-            doc["embedding"] = Vector(_get_embedding(text))
-            doc["embedding_model"] = config.GEMINI_EMBEDDING_MODEL
-        except Exception as exc:
-            print(f"  Knowledge graph: embedding generation failed ({exc}), storing without")
+        doc = _prepare_entry_document(
+            entry,
+            source_type=source_type,
+            source_title=source_title,
+            source_date=source_date,
+            attendees=attendees or [],
+        )
+        doc["source_id"] = source_id
         collection.add(doc)
 
     with _kg_cache_lock:
@@ -365,7 +398,8 @@ def extract_and_store(source_type: str, source_id: str, source_title: str,
     entries = _run_extraction(source_type, source_title, content, attendees or [])
 
     if entries:
-        _store_entries(entries, source_type, source_id, source_title, source_date)
+        _store_entries(entries, source_type, source_id, source_title, source_date,
+                       attendees=attendees or [])
         print(f"  Knowledge graph: stored {len(entries)} entries from '{source_title}'")
     else:
         print(f"  Knowledge graph: no entities extracted from '{source_title}'")
