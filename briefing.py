@@ -134,7 +134,7 @@ def run_morning_briefing(space_id: str | None = None, bg_tasks=None):
     meetings_ctx = format_meetings_for_context(meetings)
     tasks_ctx = format_tasks_for_context(tasks)
 
-    print("  Generating briefing with Gemini...")
+    print("  Generating briefing with Claude...")
     summary = generate_morning_briefing(
         emails_ctx, meetings_ctx, tasks_ctx,
         granola_context=granola_ctx, jira_context=jira_ctx,
@@ -200,7 +200,7 @@ def _extract_briefing_sources_to_kg(meetings, tasks, granola_ctx, bg_tasks=None)
 
 def run_proactive_email_alerts(bg_tasks=None):
     """Notify user when a new client/important email arrives.
-    Uses Gemini to triage emails the same way Momo would in conversation.
+    Uses Claude to triage emails the same way Momo would in conversation.
 
     When invoked from a FastAPI handler, pass `bg_tasks` so KG extraction
     runs via BackgroundTasks (survives cpu-throttling=true); otherwise
@@ -216,7 +216,7 @@ def run_proactive_email_alerts(bg_tasks=None):
     if not unseen:
         return {"status": "no_alerts", "alerts_sent": 0, "checked": len(emails)}
 
-    # Batch up to 10 unseen emails for a single Gemini triage call
+    # Batch up to 10 unseen emails for a single Claude triage call
     batch = unseen[: config.EMAIL_ALERTS_MAX_PER_RUN * 2]
     triage_results = _gemini_triage_emails(batch)
     sent_count = 0
