@@ -196,3 +196,44 @@ def _fallback(messages, system, tools, max_tokens):
             if not _is_downshiftable(exc):
                 raise
     raise last_exc
+
+
+_RERANK_SYSTEM = (
+    "You are a search reranker. Given a user query and a numbered list of candidate "
+    "results, return the candidate numbers ordered from MOST to LEAST relevant to the "
+    "query. Only include candidates that are genuinely relevant; drop irrelevant ones. "
+    "Respond with ONLY a JSON array of integers, e.g. [3,1,7]. No prose."
+)
+
+
+def rerank(query: str, candidates: list[str], top_k=None):
+    """Rerank candidate strings by relevance to query using Claude (Haiku).
+
+    Returns a list of 0-based indices into `candidates`, ordered most->least
+    relevant. On any failure returns the original order (graceful fallback),
+    so callers can always rely on getting a usable ordering.
+    """
+    if not candidates:
+        return []
+    n = len(candidates)
+    numbered = "\n".join(f"{i}: {c[:500]}" for i, c in enumerate(candidates))
+    prompt = f"Query: {query}\n\nCandidates:\n{numbered}"
+    try:
+        msg = generate(prompt=prompt, tier=TaskComplexity.LIGHT, system=_RERANK_SYSTEM)
+        order = extract_json(extract_text(msg))
+        if not isinstance(order, list):
+            return list(range(n))
+        seen = set()
+        cleaned = []
+        for x in order:
+            if isinstance(x, int) and 0 <= x < n and x not in seen:
+                cleaned.append(x)
+                seen.add(x)
+        if not cleaned:
+            return list(range(n))
+        if top_k is not None:
+            cleaned = cleaned[:top_k]
+        return cleaned
+    except Exception as exc:
+        print(f"claude_client.rerank failed, using original order — {exc}")
+        return list(range(n))

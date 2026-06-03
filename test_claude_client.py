@@ -102,6 +102,38 @@ def _msg(content, stop_reason="end_turn"):
     return type("M", (), {"content": content, "stop_reason": stop_reason})()
 
 
+def test_rerank_reorders_by_claude_output(monkeypatch):
+    def fake(**kw):
+        return _msg([type("B", (), {"type": "text", "text": "[2,0,1]"})()], "end_turn")
+    monkeypatch.setattr(cc._client, "messages", type("M", (), {"create": staticmethod(fake)})())
+    assert cc.rerank("q", ["a", "b", "c"]) == [2, 0, 1]
+
+
+def test_rerank_top_k_truncates(monkeypatch):
+    def fake(**kw):
+        return _msg([type("B", (), {"type": "text", "text": "[3,1,0,2]"})()], "end_turn")
+    monkeypatch.setattr(cc._client, "messages", type("M", (), {"create": staticmethod(fake)})())
+    assert cc.rerank("q", ["a", "b", "c", "d"], top_k=2) == [3, 1]
+
+
+def test_rerank_garbage_falls_back_to_original_order(monkeypatch):
+    def fake(**kw):
+        return _msg([type("B", (), {"type": "text", "text": "no json"})()], "end_turn")
+    monkeypatch.setattr(cc._client, "messages", type("M", (), {"create": staticmethod(fake)})())
+    assert cc.rerank("q", ["a", "b", "c"]) == [0, 1, 2]
+
+
+def test_rerank_drops_out_of_range_and_dupes(monkeypatch):
+    def fake(**kw):
+        return _msg([type("B", (), {"type": "text", "text": "[1,99,1,0]"})()], "end_turn")
+    monkeypatch.setattr(cc._client, "messages", type("M", (), {"create": staticmethod(fake)})())
+    assert cc.rerank("q", ["a", "b", "c"]) == [1, 0]
+
+
+def test_rerank_empty_returns_empty():
+    assert cc.rerank("q", []) == []
+
+
 def test_gemini_tool_to_claude_shape():
     decl = {"name": "get_x", "description": "d", "parameters": {"type": "object", "properties": {"a": {"type": "string"}}}}
     out = cc.gemini_tool_to_claude(decl)
