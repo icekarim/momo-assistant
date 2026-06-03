@@ -1,7 +1,7 @@
 """Momo briefing + proactive email alert orchestrator."""
 
 import json
-import google.generativeai as genai
+from claude_client import generate, extract_text, extract_json, TaskComplexity
 from gmail_service import (
     fetch_unread_client_emails,
     format_emails_for_context,
@@ -283,9 +283,7 @@ EMAILS:
 
 
 def _gemini_triage_emails(emails):
-    """Use Gemini to decide which emails deserve a proactive alert."""
-    genai.configure(api_key=config.GEMINI_API_KEY)
-
+    """Use Claude to decide which emails deserve a proactive alert."""
     email_block = ""
     for i, e in enumerate(emails):
         body_preview = (e.get("body", "") or "")[:800]
@@ -300,19 +298,13 @@ def _gemini_triage_emails(emails):
 
     prompt = _TRIAGE_PROMPT + email_block
 
-    model = genai.GenerativeModel(model_name=config.GEMINI_MODEL)
-
     try:
-        resp = model.generate_content(prompt)
-        text = resp.text.strip()
-        # Strip markdown code fences if present
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-        if text.endswith("```"):
-            text = text[: text.rfind("```")]
-        results = json.loads(text.strip())
+        msg = generate(prompt=prompt, tier=TaskComplexity.LIGHT)
+        results = extract_json(extract_text(msg))
+        if results is None:
+            return []
     except Exception as exc:
-        print(f"Gemini triage failed: {exc}")
+        print(f"Claude triage failed: {exc}")
         return []
 
     email_map = {e["id"]: e for e in emails}
