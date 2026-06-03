@@ -156,7 +156,7 @@ def run_tool_loop(*, messages, tools, system, dispatch, max_iterations=6,
             else:
                 try:
                     result_str = dispatch(name, tool_input)
-                    if isinstance(result_str, str) and result_str.startswith(("Tool '", "Error calling")):
+                    if isinstance(result_str, str) and result_str.startswith(("Tool '", "Error calling", "Unknown tool")):
                         is_error = True
                 except Exception as exc:
                     result_str = f"Tool '{name}' failed: {exc}"

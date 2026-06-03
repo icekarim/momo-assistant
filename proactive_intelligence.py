@@ -17,8 +17,6 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
-import google.generativeai as genai
-
 import config
 from langsmith_config import traceable
 from claude_client import generate, extract_text, TaskComplexity
@@ -42,7 +40,6 @@ from knowledge_graph import (
     update_entity_status,
 )
 
-genai.configure(api_key=config.GEMINI_API_KEY)
 
 
 def _store_proactive_message(message: str, space_id: str) -> None:
