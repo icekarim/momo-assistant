@@ -793,9 +793,14 @@ def semantic_search(query: str, limit: int | None = None,
     db = get_db()
     collection = db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
 
-    # Over-fetch when a similarity threshold is set, since Firestore returns
-    # the K nearest unconditionally — we'll filter below.
-    fetch_limit = limit * 3 if threshold > 0 else limit
+    rerank_on = config.RERANK_ENABLED
+    # Over-fetch when reranking (need a candidate pool) or threshold-filtering.
+    if rerank_on:
+        fetch_limit = max(config.RERANK_CANDIDATES, limit)
+    elif threshold > 0:
+        fetch_limit = limit * 3
+    else:
+        fetch_limit = limit
 
     vector_query = collection.find_nearest(
         vector_field="embedding",
@@ -805,7 +810,7 @@ def semantic_search(query: str, limit: int | None = None,
         distance_result_field="_distance",
     )
 
-    results = []
+    candidates = []
     for doc in vector_query.stream():
         entity = _doc_to_dict(doc)
         # COSINE distance in Firestore = 1 - cosine_similarity, so similarity
@@ -815,11 +820,17 @@ def semantic_search(query: str, limit: int | None = None,
             similarity = 1.0 - distance
             if similarity < threshold:
                 continue
-        results.append(entity)
-        if len(results) >= limit:
+        candidates.append(entity)
+        if not rerank_on and len(candidates) >= limit:
             break
 
-    return results
+    if not rerank_on or len(candidates) <= 1:
+        return candidates[:limit]
+
+    from claude_client import rerank
+    texts = [_build_embedding_text(c, source_type=c.get("source_type", "")) for c in candidates]
+    order = rerank(query, texts, top_k=limit)
+    return [candidates[i] for i in order]
 
 
 def embed_backfill(include_stale: bool = False) -> dict:

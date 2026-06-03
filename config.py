@@ -81,6 +81,11 @@ KNOWLEDGE_GRAPH_ENABLED = os.getenv("KNOWLEDGE_GRAPH_ENABLED", "true").lower() =
 GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "models/gemini-embedding-001")
 SEMANTIC_SEARCH_THRESHOLD = float(os.getenv("SEMANTIC_SEARCH_THRESHOLD", "0.60"))
 SEMANTIC_SEARCH_LIMIT = int(os.getenv("SEMANTIC_SEARCH_LIMIT", "15"))
+# Claude-as-reranker: re-score the top vector-search candidates with Claude
+# (Haiku) for better precision. RERANK_CANDIDATES are fetched, reranked, then
+# truncated to the requested limit. Falls back to raw vector order on any error.
+RERANK_ENABLED = os.getenv("RERANK_ENABLED", "true").lower() == "true"
+RERANK_CANDIDATES = int(os.getenv("RERANK_CANDIDATES", "30"))
 
 # ── User Memory ─────────────────────────────────────────────
 USER_MEMORY_ENABLED = os.getenv("USER_MEMORY_ENABLED", "true").lower() == "true"
