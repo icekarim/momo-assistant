@@ -1,0 +1,140 @@
+{
+  "provider": "claude",
+  "judge": "gemini-3-flash-preview",
+  "aggregate": {
+    "n": 16,
+    "correctness_rate": 0.75,
+    "hallucination_clean_rate": 0.3125,
+    "avg_quality": 5.0
+  },
+  "examples": [
+    {
+      "user_message": "Show me my recent unread emails",
+      "category": "retrieval",
+      "response": "here's what's in your inbox, Karim \u2014 i filtered out the noise:\n\n\ud83d\udce7 *emails*\n\n*work stuff:*\n- \ud83d\udd34 *Office Depot Dev Connect* (Zoey Hart + Ankur Kumar, Jun 3) \u2014 active thread. Ankur's fixing the 3.5s script delay & mSite issue. Zoey's asking him to confirm the `od_confirmation_staging` / `odp_confirmation_staging` identifiers, and requesting staging site access. you're cc'd.\n- \ud83d\udfe1 *OSD-115043 \u2014 Mercari Mobile SDK Update* (Jira automation, x2) \u2014 you were added as a participant on a P5 ticket about MSDK version 4.13.0 on android. status moved to \"waiting for support.\"\n- \ud83d\udfe2 *SKA Performance Report - June 02* (Zain Jaffer) \u2014 QTD at $70.7M, running at 93.4% to target. APAC and EMEA are the laggards; Travel & Mobility is the standout at 109.1%.\n- \ud83d\udfe2 *Daily Performance Tracking* (Rokt Tableau, 12:30pm) \u2014 your usual tableau subscription digest.\n\n*misc / low priority:*\n- \ud83d\udfe2 *Headshot reminder* (Liz Hecht) \u2014 if you haven't picked your headshot from the Rokt photoshoot, coupon code is `2AGCL` for a free edit.\n- \ud83d\udfe2 *Bubble live demo* (bubble.io newsletter) \u2014 already happened at 12pm ET today, so you missed it.\n- \ud83d\udfe2 ZO event at 175 Varick for First Thursday (today).\n\nthe rest is retail promo stuff (Franco Sarto, Sam Edelman, BU apparel, Mode Earners, impact.com) \u2014 nothing actionable.\n\nanything you wanna dig into?",
+      "correctness": 0,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    },
+    {
+      "user_message": "Find any emails from the engineering team about the deployment",
+      "category": "retrieval",
+      "response": "nothing from the engineering team directly about a deployment, Karim. the closest thing is the rdn v2 standup notes (Jun 1) which mentions deployment in passing \u2014 specifically:\n\n\ud83d\udce7 *relevant find*\n\n- *From:* Gemini (auto-generated standup notes) \u2014 Jun 1\n- *Subject:* Notes: \"rdn v2 standup\"\n- the notes mention someone in NY-A Tribe Called Quest was tasked with merging an attribute propagation PR and *monitoring the deployment to ensure service stability*\n- there's also mention of backend migrations to Postgres being completed\n\neverything else in the results is Datadog digests and DSW test updates \u2014 no direct deployment emails from the eng team.\n\nwant me to try a more specific search? like searching by a person's name or a specific service/project name?",
+      "correctness": 1,
+      "hallucination_clean": 1,
+      "response_quality": 5
+    },
+    {
+      "user_message": "What tasks do I have open?",
+      "category": "tool_use",
+      "response": "just one open task, Karim:\n\n\u2705 *tasks*\n\n- \ud83d\udd34 *update docs \"subtotal\"* \u2014 due May 13 (overdue by 3 weeks, no cap)\n\nwant me to update the due date or mark it done?",
+      "correctness": 1,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    },
+    {
+      "user_message": "Hey what's up?",
+      "category": "conversation",
+      "response": "not much, just vibing and ready to be useful lol. what do you need, Karim?",
+      "correctness": 1,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    },
+    {
+      "user_message": "What's the context on ProjectX? Check emails and meeting notes",
+      "category": "multi_tool",
+      "response": "here's what i found, Karim \u2014\n\n\ud83d\udce7 *emails*\nnothing came up searching \"ProjectX\" in your inbox. zero results there.\n\n\ud83d\uddd2\ufe0f *meeting notes / knowledge graph*\nthe term \"ProjectX\" didn't surface directly either, but there are a couple of references to *PX migration* that might be what you're referring to:\n\n- *PX migration* (as of ~March 31, 2026) \u2014 the Frasers Group team committed to working *exclusively* on PX migration for 30 days. Jennifer Butler is the owner on that one.\n- there's also a *blocker* flagged: the PX migration exclusivity restriction means the team couldn't pick up new work during that window.\n\nboth of those are from the \"FG x Rokt | Monthly Sync Follow Up - 24 Mar 2026\" thread.\n\ntbh the knowledge graph didn't surface anything explicitly called \"ProjectX\" \u2014 it might be going by a different name in your systems, or it's possible it hasn't been discussed in any logged meeting/email yet.\n\nwant me to try a different search term, or do you think PX migration is the one?",
+      "correctness": 1,
+      "hallucination_clean": 1,
+      "response_quality": 5
+    },
+    {
+      "user_message": "Give me a quick rundown of today \u2014 meetings, tasks, and emails",
+      "category": "multi_tool",
+      "response": "here's your wednesday rundown, Karim \ud83d\udc47\n\n\ud83d\udcc5 *schedule*\n\n- 11:00 AM \u2014 *rdn v2 standup* (30 min) w/ Ziquan + launch engineers\n- 12:00 PM \u2014 *Lunch* \ud83c\udf7d\ufe0f\n- 1:00 PM \u2014 *Rokt x Hallmark Technical Sync* (1 hr) w/ Zachary, Olivia, and Hallmark folks (Mike, Shane, Jackie)\n- 2:00 PM \u2014 *Karim / Laura* (30 min) 1:1 w/ Laura Cosgrove\n- 2:30 PM \u2014 *Olivia / Karim* (15 min) quick sync w/ Olivia Hendrzak\n- 3:00 PM \u2014 *DSW | Rokt Monthly* (30 min) w/ the DSW team\n- 4:30 PM \u2014 *Pride Party on Rokt Rooftop* \ud83c\udf89\n- 5:00 PM \u2014 *end of an era* @ Lazy Point (310 Spring St) \u2014 someone's farewell after 3 years at Rokt\n\npacked afternoon, ngl.\n\n---\n\n\u2705 *tasks*\n\n- \ud83d\udd34 *update docs \"subtotal\"* \u2014 overdue since May 13. this one's been sitting there a while, Karim\n\n---\n\n\ud83d\udce7 *emails worth noting*\n\n- \ud83d\udfe1 *Rokt x Office Depot Dev Connect* \u2014 Ankur (ODP contractor) is working on two fixes (removing the 3.5s script delay, enabling Rokt for mSite/WWW). Zoey followed up asking them to confirm the placement identifiers and requesting staging site access. you're CC'd, nothing that seems to need action from you yet\n- \ud83d\udfe1 *OSD-115043 (Jira)* \u2014 Mercari mobile SDK update ticket, status changed to \"Waiting for support.\" you were added as a participant\n- \ud83d\udfe2 *Headshot reminder* \u2014 Liz Hecht says pick your headshot if you haven't. coupon code is `2AGCL`, one free edit from Rokt\n- \ud83d\udfe2 *SKA Performance Report (June 2)* \u2014 overall Rokt at 106.1% QTD vs plan. SKA sitting at 93.4% pacing. APAC and Retail-Marketplace are the laggards\n- \ud83d\udfe2 rest is noise (promo emails, newsletters, Datadog digest)\n\n---\n\nthat overdue task is the only real loose end I see. want me to help knock it out or reschedule it?",
+      "correctness": 1,
+      "hallucination_clean": 1,
+      "response_quality": 5
+    },
+    {
+      "user_message": "What's on my calendar today?",
+      "category": "calendar",
+      "response": "pretty packed day, Karim. here's the rundown:\n\n\ud83d\udcc5 *today \u2014 wednesday, june 3*\n\n- *11:00 AM* \u2014 rdn v2 standup (Wu-Tang Clan room / Google Meet, 30 min)\n- *12:00 PM* \u2014 lunch \ud83e\udee1\n- *1:00 PM* \u2014 Rokt x Hallmark Technical Sync (Pat Benatar room, 1hr) \u2014 Zachary, Olivia, and a few folks from Hallmark\n- *2:00 PM* \u2014 Karim / Laura (30 min)\n- *2:30 PM* \u2014 Olivia / Karim (15 min)\n- *3:00 PM* \u2014 DSW | Rokt Monthly (30 min) \u2014 DSW team + Stephen Rivera\n- *4:30 PM* \u2014 Pride Party on the Rokt Rooftop (until 7:30pm)\n- *5:00 PM* \u2014 \"end of an era\" event at Lazy Point on Spring St \u2014 looks like a farewell gathering, someone's rounding off 3 years at Rokt\n\nafternoon is back-to-back from 1\u20133:30, heads up. and the evening has two overlapping events starting at 4:30 and 5pm \u2014 worth keeping in mind.",
+      "correctness": 1,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    },
+    {
+      "user_message": "What meetings do I have next Monday?",
+      "category": "calendar",
+      "response": "here's your Monday, Karim:\n\n\ud83d\udcc5 *monday, june 8*\n\n- *Weekly Retail Accelerators Sync* \u2014 10:00\u201310:30am\n  Room: NY-8-Mariah Carey | Google Meet available\n  With Olivia, Margaret, Zoey, William, Tatum, Selene, Ted, Rachel\n\n- *Lunch* \u2014 12:00\u20131:00pm\n\npretty light day tbh. one real meeting in the morning and you're mostly free.",
+      "correctness": 1,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    },
+    {
+      "user_message": "Thanks for the help!",
+      "category": "conversation",
+      "response": "anytime, Karim! \ud83d\ude04 hit me up whenever you need something.",
+      "correctness": 1,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    },
+    {
+      "user_message": "Create a task to follow up on the pricing discussion from last week's meeting, and find any related emails",
+      "category": "multi_tool",
+      "response": "here's what i found, Karim:\n\n\u2705 *task queued*\n\n- \"Follow up on pricing discussion from last week's meeting\" is ready to create \u2014 reply *yes* to confirm or *no* to cancel\n\n---\n\n\ud83d\udce7 *related emails*\n\nnothing in recent emails matches a pricing discussion directly. but the knowledge graph surfaced something relevant:\n\n- \ud83d\udd34 *Pricing Validation / Ledger (Apr 27)* \u2014 you have an open action item to *set the pricing tolerance threshold*, with suggestions starting at 0.01% or 1.5%. this one's been sitting open for a while\n\nno emails from last week specifically about pricing \u2014 it might've stayed in the meeting notes. want me to dig deeper into the meeting from last week to pull more context?",
+      "correctness": 1,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    },
+    {
+      "user_message": "Am I free tomorrow afternoon?",
+      "category": "calendar",
+      "response": "not totally free, Karim. here's what tomorrow afternoon looks like:\n\n\ud83d\udcc5 *thursday afternoon*\n\n- \ud83d\udfe1 *1:30 \u2013 2:00 PM* \u2014 Karim / Catherine Weekly (room: Billy Joel)\n- \ud83d\udfe1 *4:30 \u2013 5:00 PM* \u2014 Thankful Thursday team meeting\n- \ud83d\udfe2 *5:00 \u2013 6:00 PM* \u2014 Security Office Hours (optional drop-in vibes)\n\nso you've got a couple of blocks free \u2014 roughly *2:00\u20134:30 PM* is open if you need to schedule something. mornings are also pretty clear except for an 11:30 AM webinar.",
+      "correctness": 1,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    },
+    {
+      "user_message": "What did Sarah email me about the project last week?",
+      "category": "retrieval",
+      "response": "no emails from Sarah about the project showing up in the last two weeks. could be a few things:\n\n- her email might not have \"Sarah\" as the display name (like if it's a work address with a different format)\n- the email might be older than the search window\n- or it just genuinely didn't land in your inbox\n\ngot her last name or email address? i can search more specifically and track it down.",
+      "correctness": 0,
+      "hallucination_clean": 1,
+      "response_quality": 5
+    },
+    {
+      "user_message": "Create a task to review the Q1 report by Friday",
+      "category": "tool_use",
+      "response": "ready to go, Karim \u2014 just needs your sign-off:\n\n- *task:* Review Q1 report\n- *due:* Friday, June 5\n\nreply *yes* to confirm or *no* to cancel.",
+      "correctness": 0,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    },
+    {
+      "user_message": "Mark the 'update docs' task as done",
+      "category": "tool_use",
+      "response": "ready to mark *update docs \"subtotal\"* as done \u2014 just reply *yes* to confirm or *no* to cancel.",
+      "correctness": 0,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    },
+    {
+      "user_message": "What did we decide about the pricing change last month?",
+      "category": "memory",
+      "response": "nothing that's explicitly called a \"pricing change\" in the knowledge graph, Karim. the results are covering a bunch of related topics (RPT metrics, credits, Pay+, etc.) but nothing labeled as a direct pricing change decision.\n\na couple things that *might* be what you're thinking of:\n- \ud83d\udfe1 the **Rokt credits tiered system** (March 17) \u2014 a tiered system for Rokt credits prioritizing partners who adopt the new SDK\n- \ud83d\udfe1 **RPT/RPM as primary revenue metric** (April 2) \u2014 Mike Gulotta and Juliana Freeman agreed to use RPT/RPM as the primary metric for an upcoming test\n\ncan you give me a bit more context? like which client or project was this for? that'll help me narrow it down fast.",
+      "correctness": 1,
+      "hallucination_clean": 1,
+      "response_quality": 5
+    },
+    {
+      "user_message": "Who committed to delivering the API spec?",
+      "category": "memory",
+      "response": "the most direct match is *Kyle* \u2014 he committed to finalizing the API response requirements (for Copaxon items, cart data, and tax info) with an estimated one-week timeline. that came out of the *Weekly Retail Solutions Sync*.\n\nthat said, depending on which API spec you're thinking of, Karim, there are a couple others that might be relevant:\n- *Ellie Park* committed to creating a session tree store API endpoint (from a May 5 meeting)\n- *Catherine* was scoping out SDK/checkout requirements across a few projects\n\nwant me to dig deeper into any of these specifically?",
+      "correctness": 1,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    }
+  ]
+}

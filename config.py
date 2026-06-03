@@ -3,13 +3,25 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Gemini ───────────────────────────────────────────────────
+# ── Gemini (embeddings only — generation migrated to Claude) ──
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = "gemini-3-flash-preview"
 GEMINI_MODEL_FLASH = os.getenv("GEMINI_MODEL_FLASH", "gemini-3-flash-preview")
 GEMINI_MODEL_PRO = os.getenv("GEMINI_MODEL_PRO", "gemini-3.1-pro-preview")
 # Truncated to 2048 to fit Firestore's flat vector index limit.
 GEMINI_EMBEDDING_DIM = int(os.getenv("GEMINI_EMBEDDING_DIM", "2048"))
+
+# ── Anthropic Claude (all generation/chat/reasoning) ─────────
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+# Cost-aware tiers: Haiku=light (extraction/triage/memory),
+# Sonnet=standard (chat/agent), Opus=deep (KG-context reasoning).
+CLAUDE_MODEL_HAIKU = os.getenv("CLAUDE_MODEL_HAIKU", "claude-haiku-4-5-20251001")
+CLAUDE_MODEL_SONNET = os.getenv("CLAUDE_MODEL_SONNET", "claude-sonnet-4-6")
+CLAUDE_MODEL_OPUS = os.getenv("CLAUDE_MODEL_OPUS", "claude-opus-4-8")
+# Per-tier max_tokens (Claude requires explicit max_tokens per call).
+CLAUDE_MAX_TOKENS_LIGHT = int(os.getenv("CLAUDE_MAX_TOKENS_LIGHT", "1024"))
+CLAUDE_MAX_TOKENS_STANDARD = int(os.getenv("CLAUDE_MAX_TOKENS_STANDARD", "2048"))
+CLAUDE_MAX_TOKENS_DEEP = int(os.getenv("CLAUDE_MAX_TOKENS_DEEP", "4096"))
 
 # ── Gmail ────────────────────────────────────────────────────
 GMAIL_QUERY = "is:unread in:inbox"

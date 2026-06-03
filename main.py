@@ -41,7 +41,7 @@ from tasks_service import (
     complete_task,
     delete_task,
 )
-from gemini_service import chat_response, transcribe_audio
+from gemini_service import chat_response
 from chat_service import format_for_google_chat, send_chat_message, download_attachment, _SUPPORTED_AUDIO_TYPES
 from conversation_store import (
     get_conversation,
@@ -1466,38 +1466,13 @@ def _apply_pending_task_actions_background(
 
 
 def _transcribe_voice_message(audio_attachments, existing_text, space):
-    """Download and transcribe audio attachments. Returns the final text to
-    process, or None if transcription fails entirely (error already sent)."""
-    for attachment in audio_attachments:
-        content_type = attachment.get("contentType", "")
-        if content_type not in _SUPPORTED_AUDIO_TYPES:
-            print(f"Unsupported audio type: {content_type}")
-            continue
-
-        resource_name = attachment.get("attachmentDataRef", {}).get("resourceName")
-        if not resource_name:
-            resource_name = attachment.get("name", "")
-        if not resource_name:
-            print("Attachment missing resource name, skipping")
-            continue
-
-        result = download_attachment(resource_name)
-        if result is None:
-            continue
-
-        audio_bytes, detected_type = result
-        mime = detected_type if detected_type.startswith("audio/") else content_type
-
-        transcription = transcribe_audio(audio_bytes, mime)
-        if transcription:
-            if existing_text:
-                return f"{existing_text}\n\n[voice message]: {transcription}"
-            return transcription
-
-    if not existing_text:
-        send_chat_message(space, "couldn't process that voice message — try typing it out?")
-        return None
-    return existing_text
+    """Voice transcription is currently unsupported (Claude has no audio
+    input). If text accompanies the audio, process the text and drop the
+    audio; otherwise return the graceful unsupported message."""
+    if existing_text:
+        return existing_text
+    send_chat_message(space, "voice messages aren't supported right now — try typing it out?")
+    return None
 
 
 def _process_message_background(text, user_id, space, audio_attachments=None):

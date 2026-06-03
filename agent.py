@@ -1,6 +1,6 @@
 """Agentic tool-use loop for Momo.
 
-Gives Gemini a set of callable tools (calendar, tasks, gmail, knowledge graph,
+Gives Claude a set of callable tools (calendar, tasks, gmail, knowledge graph,
 Granola, Jira) and lets it decide which to invoke at inference time.  The agent
 iterates — calling tools, observing results, calling more tools — until it has
 enough information to compose a final text response.
@@ -12,15 +12,14 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta
 
-import google.generativeai as genai
-
 import config
+from claude_client import (
+    TaskComplexity, run_tool_loop,
+)
 from langsmith_config import (
-    traceable, traced_chat_send, set_trace_metadata, _get_run_tree,
+    traceable, set_trace_metadata, _get_run_tree,
     add_trace_tags, log_eval_failure,
 )
-
-genai.configure(api_key=config.GEMINI_API_KEY)
 
 # ── Tool timeout map (seconds) ───────────────────────────────
 
@@ -57,47 +56,28 @@ _TOOL_CATEGORIES = {
 }
 
 # ── Schema helper ────────────────────────────────────────────
-
-_TYPE_MAP = {
-    "string": genai.protos.Type.STRING,
-    "integer": genai.protos.Type.INTEGER,
-    "number": genai.protos.Type.NUMBER,
-    "boolean": genai.protos.Type.BOOLEAN,
-    "object": genai.protos.Type.OBJECT,
-    "array": genai.protos.Type.ARRAY,
-}
+# Claude tools use plain JSON Schema directly, so the schema passes
+# through unchanged. _tool() wraps a declaration into a Claude tool dict.
 
 
-def _schema(json_schema: dict) -> genai.protos.Schema:
-    """Convert a JSON-Schema-style dict to a genai.protos.Schema."""
-    schema_type = _TYPE_MAP.get(json_schema.get("type", "object"), genai.protos.Type.OBJECT)
+def _schema(json_schema: dict) -> dict:
+    return json_schema
 
-    properties = {}
-    for key, prop in json_schema.get("properties", {}).items():
-        properties[key] = genai.protos.Schema(
-            type=_TYPE_MAP.get(prop.get("type", "string"), genai.protos.Type.STRING),
-            description=prop.get("description", ""),
-        )
 
-    required = json_schema.get("required") or None
-
-    return genai.protos.Schema(
-        type=schema_type,
-        properties=properties if properties else None,
-        required=required,
-    )
+def _tool(name: str, description: str, parameters: dict) -> dict:
+    return {"name": name, "description": description, "input_schema": parameters}
 
 
 # ── Tool declarations ────────────────────────────────────────
 
 _CORE_TOOLS = [
-    genai.protos.Tool(function_declarations=[
-        genai.protos.FunctionDeclaration(
+    *[
+        _tool(
             name="get_todays_calendar",
             description="Get today's meetings and schedule from Google Calendar. Returns all events for today with times, attendees, and details.",
             parameters=_schema({"type": "object", "properties": {}}),
         ),
-        genai.protos.FunctionDeclaration(
+        _tool(
             name="get_calendar_for_date",
             description="Get meetings for a specific date from Google Calendar. Use this when the user asks about a date other than today.",
             parameters=_schema({
@@ -108,12 +88,12 @@ _CORE_TOOLS = [
                 "required": ["date"],
             }),
         ),
-        genai.protos.FunctionDeclaration(
+        _tool(
             name="get_open_tasks",
             description="Get all open/incomplete tasks from Google Tasks across all task lists. Includes due dates, overdue status, and recently completed tasks.",
             parameters=_schema({"type": "object", "properties": {}}),
         ),
-        genai.protos.FunctionDeclaration(
+        _tool(
             name="create_task",
             description="Queue a new task request for approval. This does not execute until the user explicitly approves it.",
             parameters=_schema({
@@ -126,7 +106,7 @@ _CORE_TOOLS = [
                 "required": ["title"],
             }),
         ),
-        genai.protos.FunctionDeclaration(
+        _tool(
             name="update_task",
             description="Queue an update request for an existing task. This does not execute until the user explicitly approves it.",
             parameters=_schema({
@@ -140,7 +120,7 @@ _CORE_TOOLS = [
                 "required": ["find"],
             }),
         ),
-        genai.protos.FunctionDeclaration(
+        _tool(
             name="complete_task",
             description="Queue a completion request for a task. This does not execute until the user explicitly approves it.",
             parameters=_schema({
@@ -151,7 +131,7 @@ _CORE_TOOLS = [
                 "required": ["find"],
             }),
         ),
-        genai.protos.FunctionDeclaration(
+        _tool(
             name="delete_task",
             description="Queue a delete request for a task. This does not execute until the user explicitly approves it.",
             parameters=_schema({
@@ -162,7 +142,7 @@ _CORE_TOOLS = [
                 "required": ["find"],
             }),
         ),
-        genai.protos.FunctionDeclaration(
+        _tool(
             name="get_recent_emails",
             description="Get recent unread emails from the inbox. Returns sender, subject, date, and body.",
             parameters=_schema({
@@ -172,7 +152,7 @@ _CORE_TOOLS = [
                 },
             }),
         ),
-        genai.protos.FunctionDeclaration(
+        _tool(
             name="search_emails",
             description="Search emails with a custom query. Use this when looking for emails from a specific person, about a specific topic, or in a time range.",
             parameters=_schema({
@@ -185,7 +165,7 @@ _CORE_TOOLS = [
                 "required": ["query"],
             }),
         ),
-        genai.protos.FunctionDeclaration(
+        _tool(
             name="search_knowledge_graph",
             description=(
                 "Search Momo's institutional memory — the knowledge graph built from meetings, emails, "
@@ -201,7 +181,7 @@ _CORE_TOOLS = [
                 "required": ["query"],
             }),
         ),
-    ]),
+    ],
 ]
 
 
@@ -210,7 +190,7 @@ def _build_optional_tools() -> list:
     extra_decls = []
 
     if config.GRANOLA_ENABLED:
-        extra_decls.append(genai.protos.FunctionDeclaration(
+        extra_decls.append(_tool(
             name="get_meeting_notes",
             description="Search Granola meeting notes, transcripts, and action items. Use for questions about what was discussed in meetings.",
             parameters=_schema({
@@ -223,12 +203,12 @@ def _build_optional_tools() -> list:
         ))
 
     if config.JIRA_ENABLED:
-        extra_decls.append(genai.protos.FunctionDeclaration(
+        extra_decls.append(_tool(
             name="get_jira_tickets",
             description="Get active Jira tickets where the user is assignee, reporter, or watcher.",
             parameters=_schema({"type": "object", "properties": {}}),
         ))
-        extra_decls.append(genai.protos.FunctionDeclaration(
+        extra_decls.append(_tool(
             name="get_jira_issue",
             description="Get details for a specific Jira issue by key (e.g. PROJ-123).",
             parameters=_schema({
@@ -239,7 +219,7 @@ def _build_optional_tools() -> list:
                 "required": ["key"],
             }),
         ))
-        extra_decls.append(genai.protos.FunctionDeclaration(
+        extra_decls.append(_tool(
             name="search_jira_tickets",
             description="Search Jira tickets with a text query.",
             parameters=_schema({
@@ -252,7 +232,7 @@ def _build_optional_tools() -> list:
         ))
 
     if config.USER_MEMORY_ENABLED:
-        extra_decls.append(genai.protos.FunctionDeclaration(
+        extra_decls.append(_tool(
             name="remember_this",
             description=(
                 "Store a user correction or preference for future conversations. "
@@ -274,7 +254,7 @@ def _build_optional_tools() -> list:
                 "required": ["content"],
             }),
         ))
-        extra_decls.append(genai.protos.FunctionDeclaration(
+        extra_decls.append(_tool(
             name="forget_this",
             description=(
                 "Remove a previously stored memory. Use when the user says "
@@ -295,7 +275,7 @@ def _build_optional_tools() -> list:
 
     if not extra_decls:
         return []
-    return [genai.protos.Tool(function_declarations=extra_decls)]
+    return list(extra_decls)
 
 
 def _get_all_tools() -> list:
@@ -575,7 +555,7 @@ Keep responses scannable. Google Chat supports *bold* and basic formatting. Use 
 
 
 def _build_history(conversation_history: list[dict], user_memories_context: str = "") -> list[dict]:
-    """Convert stored conversation history to Gemini chat format."""
+    """Convert stored conversation history to Claude message format."""
     from datetime import timedelta as _td
 
     now = datetime.now()
@@ -592,18 +572,18 @@ def _build_history(conversation_history: list[dict], user_memories_context: str 
     date_ref += "Upcoming days: " + ", ".join(f"{k.capitalize()}={v}" for k, v in weekday_dates.items())
 
     history = [
-        {"role": "user", "parts": [f"[SYSTEM DATE REFERENCE]\n{date_ref}\n[END DATE REFERENCE]"]},
-        {"role": "model", "parts": ["got it, i know the date. what's up?"]},
+        {"role": "user", "content": f"[SYSTEM DATE REFERENCE]\n{date_ref}\n[END DATE REFERENCE]"},
+        {"role": "assistant", "content": "got it, i know the date. what's up?"},
     ]
 
     if user_memories_context:
-        history.append({"role": "user", "parts": [user_memories_context]})
-        history.append({"role": "model", "parts": ["got it, i'll keep those in mind."]})
+        history.append({"role": "user", "content": user_memories_context})
+        history.append({"role": "assistant", "content": "got it, i'll keep those in mind."})
 
     recent = conversation_history[-20:] if len(conversation_history) > 20 else conversation_history
     for turn in recent:
-        role = "model" if turn["role"] == "assistant" else "user"
-        history.append({"role": role, "parts": [turn["content"]]})
+        role = "assistant" if turn["role"] == "assistant" else "user"
+        history.append({"role": role, "content": turn["content"]})
 
     return history
 
@@ -638,22 +618,16 @@ def run_agent_loop(user_message: str, conversation_history: list[dict],
                    user_id: str | None = None) -> tuple[str, list[dict]]:
     """Run the agentic tool-use loop.
 
-    Sends the user message to Gemini with tool declarations.  If Gemini
-    responds with function calls, executes them and sends results back.
-    Repeats until Gemini produces a text response or max_iterations is hit.
+    Sends the user message to Claude with tool declarations.  If Claude
+    responds with tool calls, executes them and sends results back.
+    Repeats until Claude produces a text response or max_iterations is hit.
 
     Returns the final text response and any queued task actions.
     """
     if thread_id:
         set_trace_metadata(thread_id=thread_id)
     tools = _get_all_tools()
-    model = genai.GenerativeModel(
-        model_name=config.GEMINI_MODEL_FLASH,
-        system_instruction=AGENT_SYSTEM_PROMPT,
-        tools=tools,
-    )
 
-    # Load user memories for context injection
     user_memories_context = ""
     if config.USER_MEMORY_ENABLED and user_id:
         try:
@@ -663,143 +637,83 @@ def run_agent_loop(user_message: str, conversation_history: list[dict],
         except Exception as exc:
             print(f"[agent] failed to load user memories: {exc}")
 
-    history = _build_history(conversation_history, user_memories_context=user_memories_context)
-    chat = model.start_chat(history=history)
+    messages = _build_history(conversation_history, user_memories_context=user_memories_context)
+    messages.append({"role": "user", "content": user_message})
 
     t0 = time.time()
     print(f"[agent] starting loop (max_iterations={max_iterations})")
 
     _trace_metrics = {
         "iteration_count": 0,
-        "tool_calls": [],       # list of {"name", "elapsed_s", "success"}
-        "tool_names": [],       # ordered tool names called
+        "tool_calls": [],
+        "tool_names": [],
         "total_tool_calls": 0,
         "unique_tools": set(),
         "errors": [],
     }
 
     pending_task_actions: list[dict] = []
+    parent_run_tree = _get_run_tree()
 
-    try:
-        response = traced_chat_send(chat, user_message, model_name=config.GEMINI_MODEL_FLASH)
-    except Exception as exc:
-        print(f"[agent] initial send failed: {exc}")
-        traceback.print_exc()
-        _trace_metrics["errors"].append(f"initial_send: {exc}")
-        _flush_trace_metrics(_trace_metrics, t0)
-        return "sorry, something went wrong talking to gemini — try again in a sec?", pending_task_actions
+    def _dispatch_tool(name, tool_input):
+        timeout = _TOOL_TIMEOUTS.get(name, 10)
 
-    for iteration in range(max_iterations):
-        _trace_metrics["iteration_count"] = iteration + 1
+        def _run_tool(rt=parent_run_tree):
+            if rt is not None:
+                try:
+                    from langsmith.run_helpers import _PARENT_RUN_TREE
+                    _PARENT_RUN_TREE.set(rt)
+                except (ImportError, AttributeError):
+                    pass
+            return execute_tool(name, tool_input, pending_task_actions,
+                                user_id=user_id, user_message=user_message)
 
-        candidate = response.candidates[0] if response.candidates else None
-        if not candidate:
-            break
-
-        parts = candidate.content.parts
-        function_calls = [p for p in parts if p.function_call and p.function_call.name]
-        text_parts = [p.text for p in parts if hasattr(p, "text") and p.text]
-
-        if not function_calls:
-            if text_parts:
-                final = "\n".join(text_parts)
-                print(f"[agent] done in {iteration + 1} iteration(s), {time.time() - t0:.2f}s total")
-                _flush_trace_metrics(_trace_metrics, t0)
-                return final, pending_task_actions
-            break
-
-        print(f"[agent] iteration {iteration + 1}: {len(function_calls)} tool call(s): "
-              f"{[fc.function_call.name for fc in function_calls]}")
-
-        tool_responses = []
-        # Capture the current run tree so child threads inherit the trace context
-        parent_run_tree = _get_run_tree()
-        for part in function_calls:
-            fc = part.function_call
-            timeout = _TOOL_TIMEOUTS.get(fc.name, 10)
-
-            def _run_tool(name, args, pending, rt=parent_run_tree):
-                """Execute tool with LangSmith context propagated."""
-                if rt is not None:
-                    import contextvars
-                    try:
-                        from langsmith.run_helpers import _PARENT_RUN_TREE
-                        _PARENT_RUN_TREE.set(rt)
-                    except (ImportError, AttributeError):
-                        pass
-                return execute_tool(name, args, pending,
-                                    user_id=user_id, user_message=user_message)
-
-            _tool_t0 = time.time()
-            tool_success = True
-            try:
-                with ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(_run_tool, fc.name, dict(fc.args), pending_task_actions)
-                    result_str = future.result(timeout=timeout)
-                    if result_str.startswith(("Tool '", "Error calling")):
-                        tool_success = False
-            except FuturesTimeoutError:
-                result_str = f"Tool '{fc.name}' timed out after {timeout}s"
-                print(f"[agent] tool '{fc.name}' timed out")
-                tool_success = False
-                _trace_metrics["errors"].append(f"timeout: {fc.name}")
-            except Exception as exc:
-                result_str = f"Tool '{fc.name}' failed: {str(exc)}"
-                tool_success = False
-                _trace_metrics["errors"].append(f"exception: {fc.name}: {exc}")
-
-            # Record tool metrics for trajectory evaluation
-            _trace_metrics["tool_calls"].append({
-                "name": fc.name,
-                "elapsed_s": round(time.time() - _tool_t0, 3),
-                "success": tool_success,
-            })
-            _trace_metrics["tool_names"].append(fc.name)
-            _trace_metrics["unique_tools"].add(fc.name)
-            _trace_metrics["total_tool_calls"] += 1
-
-            tool_responses.append(
-                genai.protos.Part(
-                    function_response=genai.protos.FunctionResponse(
-                        name=fc.name,
-                        response={"result": result_str},
-                    )
-                )
-            )
-
-        if text_parts:
-            tool_responses.append(genai.protos.Part(text="\n".join(text_parts)))
-
+        _tool_t0 = time.time()
         try:
-            response = traced_chat_send(chat, tool_responses, model_name=config.GEMINI_MODEL_FLASH, iteration=iteration + 1)
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                result_str = pool.submit(_run_tool).result(timeout=timeout)
+        except FuturesTimeoutError:
+            result_str = f"Tool '{name}' timed out after {timeout}s"
+            print(f"[agent] tool '{name}' timed out")
+            _trace_metrics["errors"].append(f"timeout: {name}")
         except Exception as exc:
-            print(f"[agent] send_message failed on iteration {iteration + 1}: {exc}")
-            _trace_metrics["errors"].append(f"send_message: {exc}")
-            _flush_trace_metrics(_trace_metrics, t0)
-            if text_parts:
-                return "\n".join(text_parts), pending_task_actions
-            return "sorry, hit a snag pulling your data — try again?", pending_task_actions
+            result_str = f"Tool '{name}' failed: {str(exc)}"
+            _trace_metrics["errors"].append(f"exception: {name}: {exc}")
+        _trace_metrics["tool_calls"].append({
+            "name": name,
+            "elapsed_s": round(time.time() - _tool_t0, 3),
+        })
+        _trace_metrics["tool_names"].append(name)
+        _trace_metrics["unique_tools"].add(name)
+        _trace_metrics["total_tool_calls"] += 1
+        return result_str
 
-    final_text = ""
     try:
-        if response.candidates:
-            for p in response.candidates[0].content.parts:
-                if hasattr(p, "text") and p.text:
-                    final_text += p.text
-    except Exception:
-        pass
+        final_text, stop_reason = run_tool_loop(
+            messages=messages,
+            tools=tools,
+            system=AGENT_SYSTEM_PROMPT,
+            dispatch=_dispatch_tool,
+            max_iterations=max_iterations,
+            tier=TaskComplexity.STANDARD,
+        )
+    except Exception as exc:
+        print(f"[agent] loop failed: {exc}")
+        traceback.print_exc()
+        _trace_metrics["errors"].append(f"loop: {exc}")
+        _flush_trace_metrics(_trace_metrics, t0)
+        return "sorry, something went wrong — try again in a sec?", pending_task_actions
 
+    _trace_metrics["iteration_count"] = len(_trace_metrics["tool_names"]) or 1
     elapsed = time.time() - t0
-    print(f"[agent] loop ended after {max_iterations} iterations, {elapsed:.2f}s total")
-
+    print(f"[agent] done, {elapsed:.2f}s total")
     _flush_trace_metrics(_trace_metrics, t0)
 
-    # Log exhausted loops as eval failure candidates
     if not final_text:
         log_eval_failure(
             user_message=user_message,
             expected_behavior="Agent should produce a text response",
-            actual_behavior=f"Exhausted {max_iterations} iterations without text response. "
+            actual_behavior=f"Loop ended ({stop_reason}) without text. "
                             f"Tools called: {_trace_metrics['tool_names']}",
             category="agent_loop_exhaustion",
         )
