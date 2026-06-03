@@ -1,29 +1,6 @@
-from enum import Enum
-
-import google.generativeai as genai
 import config
-from langsmith_config import traceable, traced_generate_content, traced_chat_send, set_trace_metadata
-
-genai.configure(api_key=config.GEMINI_API_KEY)
-
-
-class TaskComplexity(Enum):
-    LIGHT = "light"
-    STANDARD = "standard"
-    DEEP = "deep"
-
-
-TASK_MODEL_MAP = {
-    TaskComplexity.LIGHT: config.GEMINI_MODEL_FLASH,
-    TaskComplexity.STANDARD: config.GEMINI_MODEL_FLASH,
-    TaskComplexity.DEEP: config.GEMINI_MODEL_PRO,
-}
-
-TIER_TIMEOUTS = {
-    TaskComplexity.LIGHT: 30,
-    TaskComplexity.STANDARD: 60,
-    TaskComplexity.DEEP: 120,
-}
+from claude_client import TaskComplexity, TASK_MODEL_MAP, generate, extract_text
+from langsmith_config import traceable, set_trace_metadata
 
 _OWNER_LINE = f"\nYou are {config.OWNER_NAME}'s personal AI assistant. Always address them by name when it fits naturally.\n" if config.OWNER_NAME else ""
 
@@ -240,42 +217,6 @@ Momo is the friend who fixes your resume at 2am, tells you your ex's rebound is 
 Keep responses scannable. Google Chat supports *bold* and basic formatting. Use section emojis (📅 ✅ 📧 🎫 🎯) and priority colors (🔴 🟡 🟢) to make messages easy to read at a glance. No other emojis."""
 
 
-def _get_model(complexity: TaskComplexity = TaskComplexity.STANDARD,
-               system_prompt: str | None = None):
-    model_name = TASK_MODEL_MAP[complexity]
-    return genai.GenerativeModel(
-        model_name=model_name,
-        system_instruction=system_prompt if system_prompt is not None else SYSTEM_PROMPT,
-    )
-
-
-@traceable(name="transcribe-audio", tags=["chat", "user-initiated"])
-def transcribe_audio(audio_bytes: bytes, mime_type: str) -> str | None:
-    """Transcribe audio using Gemini's native multimodal capabilities.
-
-    Returns the transcription text, or None if transcription fails.
-    """
-    try:
-        model = _get_model(
-            TaskComplexity.LIGHT,
-            system_prompt="You are a precise speech-to-text transcriber. Return only the spoken words, nothing else.",
-        )
-        response = traced_generate_content(model, [
-            "Transcribe this voice message exactly as spoken. "
-            "Return only the transcription text with no preamble, labels, or formatting.",
-            {"mime_type": mime_type, "data": audio_bytes},
-        ], model_name=TASK_MODEL_MAP[TaskComplexity.LIGHT])
-        text = response.text.strip()
-        if text:
-            print(f"Audio transcribed ({len(audio_bytes)} bytes → {len(text)} chars)")
-            return text
-        print("Transcription returned empty text")
-        return None
-    except Exception as e:
-        print(f"Audio transcription failed: {e}")
-        return None
-
-
 @traceable(name="morning-briefing", tags=["briefing", "scheduled"])
 def generate_morning_briefing(emails_context, meetings_context, tasks_context,
                                granola_context="", jira_context="",
@@ -322,16 +263,14 @@ def generate_morning_briefing(emails_context, meetings_context, tasks_context,
 {granola_section}{jira_section}{nudges_section}
 Please create my morning briefing."""
 
-    model = _get_model()
-    resp = traced_generate_content(model, prompt, model_name=TASK_MODEL_MAP[TaskComplexity.STANDARD])
-    return resp.text
+    msg = generate(prompt=prompt, tier=TaskComplexity.STANDARD, system=SYSTEM_PROMPT)
+    return extract_text(msg)
 
 
 @traceable(name="chat-response", tags=["chat", "user-initiated"])
 def chat_response(user_message, conversation_history, context_data, thread_id=None):
     """Generate a conversational response with email/calendar/task context."""
     import time
-    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
     from datetime import datetime, timedelta
 
     if thread_id:
@@ -339,7 +278,6 @@ def chat_response(user_message, conversation_history, context_data, thread_id=No
 
     has_kg_context = bool(context_data.get("knowledge_graph"))
     complexity = TaskComplexity.DEEP if has_kg_context else TaskComplexity.STANDARD
-    model = _get_model(complexity)
 
     now = datetime.now()
     today_str = now.strftime("%A, %B %d, %Y")
@@ -353,7 +291,7 @@ def chat_response(user_message, conversation_history, context_data, thread_id=No
     date_ref = f"=== DATE REFERENCE ===\nToday is {today_str} ({today_iso}). Tomorrow is {tomorrow_iso}.\n"
     date_ref += "Upcoming days: " + ", ".join(f"{k.capitalize()}={v}" for k, v in weekday_dates.items())
 
-    history = []
+    messages = []
 
     context_parts = [date_ref]
     if context_data.get("emails"):
@@ -379,67 +317,37 @@ def chat_response(user_message, conversation_history, context_data, thread_id=No
         context_parts.append(f"=== DATA SOURCE NOTICE ===\n{context_data['_unavailable_sources']}")
 
     context_block = "\n\n".join(context_parts)
-    history.append({
+    messages.append({
         "role": "user",
-        "parts": [f"[CONTEXT — current date, emails, meetings, tasks, jira tickets, meeting notes, and knowledge graph for reference]\n\n{context_block}\n\n[END CONTEXT]"],
+        "content": f"[CONTEXT — current date, emails, meetings, tasks, jira tickets, meeting notes, and knowledge graph for reference]\n\n{context_block}\n\n[END CONTEXT]",
     })
-    history.append({
-        "role": "model",
-        "parts": ["got it, i have the date and your current data loaded. what's up?"],
+    messages.append({
+        "role": "assistant",
+        "content": "got it, i have the date and your current data loaded. what's up?",
     })
 
     recent_history = conversation_history[-20:] if len(conversation_history) > 20 else conversation_history
     for turn in recent_history:
-        role = "model" if turn["role"] == "assistant" else "user"
-        history.append({"role": role, "parts": [turn["content"]]})
+        role = "assistant" if turn["role"] == "assistant" else "user"
+        messages.append({"role": role, "content": turn["content"]})
 
-    chat = model.start_chat(history=history)
-    timeout_s = TIER_TIMEOUTS[complexity]
+    messages.append({"role": "user", "content": user_message})
 
     start = time.time()
-    print(f"[perf] gemini: model={TASK_MODEL_MAP[complexity]} tier={complexity.value} timeout={timeout_s}s context={len(context_block)} chars")
-
     model_name = TASK_MODEL_MAP[complexity]
-
-    def _do_send():
-        return traced_chat_send(chat, user_message, model_name=model_name)
+    print(f"[perf] claude: model={model_name} tier={complexity.value} context={len(context_block)} chars")
 
     _fallback_used = False
     try:
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(_do_send)
-            resp = future.result(timeout=timeout_s)
-        print(f"[perf] gemini response: {time.time() - start:.2f}s ({len(resp.text)} chars)")
-        return resp.text
-    except FuturesTimeoutError:
-        print(f"Gemini {complexity.value} timed out after {timeout_s}s")
-        if complexity == TaskComplexity.DEEP:
+        msg = generate(messages=messages, tier=complexity, system=SYSTEM_PROMPT)
+        if complexity == TaskComplexity.DEEP and getattr(msg, "model", "").find("sonnet") != -1:
             _fallback_used = True
-            fallback_model = _get_model(TaskComplexity.STANDARD)
-            fallback_chat = fallback_model.start_chat(history=history)
-            fallback_timeout = TIER_TIMEOUTS[TaskComplexity.STANDARD]
-            fallback_name = TASK_MODEL_MAP[TaskComplexity.STANDARD]
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(lambda: traced_chat_send(fallback_chat, user_message, model_name=fallback_name))
-                resp = future.result(timeout=fallback_timeout)
-            return resp.text
-        return "sorry, that took way too long — try again in a sec? (gemini was slow)"
+        text = extract_text(msg)
+        print(f"[perf] claude response: {time.time() - start:.2f}s ({len(text)} chars)")
+        return text
     except Exception as e:
-        if complexity == TaskComplexity.DEEP:
-            _fallback_used = True
-            print(f"Pro model failed ({e}), falling back to Flash")
-            fallback_model = _get_model(TaskComplexity.STANDARD)
-            fallback_chat = fallback_model.start_chat(history=history)
-            fallback_timeout = TIER_TIMEOUTS[TaskComplexity.STANDARD]
-            fallback_name = TASK_MODEL_MAP[TaskComplexity.STANDARD]
-            try:
-                with ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(lambda: traced_chat_send(fallback_chat, user_message, model_name=fallback_name))
-                    resp = future.result(timeout=fallback_timeout)
-                return resp.text
-            except FuturesTimeoutError:
-                return "sorry, that took way too long — try again in a sec?"
-        raise
+        print(f"Claude chat_response failed: {e}")
+        return "sorry, hit a snag generating that — try again in a sec?"
     finally:
         elapsed = time.time() - start
         set_trace_metadata(
@@ -483,6 +391,5 @@ Do NOT include any other text on the same line as a [CREATE_TASK] tag.
 
 Keep it tight — this goes to Google Chat right after the meeting. No fluff."""
 
-    model = _get_model()
-    resp = traced_generate_content(model, prompt, model_name=TASK_MODEL_MAP[TaskComplexity.STANDARD])
-    return resp.text
+    msg = generate(prompt=prompt, tier=TaskComplexity.STANDARD, system=SYSTEM_PROMPT)
+    return extract_text(msg)
