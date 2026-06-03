@@ -20,7 +20,8 @@ from datetime import datetime, timedelta
 import google.generativeai as genai
 
 import config
-from langsmith_config import traceable, traced_generate_content
+from langsmith_config import traceable
+from claude_client import generate, extract_text, TaskComplexity
 from calendar_service import fetch_upcoming_meetings
 from chat_service import format_for_google_chat, send_chat_message
 from conversation_store import (
@@ -188,10 +189,9 @@ def _build_meeting_prep(meeting: dict) -> str | None:
         knowledge_context=knowledge_context,
     )
 
-    model = genai.GenerativeModel(model_name=config.GEMINI_MODEL_FLASH)
     try:
-        resp = traced_generate_content(model, prompt, model_name=config.GEMINI_MODEL_FLASH)
-        return resp.text.strip()
+        msg = generate(prompt=prompt, tier=TaskComplexity.LIGHT)
+        return extract_text(msg).strip()
     except Exception as exc:
         print(f"  Meeting prep generation failed: {exc}")
         return None
@@ -282,7 +282,6 @@ def _check_commitment_evidence(commitment: dict) -> str | None:
         from gmail_service import search_emails
         emails = search_emails(search_terms, days_back=30, max_results=3)
         if emails:
-            model = genai.GenerativeModel(model_name=config.GEMINI_MODEL_FLASH)
             commitment_desc = f"{name}: {content}"
             for email in emails:
                 prompt = _EVIDENCE_PROMPT.format(
@@ -292,8 +291,8 @@ def _check_commitment_evidence(commitment: dict) -> str | None:
                     body=(email.get("body", "") or "")[:500],
                 )
                 try:
-                    resp = traced_generate_content(model, prompt, model_name=config.GEMINI_MODEL_FLASH)
-                    if resp.text.strip().lower().startswith("yes"):
+                    msg = generate(prompt=prompt, tier=TaskComplexity.LIGHT)
+                    if extract_text(msg).lower().startswith("yes"):
                         return f"Found matching email: {email.get('subject', '?')}"
                 except Exception:
                     pass
@@ -425,11 +424,10 @@ def _run_pattern_engine() -> list[dict]:
     if has_nudge_been_sent(nudge_id):
         return []
 
-    model = genai.GenerativeModel(model_name=config.GEMINI_MODEL_FLASH)
     try:
         prompt = _PATTERN_PROMPT.format(patterns="\n".join(pattern_lines))
-        resp = traced_generate_content(model, prompt, model_name=config.GEMINI_MODEL_FLASH)
-        text = resp.text.strip()
+        msg = generate(prompt=prompt, tier=TaskComplexity.LIGHT)
+        text = extract_text(msg).strip()
     except Exception as exc:
         print(f"  Pattern insight generation failed: {exc}")
         return []
