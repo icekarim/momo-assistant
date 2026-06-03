@@ -1,0 +1,140 @@
+{
+  "provider": "gemini",
+  "judge": "gemini-3-flash-preview",
+  "aggregate": {
+    "n": 16,
+    "correctness_rate": 0.1875,
+    "hallucination_clean_rate": 0.375,
+    "avg_quality": 3.875
+  },
+  "examples": [
+    {
+      "user_message": "Show me my recent unread emails",
+      "category": "retrieval",
+      "response": "\ud83d\udce7 *emails*\n\n- \ud83d\udd34 **Ankur Kumar**: needs you to enable the staging environments (wwwdev.officedepot.com and bsdsqs.odpbusiness.com) so they can proceed with dev validations for Office Depot.\n- \ud83d\udd34 **ChatGPT**: urgent security update for the OpenAI macOS apps. you probably need to update the client.\n- \ud83d\udfe1 **Zain Jaffer**: SKA Performance Report is in. QTD is at 106.1% against plan, looking solid.\n- \ud83d\udfe1 **Jira**: you've been looped into OSD-115043 (Mobile SDK Update for Mercari) which is now \"Waiting for support\".\n- \ud83d\udfe2 **Rokt/Tableau**: daily performance tracking and digest reports are ready.\n- \ud83d\udfe2 **Misc**: usual stack of newsletters and promos from Bubble, Datadog, Franco Sarto, and Sam Edelman.\n\nlooks like Ankur is blocked until you check those staging urls, Karim. want me to set a task for that?",
+      "correctness": 0,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    },
+    {
+      "user_message": "Find any emails from the engineering team about the deployment",
+      "category": "retrieval",
+      "response": "found a few things regarding deployments, mostly focused on the RDN v2 migration.\n\n\ud83d\udce7 *emails*\n- \ud83d\udd34 **RDN v2 Standup (Jun 1):** The engineering team (NY-A / Tribe Called Quest) is syncing on a pull request for attribute propagation. The main action item is to merge this PR and monitor the deployment for service stability.\n- \ud83d\udfe1 **Petco Traffic Move (May 25-26):** Abinash Mishra and Alyssa Frederico confirmed moving 100% of traffic to the \"Grooming Rokt Testing Plan\" in Adobe Target.\n- \ud83d\udfe2 **DSW Weekly Update (May 29):** Megan O'Malley sent a performance recap for the \"Checkout Modal Test,\" showing VAR1 has reached statistical significance (99% confidence).\n\n\ud83d\uddd2\ufe0f *meeting notes*\n- \ud83c\udfaf **RDN v2 Progress:** Backend cleanup and database migrations to Postgres are successfully completed. You've recently submitted 10 PRs for cleanup, including Build Kite fixes and Terraform updates.\n- \ud83c\udfaf **Deployment Monitoring:** In today's notes (June 3), you committed to assisting with the implementation and deployment of PRs for needed features to keep things moving.\n\nlooks like the big focus right now is that attribute propagation merge for RDN v2. let me know if you want me to dig into any of those PR details.",
+      "correctness": 0,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    },
+    {
+      "user_message": "What tasks do I have open?",
+      "category": "tool_use",
+      "response": "\u2705 *tasks*\n- \ud83d\udd34 update docs \"subtotal\" (due may 13, 2026)\n\nlooks like you've just got that one doc update hanging over you. it's pretty overdue ngl. need a hand with anything else?",
+      "correctness": 1,
+      "hallucination_clean": 0,
+      "response_quality": 4
+    },
+    {
+      "user_message": "Hey what's up?",
+      "category": "conversation",
+      "response": "chillin. busy afternoon but it's mostly good vibes from here on out. you're done with the syncs, now it's just rooftop parties and farewell drinks.\n\n\ud83d\udcc5 *schedule*\n- \ud83d\udfe2 4:30 PM: Pride Party on the Rokt Rooftop. \n- \ud83d\udfe2 5:00 PM: \"end of an era\" hoorah at Lazy Point. looks like a send-off for some of the crew (3 years in, damn).\n\n\u2705 *tasks*\n- \ud83d\udd34 update docs \"subtotal\" \u2014 this is technically from mid-may, so it's living its best overdue life.\n\n\ud83d\udce7 *emails*\n- \ud83d\udfe1 Ankur Kumar is asking to enable staging placements for Office Depot so they can hit those dev validations. \n- \ud83d\udfe2 Jira's blowing up a bit with the MercariApp MSDK update (v4.13.0) on android.\n\nyou hitting the rooftop or heading straight to lazy point, Karim?",
+      "correctness": 0,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    },
+    {
+      "user_message": "What's the context on ProjectX? Check emails and meeting notes",
+      "category": "multi_tool",
+      "response": "looks like \"ProjectX\" refers to the **PX migration** (and the subsequent **SDK+ migration**) for **Frasers Group (FG)**. it was a massive priority earlier this spring where their team actually went on a 30-day \"exclusivity restriction\" just to get it done.\n\n\ud83d\uddd2\ufe0f *meeting notes*\n- **exclusivity period:** as of march 31, jennifer butler (FG product owner) confirmed their engineering team was dedicated 100% to the PX migration for 30 days, blocking all other new work.\n- **sdk+ potential:** in an april 28 internal sync, the team discussed using the new sdk+ to capture signals earlier in the funnel (not just on the confirmation page) to drive more revenue. \n- **sports direct:** jennifer's team is taking ownership of the config and implementation for the sports direct brand specifically.\n\n\ud83d\udce7 *emails*\n- **sdk+ guide:** on may 1, will yarusinsky sent over a custom migration guide. he noted that moving to sdk+ unlocks next-gen products and better identity resolution.\n- **qa & prod status:** as of may 14, will confirmed that QA is complete and everything looks good for the move to production. \n- **visibility issues:** there were some early hiccups with placement visibility on \"flannels\" (another FG brand), but the team worked to mirror the house of fraser setup to fix it.\n\n\ud83c\udfaf *priorities*\n- \ud83d\udfe2 **prod launch:** you're cleared for production, but don't forget to **remove the sandbox flag**.\n- \ud83d\udfe1 **sports direct implementation:** wait for the FG team to finish their internal config for this brand.\n- \ud83d\udfe1 **next steps:** lyeanne jones was supposed to set up an internal follow-up meeting at FG to discuss the sdk+ review materials.\n\nlmk if you want me to find that specific migration guide or reach out to anyone on their team.",
+      "correctness": 1,
+      "hallucination_clean": 1,
+      "response_quality": 5
+    },
+    {
+      "user_message": "Give me a quick rundown of today \u2014 meetings, tasks, and emails",
+      "category": "multi_tool",
+      "response": "\ud83d\udcc5 *schedule*\n- \ud83d\udfe2 11:00 am: rdn v2 standup\n- \ud83d\udfe2 1:00 pm: rokt x hallmark technical sync\n- \ud83d\udfe2 2:00 pm: karim / laura\n- \ud83d\udfe2 2:30 pm: olivia / karim\n- \ud83d\udfe2 3:00 pm: dsw | rokt - monthly\n- \ud83d\udfe1 4:30 pm: pride party on the rooftop\n- \ud83d\udfe1 5:00 pm: \"end of an era\" farewell drinks @ lazy point\n\n\u2705 *tasks*\n- \ud83d\udd34 update docs \"subtotal\" \u2014 this is super overdue (may 13), might want to knock it out today.\n\n\ud83d\udce7 *emails*\n- \ud83d\udd34 **security:** openai sent an urgent security update for their macos apps.\n- \ud83d\udfe1 **office depot:** ankur kumar is having issues with the rokt pop-up not showing on staging environments for dev validation.\n- \ud83d\udfe1 **jira:** OSD-115043 (mercari android sdk update) is now \"waiting for support.\"\n- \ud83d\udfe2 **performance:** ska hit $2.4m yesterday; pacing 103% to quarterly plan.\n\nlooks like a busy one before the party. need me to dig into that office depot stuff?",
+      "correctness": 0,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    },
+    {
+      "user_message": "What's on my calendar today?",
+      "category": "calendar",
+      "response": "\ud83d\udcc5 *schedule*\n\n- \ud83d\udfe1 [11:00 AM] rdn v2 standup\n- \ud83d\udfe2 [12:00 PM] Lunch\n- \ud83d\udfe1 [1:00 PM] Rokt x Hallmark Technical Sync\n- \ud83d\udfe1 [2:00 PM] Karim / Laura\n- \ud83d\udfe1 [2:30 PM] Olivia / Karim\n- \ud83d\udfe1 [3:00 PM] DSW | Rokt - Monthly\n- \ud83d\udfe2 [4:30 PM] Pride Party on Rokt Rooftop\n- \ud83d\udfe2 [5:00 PM] end of an era (at Lazy Point)\n\nlooks like a busy afternoon but at least you've got two parties to choose from later. ngl the \"end of an era\" note says \"one last hoorah to round off 3 Rokt years\" so someone is definitely making an exit. turnover is wild lol.",
+      "correctness": 0,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    },
+    {
+      "user_message": "What meetings do I have next Monday?",
+      "category": "calendar",
+      "response": "\ud83d\udcc5 *schedule*\n- \ud83d\udfe2 [All Day] Office\n- \ud83d\udfe1 [10:00 AM \u2013 10:30 AM] Weekly Retail Accelerators Sync\n- \ud83d\udfe2 [12:00 PM \u2013 1:00 PM] Lunch\n\nlooks like a pretty chill monday, karim. just the one sync in the morning and the rest is clear.",
+      "correctness": 0,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    },
+    {
+      "user_message": "Thanks for the help!",
+      "category": "conversation",
+      "response": "anytime karim. i'm around if you need anything else.",
+      "correctness": 1,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    },
+    {
+      "user_message": "Create a task to follow up on the pricing discussion from last week's meeting, and find any related emails",
+      "category": "multi_tool",
+      "response": "i pulled a lot of info but couldn't put it together \u2014 try asking differently?",
+      "correctness": 0,
+      "hallucination_clean": 1,
+      "response_quality": 1
+    },
+    {
+      "user_message": "Am I free tomorrow afternoon?",
+      "category": "calendar",
+      "response": "you've got a decent gap in the middle of the afternoon, but the start and end are booked up.\n\n\ud83d\udcc5 *schedule*\n- \ud83d\udfe2 1:30 pm \u2013 2:00 pm: weekly with catherine\n- \ud83d\udfe2 2:00 pm \u2013 4:30 pm: **free**\n- \ud83d\udfe2 4:30 pm \u2013 5:00 pm: thankful thursday\n- \ud83d\udfe2 5:00 pm \u2013 6:00 pm: security office hours\n\nlooks like 2:00 to 4:30 is your best bet for getting stuff done. bet.",
+      "correctness": 0,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    },
+    {
+      "user_message": "What did Sarah email me about the project last week?",
+      "category": "retrieval",
+      "response": "i pulled a lot of info but couldn't put it together \u2014 try asking differently?",
+      "correctness": 0,
+      "hallucination_clean": 1,
+      "response_quality": 1
+    },
+    {
+      "user_message": "Create a task to review the Q1 report by Friday",
+      "category": "tool_use",
+      "response": "bet, i've queued that up.\n\n\u2705 *tasks*\n- \ud83d\udfe2 review the Q1 report (due 2026-06-05)\n\nit's waiting for your approval. reply \"yes\" to confirm or \"no\" to cancel.",
+      "correctness": 0,
+      "hallucination_clean": 0,
+      "response_quality": 2
+    },
+    {
+      "user_message": "Mark the 'update docs' task as done",
+      "category": "tool_use",
+      "response": "marked that as done for you. it's waiting for your approval \u2014 reply \"yes\" to confirm or \"no\" to cancel.",
+      "correctness": 0,
+      "hallucination_clean": 1,
+      "response_quality": 5
+    },
+    {
+      "user_message": "What did we decide about the pricing change last month?",
+      "category": "memory",
+      "response": "i pulled a lot of info but couldn't put it together \u2014 try asking differently?",
+      "correctness": 0,
+      "hallucination_clean": 1,
+      "response_quality": 2
+    },
+    {
+      "user_message": "Who committed to delivering the API spec?",
+      "category": "memory",
+      "response": "i pulled a lot of info but couldn't put it together \u2014 try asking differently?",
+      "correctness": 0,
+      "hallucination_clean": 1,
+      "response_quality": 2
+    }
+  ]
+}

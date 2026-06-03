@@ -1,0 +1,105 @@
+{
+  "provider": "claude",
+  "judge": "gemini-3-flash-preview",
+  "partial": true,
+  "note": "13/16 - judge hung on #14, killed",
+  "aggregate": {
+    "n": 13,
+    "correctness_rate": 0.5384615384615384,
+    "hallucination_clean_rate": 0.07692307692307693,
+    "avg_quality": 4.923076923076923
+  },
+  "examples": [
+    {
+      "idx": 1,
+      "category": "retrieval",
+      "correctness": 0,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    },
+    {
+      "idx": 2,
+      "category": "retrieval",
+      "correctness": 1,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    },
+    {
+      "idx": 3,
+      "category": "tool_use",
+      "correctness": 1,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    },
+    {
+      "idx": 4,
+      "category": "conversation",
+      "correctness": 1,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    },
+    {
+      "idx": 5,
+      "category": "multi_tool",
+      "correctness": 1,
+      "hallucination_clean": 1,
+      "response_quality": 5
+    },
+    {
+      "idx": 6,
+      "category": "multi_tool",
+      "correctness": 0,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    },
+    {
+      "idx": 7,
+      "category": "calendar",
+      "correctness": 0,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    },
+    {
+      "idx": 8,
+      "category": "calendar",
+      "correctness": 1,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    },
+    {
+      "idx": 9,
+      "category": "conversation",
+      "correctness": 1,
+      "hallucination_clean": 0,
+      "response_quality": 4
+    },
+    {
+      "idx": 10,
+      "category": "multi_tool",
+      "correctness": 0,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    },
+    {
+      "idx": 11,
+      "category": "calendar",
+      "correctness": 1,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    },
+    {
+      "idx": 12,
+      "category": "retrieval",
+      "correctness": 0,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    },
+    {
+      "idx": 13,
+      "category": "tool_use",
+      "correctness": 0,
+      "hallucination_clean": 0,
+      "response_quality": 5
+    }
+  ]
+}
