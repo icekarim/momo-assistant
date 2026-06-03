@@ -135,6 +135,21 @@ def test_tool_loop_full_cycle(monkeypatch):
     assert final == "the answer is 5" and stop == "end_turn"
 
 
+def test_tool_loop_unknown_tool_flagged_is_error(monkeypatch):
+    tu = _tool_use_block("t", "nonexistent_tool", {})
+    text_block = type("B", (), {"type": "text", "text": "ok"})()
+    seq = [_msg([tu], "tool_use"), _msg([text_block], "end_turn")]
+    i = {"n": 0}
+    def advance(**kw):
+        m = seq[i["n"]]; i["n"] += 1; return m
+    monkeypatch.setattr(cc._client, "messages", type("M", (), {"create": staticmethod(advance)})())
+    errors = []
+    cc.run_tool_loop(messages=[{"role": "user", "content": "x"}], tools=[], system=None,
+                     dispatch=lambda n, inp: f"Unknown tool: {n}",
+                     on_tool=lambda n, r, e: errors.append(e))
+    assert errors == [True]  # "Unknown tool:" must be flagged is_error
+
+
 def test_tool_loop_malformed_input(monkeypatch):
     bad = type("TU", (), {"type": "tool_use", "id": "t", "name": "add", "input": None})()
     text_block = type("B", (), {"type": "text", "text": "handled"})()
