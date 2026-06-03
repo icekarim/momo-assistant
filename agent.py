@@ -1,6 +1,6 @@
 """Agentic tool-use loop for Momo.
 
-Gives Gemini a set of callable tools (calendar, tasks, gmail, knowledge graph,
+Gives Claude a set of callable tools (calendar, tasks, gmail, knowledge graph,
 Granola, Jira) and lets it decide which to invoke at inference time.  The agent
 iterates — calling tools, observing results, calling more tools — until it has
 enough information to compose a final text response.
@@ -555,7 +555,7 @@ Keep responses scannable. Google Chat supports *bold* and basic formatting. Use 
 
 
 def _build_history(conversation_history: list[dict], user_memories_context: str = "") -> list[dict]:
-    """Convert stored conversation history to Gemini chat format."""
+    """Convert stored conversation history to Claude message format."""
     from datetime import timedelta as _td
 
     now = datetime.now()
@@ -618,9 +618,9 @@ def run_agent_loop(user_message: str, conversation_history: list[dict],
                    user_id: str | None = None) -> tuple[str, list[dict]]:
     """Run the agentic tool-use loop.
 
-    Sends the user message to Gemini with tool declarations.  If Gemini
-    responds with function calls, executes them and sends results back.
-    Repeats until Gemini produces a text response or max_iterations is hit.
+    Sends the user message to Claude with tool declarations.  If Claude
+    responds with tool calls, executes them and sends results back.
+    Repeats until Claude produces a text response or max_iterations is hit.
 
     Returns the final text response and any queued task actions.
     """
