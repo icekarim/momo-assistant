@@ -45,6 +45,9 @@ def _cos_rank(query_vec, doc_matrix):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sample", type=int, default=40)
+    ap.add_argument("--rerank", action="store_true",
+                    help="Also pipe each model's top-K candidates through the Claude reranker")
+    ap.add_argument("--pool", type=int, default=10, help="Candidate pool size fed to the reranker")
     args = ap.parse_args()
 
     db = get_db()
@@ -63,6 +66,12 @@ def main():
         print("Not enough entities with name+content for a meaningful A/B.")
         return 1
 
+    if args.rerank:
+        from claude_client import rerank as claude_rerank
+
+    mode = "reranked (top-%d pool -> Claude rerank)" % args.pool if args.rerank else "raw cosine"
+    print(f"Mode: {mode}\n", flush=True)
+
     results = {}
     for label, model in [("001", MODEL_OLD), ("emb2", MODEL_NEW)]:
         t0 = time.time()
@@ -71,9 +80,20 @@ def main():
         q_vecs = [_embed(e["name"], model, "RETRIEVAL_QUERY") for e in entities]
         reciprocal_ranks = []
         hits_at_1 = hits_at_3 = 0
+        pool_misses = 0  # target fell outside the candidate pool (reranker can't recover)
         for i, qv in enumerate(q_vecs):
-            order = _cos_rank(qv, doc_mat)
-            rank = int(np.where(order == i)[0][0]) + 1  # 1-based rank of own doc
+            order = list(_cos_rank(qv, doc_mat))
+            if args.rerank:
+                # Production-realistic: take top-`pool` cosine candidates, then
+                # rerank that pool with the SAME Claude reranker both models use.
+                pool_idx = order[:args.pool]
+                if i not in pool_idx:
+                    pool_misses += 1  # reranker cannot rank what wasn't fetched
+                rr = claude_rerank(entities[i]["name"], [entities[j]["content"] for j in pool_idx])
+                final = [pool_idx[k] for k in rr] if rr else pool_idx
+                rank = (final.index(i) + 1) if i in final else (len(pool_idx) + 1)
+            else:
+                rank = order.index(i) + 1  # 1-based rank of own doc in full cosine order
             reciprocal_ranks.append(1.0 / rank)
             if rank == 1:
                 hits_at_1 += 1
@@ -81,9 +101,10 @@ def main():
                 hits_at_3 += 1
         mrr = float(np.mean(reciprocal_ranks))
         results[label] = {"mrr": mrr, "hit@1": hits_at_1 / n, "hit@3": hits_at_3 / n,
-                          "secs": time.time() - t0}
+                          "pool_misses": pool_misses, "secs": time.time() - t0}
+        extra = f"  pool_misses={pool_misses}/{n}" if args.rerank else ""
         print(f"[{label}] MRR={mrr:.3f}  hit@1={hits_at_1}/{n} ({hits_at_1/n:.0%})  "
-              f"hit@3={hits_at_3}/{n} ({hits_at_3/n:.0%})  ({results[label]['secs']:.1f}s)", flush=True)
+              f"hit@3={hits_at_3}/{n} ({hits_at_3/n:.0%}){extra}  ({results[label]['secs']:.1f}s)", flush=True)
 
     print("\n=== VERDICT ===")
     old, new = results["001"], results["emb2"]
