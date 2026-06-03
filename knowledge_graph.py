@@ -773,13 +773,18 @@ def update_entity_status(doc_id: str, new_status: str):
 
 
 def semantic_search(query: str, limit: int | None = None,
-                    threshold: float | None = None) -> list[dict]:
+                    threshold: float | None = None,
+                    rerank: bool = False) -> list[dict]:
     """Semantic search over the knowledge graph using Firestore's native
     vector search (FindNearest with COSINE distance).
 
-    Note: threshold is applied client-side because Firestore vector queries
-    don't support a similarity-cutoff predicate yet. Set threshold to 0 (or
-    None falling back to config) to skip the filter.
+    threshold is applied client-side because Firestore vector queries don't
+    support a similarity-cutoff predicate yet.
+
+    rerank: opt-in Claude reranking of the candidate pool. Adds ~3s latency, so
+    callers on the interactive chat path leave it False; async/background callers
+    (proactive prep, briefings) pass True. Globally gated by config.RERANK_ENABLED
+    so it can be killed without code changes.
     """
     limit = limit if limit is not None else config.SEMANTIC_SEARCH_LIMIT
     threshold = threshold if threshold is not None else config.SEMANTIC_SEARCH_THRESHOLD
@@ -793,7 +798,7 @@ def semantic_search(query: str, limit: int | None = None,
     db = get_db()
     collection = db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
 
-    rerank_on = config.RERANK_ENABLED
+    rerank_on = rerank and config.RERANK_ENABLED
     # Over-fetch when reranking (need a candidate pool) or threshold-filtering.
     if rerank_on:
         fetch_limit = max(config.RERANK_CANDIDATES, limit)
