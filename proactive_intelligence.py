@@ -136,8 +136,10 @@ def _build_meeting_prep(meeting: dict) -> str | None:
             pool.submit(query_by_person, attendee, None, 8): f"person:{attendee}"
             for attendee in attendee_names
         }
-        # Also search by meeting title to catch topic-based KG entries
-        title_future = pool.submit(_semantic_search, title, 10)
+        # Also search by meeting title to catch topic-based KG entries.
+        # rerank=True: async/background path, so the ~3s reranking latency is
+        # an acceptable trade for better precision (live chat leaves it off).
+        title_future = pool.submit(lambda: _semantic_search(title, limit=10, rerank=True))
         person_futures[title_future] = f"title:{title}"
 
         for future in as_completed(person_futures):
