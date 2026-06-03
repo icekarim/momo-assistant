@@ -94,6 +94,81 @@ def test_deep_hardfails_on_bad_request(monkeypatch):
     assert calls["n"] == 1  # NO downshift on 400
 
 
+def _tool_use_block(tid, name, inp):
+    return type("TU", (), {"type": "tool_use", "id": tid, "name": name, "input": inp})()
+
+
+def _msg(content, stop_reason="end_turn"):
+    return type("M", (), {"content": content, "stop_reason": stop_reason})()
+
+
+def test_gemini_tool_to_claude_shape():
+    decl = {"name": "get_x", "description": "d", "parameters": {"type": "object", "properties": {"a": {"type": "string"}}}}
+    out = cc.gemini_tool_to_claude(decl)
+    assert out == {"name": "get_x", "description": "d", "input_schema": {"type": "object", "properties": {"a": {"type": "string"}}}}
+
+
+def test_tool_loop_full_cycle(monkeypatch):
+    text_block = type("B", (), {"type": "text", "text": "the answer is 5"})()
+    seq = [
+        _msg([_tool_use_block("tu1", "add", {"a": 2, "b": 3})], stop_reason="tool_use"),
+        _msg([text_block], stop_reason="end_turn"),
+    ]
+    calls = {"n": 0}
+
+    class FakeMsgs:
+        def create(self, **kw):
+            return seq[calls["n"]] if calls["n"] < len(seq) else seq[-1]
+    monkeypatch.setattr(cc._client, "messages", FakeMsgs())
+
+    def advance(**kw):
+        m = seq[calls["n"]]; calls["n"] += 1; return m
+    monkeypatch.setattr(cc._client.messages, "create", advance)
+
+    dispatched = []
+    def dispatch(name, inp):
+        dispatched.append((name, inp))
+        return "5"
+    final, stop = cc.run_tool_loop(messages=[{"role": "user", "content": "add 2 and 3"}],
+                                   tools=[{"name": "add", "input_schema": {}}], system=None, dispatch=dispatch)
+    assert dispatched == [("add", {"a": 2, "b": 3})]
+    assert final == "the answer is 5" and stop == "end_turn"
+
+
+def test_tool_loop_malformed_input(monkeypatch):
+    bad = type("TU", (), {"type": "tool_use", "id": "t", "name": "add", "input": None})()
+    text_block = type("B", (), {"type": "text", "text": "handled"})()
+    seq = [_msg([bad], "tool_use"), _msg([text_block], "end_turn")]
+    i = {"n": 0}
+    def advance(**kw):
+        m = seq[i["n"]]; i["n"] += 1; return m
+    monkeypatch.setattr(cc._client, "messages", type("M", (), {"create": staticmethod(advance)})())
+    errors = []
+    final, stop = cc.run_tool_loop(messages=[{"role": "user", "content": "x"}], tools=[], system=None,
+                                   dispatch=lambda n, i: "should not be called",
+                                   on_tool=lambda n, r, e: errors.append(e))
+    assert errors == [True] and final == "handled"
+
+
+def test_tool_loop_max_tokens_truncation(monkeypatch):
+    text_block = type("B", (), {"type": "text", "text": "partial"})()
+    def advance(**kw):
+        return _msg([text_block], "max_tokens")
+    monkeypatch.setattr(cc._client, "messages", type("M", (), {"create": staticmethod(advance)})())
+    final, stop = cc.run_tool_loop(messages=[{"role": "user", "content": "x"}], tools=[], system=None,
+                                   dispatch=lambda n, i: "x")
+    assert stop == "max_tokens" and "partial" in final
+
+
+def test_tool_loop_max_iteration_guard(monkeypatch):
+    def advance(**kw):
+        return _msg([_tool_use_block("t", "loop", {})], "tool_use")  # always wants another tool
+    monkeypatch.setattr(cc._client, "messages", type("M", (), {"create": staticmethod(advance)})())
+    final, stop = cc.run_tool_loop(messages=[{"role": "user", "content": "x"}], tools=[], system=None,
+                                   dispatch=lambda n, i: "again", max_iterations=3)
+    assert final == "" and stop == "tool_use"
+
+
 def test_fallback_cap_not_exceeded(monkeypatch):
     calls = {"n": 0}
 
