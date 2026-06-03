@@ -20,6 +20,7 @@ from google.cloud.firestore_v1.base_vector_query import DistanceMeasure
 from google.cloud.firestore_v1.vector import Vector
 
 import config
+from claude_client import TaskComplexity, extract_json, extract_text, generate
 from conversation_store import get_db
 
 _kg_cache = TTLCache(maxsize=128, ttl=300)
@@ -249,7 +250,7 @@ def _already_extracted(source_id: str) -> bool:
 
 def _run_extraction(source_type: str, source_title: str, content: str,
                     attendees: list[str]) -> list[dict]:
-    """Call Gemini Flash to extract structured entities from content."""
+    """Call Claude Haiku to extract structured entities from content."""
     if not content or not content.strip():
         return []
 
@@ -261,21 +262,12 @@ def _run_extraction(source_type: str, source_title: str, content: str,
         content=content[:8000],
     )
 
-    model = genai.GenerativeModel(model_name=config.GEMINI_MODEL_FLASH)
-
     try:
-        resp = model.generate_content(prompt)
-        text = resp.text.strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-        if text.endswith("```"):
-            text = text[: text.rfind("```")]
-        parsed = json.loads(text.strip())
+        msg = generate(prompt=prompt, tier=TaskComplexity.LIGHT)
+        text = extract_text(msg)
+        parsed = extract_json(text)
 
-        if isinstance(parsed, dict):
-            parsed = [parsed]
-        if not isinstance(parsed, list):
-            print(f"Knowledge graph: unexpected response type {type(parsed)}, skipping")
+        if parsed is None:
             return []
 
         return [e for e in parsed if isinstance(e, dict)]

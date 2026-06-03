@@ -12,3 +12,4 @@ numpy
 mcp
 httpx
 langsmith
+anthropic==0.105.2

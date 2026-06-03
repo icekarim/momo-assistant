@@ -248,9 +248,24 @@ def response_quality(run: Run, example: Example) -> dict:
 
 # ── Main ─────────────────────────────────────────────────────────
 
+def _live_agent_target(inputs: dict) -> dict:
+    """Run the live agent loop for one example and shape its output for the
+    evaluators (text response + the trajectory metrics they read from metadata).
+    Whichever LLM agent.py currently calls (Gemini or Claude) is what runs."""
+    from agent import run_agent_loop
+    user_message = inputs.get("user_message", "")
+    final_text, _pending = run_agent_loop(user_message, [])
+    return {"response": final_text}
+
+
 def run_evals(prefix: str = "momo-eval", limit: int | None = None,
-              dataset: str = "golden", category: str | None = None):
-    """Run all evaluators against the dataset."""
+              dataset: str = "golden", category: str | None = None,
+              provider: str | None = None):
+    """Run all evaluators against the dataset.
+
+    provider: None -> evaluate stored outputs (passthrough, legacy).
+              'gemini'/'claude' -> run the LIVE agent (whatever agent.py uses).
+    """
 
     dataset_name = GOLDEN_DATASET if dataset == "golden" else PROD_DATASET
 
@@ -296,15 +311,19 @@ def run_evals(prefix: str = "momo-eval", limit: int | None = None,
     print(f"Evaluators: {', '.join(evaluator_names)}")
     print()
 
-    # Passthrough target — returns existing outputs (we're evaluating stored data)
-    def passthrough(inputs: dict) -> dict:
-        for ex in examples:
-            if ex.inputs == inputs:
-                return ex.outputs or {}
-        return {}
+    if provider:
+        target = _live_agent_target
+        print(f"Target:     LIVE agent ({provider})")
+    else:
+        def target(inputs: dict) -> dict:
+            for ex in examples:
+                if ex.inputs == inputs:
+                    return ex.outputs or {}
+            return {}
+        print("Target:     stored outputs (passthrough)")
 
     results = client.evaluate(
-        passthrough,
+        target,
         data=dataset_name if not category else examples,
         evaluators=evaluators,
         experiment_prefix=prefix,
