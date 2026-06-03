@@ -8,6 +8,11 @@ set -e
 #   export CHAT_SPACE_ID="spaces/XXXXXXXXX"
 PROJECT_ID="${PROJECT_ID:?PROJECT_ID env var is required}"
 GEMINI_API_KEY="${GEMINI_API_KEY:?GEMINI_API_KEY env var is required}"
+ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-$(grep '^ANTHROPIC_API_KEY=' .env 2>/dev/null | cut -d= -f2)}"
+if [ -z "$ANTHROPIC_API_KEY" ]; then
+  echo "ERROR: ANTHROPIC_API_KEY is required (all LLM generation runs on Claude)." >&2
+  exit 1
+fi
 CHAT_SPACE_ID="${CHAT_SPACE_ID:-$(grep '^CHAT_SPACE_ID=' .env 2>/dev/null | cut -d= -f2)}"
 if [ -z "$CHAT_SPACE_ID" ]; then
   echo "WARNING: CHAT_SPACE_ID is not set. Briefings will print to console only."
@@ -69,7 +74,7 @@ gcloud run deploy $SERVICE_NAME \
   --region $REGION \
   --platform managed \
   --allow-unauthenticated \
-  --set-env-vars="GEMINI_API_KEY=${GEMINI_API_KEY},GCP_PROJECT_ID=$PROJECT_ID,CHAT_SPACE_ID=${CHAT_SPACE_ID},GRANOLA_ENABLED=true" \
+  --set-env-vars="GEMINI_API_KEY=${GEMINI_API_KEY},ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY},GCP_PROJECT_ID=$PROJECT_ID,CHAT_SPACE_ID=${CHAT_SPACE_ID},GRANOLA_ENABLED=true" \
   --set-env-vars="JIRA_ENABLED=${JIRA_ENABLED:-false},JIRA_SITE_URL=${JIRA_SITE_URL},JIRA_USER_EMAIL=${JIRA_USER_EMAIL},JIRA_API_TOKEN=${JIRA_API_TOKEN}" \
   --set-env-vars="LANGSMITH_TRACING=true,LANGSMITH_API_KEY=${LANGSMITH_API_KEY},LANGSMITH_PROJECT=momo" \
   --set-env-vars="OWNER_NAME=${OWNER_NAME:-},MOMO_API_SECRET=${MOMO_API_SECRET}" \
