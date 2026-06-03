@@ -101,21 +101,3 @@ def log_eval_failure(user_message: str, expected_behavior: str,
     except Exception as e:
         print(f"[langsmith] failed to log eval failure: {e}")
 
-
-# ── Traced Gemini wrappers ───────────────────────────────────────
-# These thin wrappers let LangSmith capture LLM calls as proper
-# "llm" spans with model name, inputs, outputs, and timing.
-
-
-@traceable(run_type="llm", name="gemini-generate")
-def traced_generate_content(model, content, *, model_name="unknown"):
-    """Traced wrapper around model.generate_content()."""
-    response = model.generate_content(content)
-    return response
-
-
-@traceable(run_type="llm", name="gemini-chat-send")
-def traced_chat_send(chat, message, *, model_name="unknown", iteration=None):
-    """Traced wrapper around chat.send_message()."""
-    response = chat.send_message(message)
-    return response
