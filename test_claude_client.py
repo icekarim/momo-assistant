@@ -44,6 +44,26 @@ def test_extract_text_joins_text_blocks():
     assert cc.extract_text(msg) == "foo bar"
 
 
+def test_extract_json_three_shapes_identical():
+    expected = [{"a": 1}, {"b": 2}]
+    fenced = '```json\n[{"a": 1}, {"b": 2}]\n```'
+    clean = '[{"a": 1}, {"b": 2}]'
+    prose = 'Here you go:\n[{"a": 1}, {"b": 2}]'
+    assert cc.extract_json(fenced) == expected
+    assert cc.extract_json(clean) == expected
+    assert cc.extract_json(prose) == expected
+
+
+def test_extract_json_dict_normalized_to_list():
+    assert cc.extract_json('{"x": 1}') == [{"x": 1}]
+
+
+def test_extract_json_garbage_returns_none():
+    assert cc.extract_json("the model rambled with no json") is None
+    assert cc.extract_json("") is None
+    assert cc.extract_json(None) is None
+
+
 def test_deep_downshifts_on_transient(monkeypatch):
     calls = {"n": 0}
 

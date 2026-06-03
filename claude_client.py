@@ -1,3 +1,4 @@
+import json
 from enum import Enum
 
 import anthropic
@@ -46,6 +47,33 @@ def extract_text(message) -> str:
     return "".join(
         b.text for b in message.content if getattr(b, "type", None) == "text"
     ).strip()
+
+
+def extract_json(text):
+    if not text:
+        return None
+    t = text.strip()
+    if t.startswith("```"):
+        t = t.split("\n", 1)[1] if "\n" in t else t[3:]
+    if t.endswith("```"):
+        t = t[: t.rfind("```")]
+    t = t.strip()
+    try:
+        parsed = json.loads(t)
+    except Exception:
+        # Tolerate prose-prefixed output: slice from the first JSON bracket.
+        start = min((i for i in (t.find("["), t.find("{")) if i != -1), default=-1)
+        if start == -1:
+            print(f"claude_client.extract_json: no JSON found in output")
+            return None
+        try:
+            parsed = json.loads(t[start:])
+        except Exception as exc:
+            print(f"claude_client.extract_json: parse failed — {exc}")
+            return None
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    return parsed
 
 
 def _is_downshiftable(exc: Exception) -> bool:
