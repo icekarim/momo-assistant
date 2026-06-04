@@ -90,7 +90,7 @@ def _is_downshiftable(exc: Exception) -> bool:
 
 def generate(prompt=None, *, tier=TaskComplexity.STANDARD, system=None,
              tools=None, messages=None, max_tokens=None, model=None,
-             allow_fallback=True):
+             temperature=None, allow_fallback=True):
     if messages is None:
         if prompt is None:
             raise ValueError("generate requires either prompt or messages")
@@ -98,7 +98,9 @@ def generate(prompt=None, *, tier=TaskComplexity.STANDARD, system=None,
 
     resolved_model = model or TASK_MODEL_MAP[tier]
     resolved_max = max_tokens or TASK_MAX_TOKENS[tier]
-    kwargs = {"model": resolved_model, "max_tokens": resolved_max, "messages": messages}
+    resolved_temp = config.CLAUDE_TEMPERATURE if temperature is None else temperature
+    kwargs = {"model": resolved_model, "max_tokens": resolved_max,
+              "temperature": resolved_temp, "messages": messages}
     if system is not None:
         kwargs["system"] = system
     if tools is not None:
@@ -109,7 +111,7 @@ def generate(prompt=None, *, tier=TaskComplexity.STANDARD, system=None,
     except Exception as exc:
         if (allow_fallback and tier == TaskComplexity.DEEP
                 and _is_downshiftable(exc)):
-            return _fallback(messages, system, tools, max_tokens)
+            return _fallback(messages, system, tools, max_tokens, temperature)
         raise
 
 
@@ -174,15 +176,17 @@ def run_tool_loop(*, messages, tools, system, dispatch, max_iterations=6,
     return "", last_stop
 
 
-def _fallback(messages, system, tools, max_tokens):
+def _fallback(messages, system, tools, max_tokens, temperature=None):
     attempts = 0
     tier = _DEEP_FALLBACK
     last_exc = None
+    resolved_temp = config.CLAUDE_TEMPERATURE if temperature is None else temperature
     while attempts < _MAX_FALLBACK_ATTEMPTS:
         attempts += 1
         kwargs = {
             "model": TASK_MODEL_MAP[tier],
             "max_tokens": max_tokens or TASK_MAX_TOKENS[tier],
+            "temperature": resolved_temp,
             "messages": messages,
         }
         if system is not None:
