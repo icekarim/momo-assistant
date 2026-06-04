@@ -22,6 +22,9 @@ CLAUDE_MODEL_OPUS = os.getenv("CLAUDE_MODEL_OPUS", "claude-opus-4-8")
 CLAUDE_MAX_TOKENS_LIGHT = int(os.getenv("CLAUDE_MAX_TOKENS_LIGHT", "1024"))
 CLAUDE_MAX_TOKENS_STANDARD = int(os.getenv("CLAUDE_MAX_TOKENS_STANDARD", "2048"))
 CLAUDE_MAX_TOKENS_DEEP = int(os.getenv("CLAUDE_MAX_TOKENS_DEEP", "4096"))
+# Sampling temperature. Claude's valid range is 0..1 (default 1.0); 1.0 is the
+# loosest/warmest. Clamped so a bad env value can never 400 the generation call.
+CLAUDE_TEMPERATURE = max(0.0, min(1.0, float(os.getenv("CLAUDE_TEMPERATURE", "1.0"))))
 
 # ── Gmail ────────────────────────────────────────────────────
 GMAIL_QUERY = "is:unread in:inbox"
