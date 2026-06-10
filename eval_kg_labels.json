@@ -1,0 +1,497 @@
+[
+  {
+    "kind": "person",
+    "pair": [
+      "Aidan McWeeney",
+      "Aidan Mcweeney"
+    ],
+    "reason": "token overlap / subset match via _person_tokens",
+    "suggested": "MERGE",
+    "type": "merge"
+  },
+  {
+    "kind": "person",
+    "pair": [
+      "Aishani Agrawal",
+      "aishani.agrawal@rokt.com"
+    ],
+    "reason": "token overlap / subset match via _person_tokens",
+    "suggested": "MERGE",
+    "type": "merge"
+  },
+  {
+    "kind": "person",
+    "pair": [
+      "Ashley Danis",
+      "ashley.danis@rokt.com"
+    ],
+    "reason": "token overlap / subset match via _person_tokens",
+    "suggested": "MERGE",
+    "type": "merge"
+  },
+  {
+    "kind": "person",
+    "pair": [
+      "BJ",
+      "Bj"
+    ],
+    "reason": "token overlap / subset match via _person_tokens",
+    "suggested": "MERGE",
+    "type": "merge"
+  },
+  {
+    "kind": "person",
+    "pair": [
+      "Catherine Liou",
+      "catherine.liou@rokt.com"
+    ],
+    "reason": "token overlap / subset match via _person_tokens",
+    "suggested": "MERGE",
+    "type": "merge"
+  },
+  {
+    "kind": "person",
+    "pair": [
+      "Craig",
+      "craig@rokt.com"
+    ],
+    "reason": "token overlap / subset match via _person_tokens",
+    "suggested": "MERGE",
+    "type": "merge"
+  },
+  {
+    "kind": "person",
+    "pair": [
+      "DSW",
+      "dsw"
+    ],
+    "reason": "token overlap / subset match via _person_tokens",
+    "suggested": "MERGE",
+    "type": "merge"
+  },
+  {
+    "kind": "person",
+    "pair": [
+      "David Butsko",
+      "david.butsko@rokt.com"
+    ],
+    "reason": "token overlap / subset match via _person_tokens",
+    "suggested": "MERGE",
+    "type": "merge"
+  },
+  {
+    "kind": "person",
+    "pair": [
+      "Ellie Park",
+      "ellie.park@rokt.com"
+    ],
+    "reason": "token overlap / subset match via _person_tokens",
+    "suggested": "MERGE",
+    "type": "merge"
+  },
+  {
+    "kind": "person",
+    "pair": [
+      "Esmith1",
+      "esmith1@levi.com"
+    ],
+    "reason": "token overlap / subset match via _person_tokens",
+    "suggested": "MERGE",
+    "type": "merge"
+  },
+  {
+    "kind": "person",
+    "pair": [
+      "Fazal Aslam",
+      "fazal.aslam@rokt.com"
+    ],
+    "reason": "token overlap / subset match via _person_tokens",
+    "suggested": "MERGE",
+    "type": "merge"
+  },
+  {
+    "kind": "person",
+    "pair": [
+      "Gonpo Lama",
+      "gonpo.lama@rokt.com"
+    ],
+    "reason": "token overlap / subset match via _person_tokens",
+    "suggested": "MERGE",
+    "type": "merge"
+  },
+  {
+    "kind": "person",
+    "pair": [
+      "Harry Wolansky",
+      "harry.wolansky@rokt.com"
+    ],
+    "reason": "token overlap / subset match via _person_tokens",
+    "suggested": "MERGE",
+    "type": "merge"
+  },
+  {
+    "kind": "person",
+    "pair": [
+      "Harsh Nigam",
+      "Nigam, Harsh"
+    ],
+    "reason": "token overlap / subset match via _person_tokens",
+    "suggested": "MERGE",
+    "type": "merge"
+  },
+  {
+    "kind": "person",
+    "pair": [
+      "Ilana Newman",
+      "ilana.newman@rokt.com"
+    ],
+    "reason": "token overlap / subset match via _person_tokens",
+    "suggested": "MERGE",
+    "type": "merge"
+  },
+  {
+    "kind": "project",
+    "pair": [
+      "Ads Team",
+      "Ads team"
+    ],
+    "reason": "alphanumeric token overlap",
+    "suggested": "MERGE",
+    "type": "merge"
+  },
+  {
+    "kind": "project",
+    "pair": [
+      "Ads Team",
+      "ads team"
+    ],
+    "reason": "alphanumeric token overlap",
+    "suggested": "MERGE",
+    "type": "merge"
+  },
+  {
+    "kind": "project",
+    "pair": [
+      "Aftersales",
+      "aftersales"
+    ],
+    "reason": "alphanumeric token overlap",
+    "suggested": "MERGE",
+    "type": "merge"
+  },
+  {
+    "kind": "project",
+    "pair": [
+      "Aftersell",
+      "AfterSell"
+    ],
+    "reason": "alphanumeric token overlap",
+    "suggested": "MERGE",
+    "type": "merge"
+  },
+  {
+    "kind": "project",
+    "pair": [
+      "Android Integration",
+      "Android integration"
+    ],
+    "reason": "alphanumeric token overlap",
+    "suggested": "MERGE",
+    "type": "merge"
+  },
+  {
+    "kind": "person",
+    "pair": [
+      "Karim",
+      "Karim Tounkara"
+    ],
+    "reason": "reviewed: single-token subset of full name, same person (the user)",
+    "suggested": "MERGE",
+    "type": "merge"
+  },
+  {
+    "kind": "project",
+    "pair": [
+      "App Layout Experiment",
+      "app layout experiment"
+    ],
+    "reason": "alphanumeric token overlap",
+    "suggested": "MERGE",
+    "type": "merge"
+  },
+  {
+    "kind": "person",
+    "pair": [
+      "Aidan McWeeney",
+      "Thomas Bugas-McWeeney"
+    ],
+    "reason": "reviewed hard negative: shared surname, different people",
+    "suggested": "NO-MERGE",
+    "type": "merge"
+  },
+  {
+    "kind": "person",
+    "pair": [
+      "Alex Frick",
+      "Alex Gurevich"
+    ],
+    "reason": "reviewed hard negative: shared first name, different people",
+    "suggested": "NO-MERGE",
+    "type": "merge"
+  },
+  {
+    "kind": "person",
+    "pair": [
+      "Alex Lou",
+      "Alex Oldham"
+    ],
+    "reason": "reviewed hard negative: shared first name, different people",
+    "suggested": "NO-MERGE",
+    "type": "merge"
+  },
+  {
+    "kind": "person",
+    "pair": [
+      "Angela Acton",
+      "Angela Kent"
+    ],
+    "reason": "reviewed hard negative: shared first name, different people",
+    "suggested": "NO-MERGE",
+    "type": "merge"
+  },
+  {
+    "kind": "person",
+    "pair": [
+      "Aniyah Smith",
+      "Julia Smith"
+    ],
+    "reason": "reviewed hard negative: shared surname, different people",
+    "suggested": "NO-MERGE",
+    "type": "merge"
+  },
+  {
+    "kind": "person",
+    "pair": [
+      "Ankur Kumar",
+      "Prashant Kumar"
+    ],
+    "reason": "reviewed hard negative: shared surname, different people",
+    "suggested": "NO-MERGE",
+    "type": "merge"
+  },
+  {
+    "kind": "person",
+    "pair": [
+      "Acel Joseph",
+      "Joseph Karlin"
+    ],
+    "reason": "reviewed hard negative: name-position crossover, different people",
+    "suggested": "NO-MERGE",
+    "type": "merge"
+  },
+  {
+    "kind": "person",
+    "pair": [
+      "Andrew Bodner",
+      "Andrew Cushen"
+    ],
+    "reason": "reviewed hard negative: shared first name, different people",
+    "suggested": "NO-MERGE",
+    "type": "merge"
+  },
+  {
+    "commitment": {
+      "id": "NS9maqxBmpQWvCK2bf6f",
+      "name": "Send new builds for control testing",
+      "owner": "Meghan Kicak"
+    },
+    "evidence": {
+      "desc": "email from Meghan Kicak: new iOS and Android builds attached, these have the control variation for your testing"
+    },
+    "reason": "reviewed: realistic paraphrased completion evidence",
+    "suggested": "LINK",
+    "type": "link"
+  },
+  {
+    "commitment": {
+      "id": "49oHfvT5NGdVaP4vsv56",
+      "name": "Karim to set up team request",
+      "owner": "Karim Tounkara"
+    },
+    "evidence": {
+      "desc": "email from Karim: all set, the item you asked for is set up for the team, let me know if it works"
+    },
+    "reason": "reviewed: realistic paraphrased completion evidence",
+    "suggested": "LINK",
+    "type": "link"
+  },
+  {
+    "commitment": {
+      "id": "ZQfG8Po8ucmaxadycLWa",
+      "name": "Disable current test session",
+      "owner": "Meghan Kicak"
+    },
+    "evidence": {
+      "desc": "task completed: turn off mobile app test, marked done Friday afternoon"
+    },
+    "reason": "reviewed: realistic paraphrased completion evidence",
+    "suggested": "LINK",
+    "type": "link"
+  },
+  {
+    "commitment": {
+      "id": "oC9TxKCvnm3NcyU3acEP",
+      "name": "Send new builds for control variation testing",
+      "owner": "Meghan Kicak"
+    },
+    "evidence": {
+      "desc": "email from Meghan: builds are on the way, you should have the control variant by end of week"
+    },
+    "reason": "reviewed: realistic paraphrased completion evidence",
+    "suggested": "LINK",
+    "type": "link"
+  },
+  {
+    "commitment": {
+      "id": "m13PZJMTVss0dLiv7CNv",
+      "name": "Provide weekly performance reports",
+      "owner": "Natasha Jewett"
+    },
+    "evidence": {
+      "desc": "email from Natasha Jewett: attaching this week's RAF performance numbers, cumulative through this week"
+    },
+    "reason": "reviewed: realistic paraphrased completion evidence",
+    "suggested": "LINK",
+    "type": "link"
+  },
+  {
+    "commitment": {
+      "id": "yssZSayt18aOg5LJhukm",
+      "name": "American Eagle imagery handoff and launch",
+      "owner": "Kristi Siemsen"
+    },
+    "evidence": {
+      "desc": "email from Kristi Siemsen: AE creative handed off today, on track for the 4/15 go-live"
+    },
+    "reason": "reviewed: realistic paraphrased completion evidence",
+    "suggested": "LINK",
+    "type": "link"
+  },
+  {
+    "commitment": {
+      "id": "6yn1VXamPDP6U4EtKdaG",
+      "name": "Confirm Medallia survey functionality",
+      "owner": "Albroz Aloush"
+    },
+    "evidence": {
+      "desc": "email from Albroz: checked both sites, Medallia survey renders and submits correctly on Office Depot and ODP"
+    },
+    "reason": "reviewed: realistic paraphrased completion evidence",
+    "suggested": "LINK",
+    "type": "link"
+  },
+  {
+    "commitment": {
+      "id": "dRUReKQqVDV6x58UO35T",
+      "name": "Post-release performance verification",
+      "owner": "Aishani Agrawal"
+    },
+    "evidence": {
+      "desc": "email from Aishani Agrawal: Rokt-side performance looks good post-release, no anomalies in the dashboards"
+    },
+    "reason": "reviewed: realistic paraphrased completion evidence",
+    "suggested": "LINK",
+    "type": "link"
+  },
+  {
+    "commitment": {
+      "id": "vhXWfFVIh085dkApAYFt",
+      "name": "Response to technical questions",
+      "owner": "Ankur Kumar"
+    },
+    "evidence": {
+      "desc": "email from Ankur Kumar: answers inline below to Aishani's technical questions"
+    },
+    "reason": "reviewed: realistic paraphrased completion evidence",
+    "suggested": "LINK",
+    "type": "link"
+  },
+  {
+    "commitment": {
+      "id": "YpRBfwucn56EQs3Ci11a",
+      "name": "Clarify page identifier and placement locations",
+      "owner": "Karim Tounkara"
+    },
+    "evidence": {
+      "desc": "email from Karim: here is where to find the page identifiers and placement locations in the app, screenshots attached"
+    },
+    "reason": "reviewed: realistic paraphrased completion evidence",
+    "suggested": "LINK",
+    "type": "link"
+  },
+  {
+    "commitment": {
+      "id": "wkBoF8ghqeItn0eH1sMS",
+      "name": "Post-rollback app functionality audit",
+      "owner": "Karim Tounkara"
+    },
+    "evidence": {
+      "desc": "email/task referencing 'Send new builds for control testing'"
+    },
+    "reason": "evidence belongs to a different commitment",
+    "suggested": "NO-LINK",
+    "type": "link"
+  },
+  {
+    "commitment": {
+      "id": "OnDi8KCqGm4swhHTnFJE",
+      "name": "Adjust creative assets today",
+      "owner": "Stephen Rivera"
+    },
+    "evidence": {
+      "desc": "email/task referencing 'Karim to set up team request'"
+    },
+    "reason": "evidence belongs to a different commitment",
+    "suggested": "NO-LINK",
+    "type": "link"
+  },
+  {
+    "commitment": {
+      "id": "wefzBHInHSzwQSRhTUk7",
+      "name": "Provide go-live screenshots",
+      "owner": "Natasha Jewett"
+    },
+    "evidence": {
+      "desc": "email/task referencing 'Disable current test session'"
+    },
+    "reason": "evidence belongs to a different commitment",
+    "suggested": "NO-LINK",
+    "type": "link"
+  },
+  {
+    "commitment": {
+      "id": "hlCLW62tm5L0Muor1ZPv",
+      "name": "Clarify page identifier and placement locations",
+      "owner": "Karim Tounkara"
+    },
+    "evidence": {
+      "desc": "email/task referencing 'Send new builds for control variation testing'"
+    },
+    "reason": "evidence belongs to a different commitment",
+    "suggested": "NO-LINK",
+    "type": "link"
+  },
+  {
+    "commitment": {
+      "id": "sOtmXcS9JQYT4Ybm4k5X",
+      "name": "Ongoing debugging of show placements rule",
+      "owner": "Kevin O\u2019Sullivan"
+    },
+    "evidence": {
+      "desc": "email/task referencing 'Provide weekly performance reports'"
+    },
+    "reason": "evidence belongs to a different commitment",
+    "suggested": "NO-LINK",
+    "type": "link"
+  }
+]
