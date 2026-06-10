@@ -70,7 +70,6 @@ print('  MCP token synced to Firestore')
 " 2>/dev/null || echo "  (Firestore sync skipped — will use env var fallback)"
 done
 
-
 # Read token files into variables for passing as env vars
 GOOGLE_TOKEN_JSON="${GOOGLE_TOKEN_JSON:-$(cat token.json 2>/dev/null || echo "")}"
 GRANOLA_TOKEN_JSON=$(cat granola_token.json 2>/dev/null || echo "")
@@ -96,6 +95,7 @@ gcloud run deploy $SERVICE_NAME \
   --set-env-vars="LANGSMITH_TRACING=true,LANGSMITH_API_KEY=${LANGSMITH_API_KEY},LANGSMITH_PROJECT=momo" \
   --set-env-vars="OWNER_NAME=${OWNER_NAME:-},MOMO_API_SECRET=${MOMO_API_SECRET}" \
   --set-env-vars="MOMO_SERVICE_URL=${EXISTING_URL}" \
+  --set-env-vars="KG_RESOLUTION_ENABLED=true,KG_LINKING_ENABLED=true,KG_LINK_MIN_CONFIDENCE=0.85" \
   --set-env-vars="MCP_ENABLED=true" \
   --set-env-vars="^##^GOOGLE_TOKEN_JSON=${GOOGLE_TOKEN_JSON}##GRANOLA_TOKEN_JSON=${GRANOLA_TOKEN_JSON}" \
   --memory=2Gi \

@@ -1,0 +1,51 @@
+query,expected_entity_ids
+when is meghan sending the new mobile builds for control testing?,NS9maqxBmpQWvCK2bf6f
+when are we turning off the current test?,mABSyvmO3oSDDOoK4S8V
+are the android and ios apps loading the right variation?,nOkzQsTxPCVNIURnXGhF
+what paymenttype value does the android app use for credit cards?,z0oXghMTi3lILF9RWH0r
+what did karim commit to set up for the team?,49oHfvT5NGdVaP4vsv56
+did meghan confirm the deep links are working?,BxLXeWnbJx6VTAUStrbO
+what fixed the placement rendering on ios?,WNHCs9AUOI2G3QEETBEl
+when is the test session being disabled?,ZQfG8Po8ucmaxadycLWa
+what builds is meghan sending karim next week?,oC9TxKCvnm3NcyU3acEP
+what does the standard paymenttype value mean?,pZcMHVwhoM89E1uGpfEb
+how often are we reporting on the RAF test?,K7EfZAcYIcn1e28nBdnI
+who owns the weekly performance reports for the RAF test?,m13PZJMTVss0dLiv7CNv
+how did the american eagle refer-a-friend test perform?,tTKsYgZlEtPNpb8QsjKi
+when did the RAF test go live and how long will it run?,vqikKB7Q987K5vSUXqi5
+did the test purchases work on ios and android for BJs?,miqEQbKk3CBuqsgIbMhK
+how long until users move to the new traffic after the app update?,qvmGQtdn1Rrd091pGo0W
+are the traffic logs healthy after the bjs app update?,tVwUieaUvTSQz9R2dYbL
+Log health status check,3VqkKkagbvxUiOMYyW4Y
+is the rokt overlay showing after the bjs app update?,OcQeQQO3vRIytjNt5W8G
+can we still deliver the 90/10 experience in app version 13.19.0?,UYsJpUNJCPD3jaeCitzV
+is the BJs app rollback live in the app stores?,hO78zAaxCv4NKE5DrZm7
+who asked for the audit of the rokt integration after the rollback?,kQv5nzqVj3prvrvSGqHZ
+did the aerie RAF imagery get updated?,NNcYwMcOvOMJLEYT4jeh
+who asked for screenshots of the live imagery?,mKqmtiHk8DxzhKmT1c8L
+when does american eagle hand off the new imagery?,yssZSayt18aOg5LJhukm
+does the imagery update apply to american eagle too?,zKsM2kn6l1LTfea75Ycu
+did we confirm the medallia survey works on office depot?,6yn1VXamPDP6U4EtKdaG
+Medallia survey deployment status,AFD6NCSU8E7woBHZfrTb
+what changed with the medallia overlay on the ODP business site?,XBchLtPDAVpuj9Pdizgl
+did anthony ask for performance verification after the release?,dRUReKQqVDV6x58UO35T
+who is answering aishani's technical questions?,vhXWfFVIh085dkApAYFt
+BJs App rollback release live,P0ZvolCArm3A9bzfWi50
+what does karim need to clarify about page identifiers?,YpRBfwucn56EQs3Ci11a
+will the overlay experience still deliver in 13.19.0?,scqTiXUmTh4Eitk4XiXT
+who is auditing the app after the rollback?,wkBoF8ghqeItn0eH1sMS
+how do we track rokt performance in tableau?,1REwdx6GEd8Wy6ktl0xy
+how is the SKA finserv pod tracking against target?,1RkCYgjJEsX1hbgewrZg
+how is SKA APAC performing this quarter?,PVJnLm8TvDgYKdqk6bsi
+SKA Travel & Mobility Performance Status,euEjk7Kp8zDIOqiQnULv
+did SKA hit its Q1 target?,m7Dl71GZLapdMgC6HUPA
+what was ROKT's overall Q1 run rate?,rpBtp0hB4pENPT2SYDIe
+which SKA retail pod is leading performance?,zz8hJpBFJDUBnMLHyX8a
+what did replit launch recently?,1mtC87rW0Gxhd1ls2E5N
+what is design canvas?,YupjzDSfLqOdF8veGcf1
+Parallel Tasks and Real-time Collaboration,yDLg4MEWUO83XUDkfS0Q
+how does composer 2 do on benchmarks?,0OjxCNC1ra6BGajCakdV
+what new coding model did cursor release?,bXbTT8xSlSxqFWPUmTcG
+how much does composer 2 cost?,vA4eSDCrGiWV7PGlU66T
+were the aerie creative assets approved?,AbjcCl42eBeOwG45LSCY
+American Eagle imagery schedule,MB2UCHEiCnpaZqV6ekFC

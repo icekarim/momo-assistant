@@ -40,6 +40,41 @@ def _store_proactive_message(message: str, space_id: str) -> None:
         print(f"  Failed to store proactive message in conversation history: {exc}")
 
 
+def get_pending_merge_suggestions(limit: int = 3):
+    """Thin re-export so the briefing's merge block reads the pending queue
+    through one monkeypatchable seam. Returns [] when KG_RESOLUTION_ENABLED is
+    off (the underlying resolution helper enforces the flag)."""
+    from knowledge_resolution import get_pending_merge_suggestions as _impl
+    return _impl(limit=limit)
+
+
+def _build_merge_suggestions_block() -> str:
+    """Compact pending-merge approval block for the morning briefing.
+
+    Returns "" when KG_RESOLUTION_ENABLED is off or there are no pending merges,
+    leaving the briefing unchanged in those cases. One line per suggestion:
+        'A' ↔ 'B' (0.82)
+    """
+    if not config.KG_RESOLUTION_ENABLED:
+        return ""
+    try:
+        pending = get_pending_merge_suggestions(limit=3)
+    except Exception as exc:
+        print(f"  Merge suggestions fetch failed: {exc}")
+        return ""
+    if not pending:
+        return ""
+
+    lines = ["MERGE SUGGESTIONS (reply to approve/reject):"]
+    for item in pending[:3]:
+        pair = list(item.get("pair", []))
+        a = pair[0] if len(pair) > 0 else "?"
+        b = pair[1] if len(pair) > 1 else "?"
+        confidence = item.get("confidence", 0.0)
+        lines.append(f"  '{a}' ↔ '{b}' ({confidence:.2f})")
+    return "\n".join(lines)
+
+
 def run_morning_briefing(space_id: str | None = None, bg_tasks=None):
     """Full morning briefing pipeline.
     Fetches emails, meetings, tasks, Granola notes, and nudges in parallel."""
@@ -125,6 +160,10 @@ def run_morning_briefing(space_id: str | None = None, bg_tasks=None):
     granola_ctx = data.get("granola", "")
     jira_ctx = data.get("jira", "")
     nudges_ctx = data.get("nudges", "")
+
+    merge_ctx = _build_merge_suggestions_block()
+    if merge_ctx:
+        nudges_ctx = f"{nudges_ctx}\n\n{merge_ctx}" if nudges_ctx else merge_ctx
 
     if not emails and not meetings and not tasks and not granola_ctx and not jira_ctx and not nudges_ctx:
         print("  Nothing to report. Skipping.")

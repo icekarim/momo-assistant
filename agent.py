@@ -273,6 +273,26 @@ def _build_optional_tools() -> list:
             }),
         ))
 
+    if config.KG_RESOLUTION_ENABLED:
+        extra_decls.append(_tool(
+            name="review_merge_suggestion",
+            description=(
+                "Approve or reject a pending knowledge-graph merge suggestion "
+                "(two name/identity variants Momo proposed combining into one). "
+                "Use when the user responds to a merge suggestion from the "
+                "morning briefing, e.g. 'approve the Sarah merge' or 'reject "
+                "Ads / Ads Team'."
+            ),
+            parameters=_schema({
+                "type": "object",
+                "properties": {
+                    "pair": {"type": "string", "description": "The two names from the suggestion, as the user refers to them (e.g. 'Sarah and Sarah Chen'). Matched against pending merges."},
+                    "decision": {"type": "string", "description": "'approve' to merge the pair into one canonical identity, or 'reject' to dismiss the suggestion."},
+                },
+                "required": ["pair", "decision"],
+            }),
+        ))
+
     if config.MCP_ENABLED:
         try:
             import mcp_client
@@ -415,11 +435,82 @@ def _dispatch(name: str, args: dict, pending_task_actions: list[dict] | None = N
             return json.dumps(result)
         return json.dumps({"status": "not_found", "message": "No matching memory found."})
 
+    if name == "review_merge_suggestion":
+        if not config.KG_RESOLUTION_ENABLED:
+            return "resolution disabled"
+        from conversation_store import get_db
+        from knowledge_resolution import (
+            apply_merge, get_pending_merge_suggestions, reject_merge,
+        )
+        db = get_db()
+        pending = get_pending_merge_suggestions(limit=50, db=db)
+        decision = (args.get("decision") or "").strip().lower()
+        if not (decision.startswith("appr") or decision.startswith("rej")):
+            return json.dumps({
+                "status": "error",
+                "message": "decision must be 'approve' or 'reject'",
+            })
+        match = _match_merge_pair(args.get("pair", ""), pending)
+        if not match:
+            return json.dumps({
+                "status": "not_found",
+                "message": f"No pending merge matching '{args.get('pair', '')}'.",
+            })
+        if match.get("status") == "ambiguous":
+            return json.dumps(match)
+        if decision.startswith("rej"):
+            reject_merge(match, db)
+            return json.dumps({"status": "rejected", "pair": match.get("pair")})
+        apply_merge(match, db)
+        return json.dumps({"status": "approved", "pair": match.get("pair")})
+
     if name.startswith("mcp_"):
         import mcp_client
         return mcp_client.call_mcp_tool(name, args)
 
     return f"Unknown tool: {name}"
+
+
+def _match_merge_pair(pair_text: str, pending: list[dict]) -> dict | None:
+    """Find the pending merge whose two pair names both appear in the user's
+    reference text (substring, case-insensitive).
+
+    When several pending pairs fully match (overlapping alias chains like
+    ("Karim", "Karim Tounkara") vs ("Karim Tounkara", "karim@rokt.com")), prefer
+    the most specific match — one where neither name is a strict substring of a
+    name in another match. If multiple matches remain, return
+    {"status": "ambiguous", "candidates": [...]} so the caller writes nothing.
+    Returns None when no pending pair is fully named."""
+    text = (pair_text or "").lower()
+    matches = []
+    for item in pending:
+        pair = item.get("pair", [])
+        if len(pair) == 2 and all(str(p).lower() in text for p in pair):
+            matches.append(item)
+
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]
+
+    def _is_specific(candidate):
+        cand_names = [str(p).lower() for p in candidate.get("pair", [])]
+        for other in matches:
+            if other is candidate:
+                continue
+            other_names = [str(p).lower() for p in other.get("pair", [])]
+            for name in cand_names:
+                if any(name != o and name in o for o in other_names):
+                    return False
+        return True
+
+    specific = [m for m in matches if _is_specific(m)]
+    if len(specific) == 1:
+        return specific[0]
+    return {
+        "status": "ambiguous",
+        "candidates": [m.get("pair") for m in (specific or matches)],
+    }
 
 
 # ── Agent system prompt ──────────────────────────────────────
