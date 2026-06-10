@@ -1,3 +1,4 @@
+import json
 import os
 from dotenv import load_dotenv
 
@@ -137,6 +138,48 @@ MOMO_API_SECRET = os.getenv("MOMO_API_SECRET", "")
 
 # ── Service URL (for self-serve OAuth re-auth links) ─────────
 MOMO_SERVICE_URL = os.getenv("MOMO_SERVICE_URL", "")
+
+
+# ── MCP (Model Context Protocol) servers ────────────────────
+# MCP_ENABLED=true activates generic MCP tool discovery and calling in the
+# agent loop.  Add servers via MCP_SERVERS_JSON (a JSON array) or rely on the
+# built-in default which registers the RoktGPT server.
+#
+# Each server object fields:
+#   name          - identifier; MUST NOT contain underscores (used in tool names)
+#   url           - MCP server URL (streamable HTTP transport)
+#   auth          - "oauth" | "bearer" | "none"
+#   enabled       - true/false (default true)
+#   tools         - optional list of allowed tool names (null = all)
+#   callback_path - OAuth callback path for local loopback (default /oauth/callback)
+MCP_ENABLED = os.getenv("MCP_ENABLED", "false").lower() == "true"
+
+_MCP_DEFAULT_SERVERS: list[dict] = [
+    {
+        "name": "roktgpt",
+        "url": "https://roktgpt-mcp-y7qoekew6a-ue.a.run.app/mcp",
+        "auth": "oauth",
+        "enabled": True,
+        "callback_path": "/oauth/callback",
+    }
+]
+
+
+def _parse_mcp_servers() -> list[dict]:
+    raw = os.getenv("MCP_SERVERS_JSON", "")
+    if raw:
+        try:
+            return json.loads(raw)
+        except Exception:
+            print("MCP: MCP_SERVERS_JSON is not valid JSON — using built-in defaults")
+    return _MCP_DEFAULT_SERVERS
+
+
+MCP_SERVERS: list[dict] = _parse_mcp_servers()
+
+# Default per-call timeout for MCP tool calls (seconds).
+# RoktGPT thinking-mode responses can be slow — 60s keeps headroom.
+MCP_DEFAULT_TIMEOUT = int(os.getenv("MCP_DEFAULT_TIMEOUT", "60"))
 
 # ── Server ───────────────────────────────────────────────────
 PORT = int(os.getenv("PORT", "8080"))
