@@ -640,6 +640,55 @@ async def trigger_search_index_backfill():
     return {"status": "started", "message": "search index backfill running in background, check logs for progress"}
 
 
+
+@app.post("/knowledge-resolve")
+async def trigger_knowledge_resolve(background_tasks: BackgroundTasks):
+    """Run entity resolution over all KG entities, writing to overlay collections.
+    Returns immediately; resolution runs in a background task."""
+    if not config.KG_RESOLUTION_ENABLED:
+        return {"status": "disabled"}
+
+    def _run():
+        from conversation_store import get_db
+        import knowledge_resolution
+        from datetime import datetime, timezone
+        db = get_db()
+        now = datetime.now(timezone.utc)
+        entities = [
+            doc.to_dict()
+            for doc in db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION).stream()
+        ]
+        print(f"Resolution: loaded {len(entities)} entities, starting...")
+        summary = knowledge_resolution.run_resolution(entities, db, now)
+        print(f"Resolution complete: {summary}")
+
+    background_tasks.add_task(_run)
+    return {"status": "started"}
+
+
+@app.post("/knowledge-link")
+async def trigger_knowledge_link(background_tasks: BackgroundTasks):
+    """Run commitment linking over open commitments.
+    Returns immediately; linking runs in a background task."""
+    if not config.KG_LINKING_ENABLED:
+        return {"status": "disabled"}
+
+    def _run():
+        from conversation_store import get_db
+        import knowledge_linking
+        from knowledge_graph import query_open_by_age
+        from datetime import datetime, timezone
+        db = get_db()
+        commitments = query_open_by_age(min_days=config.COMMITMENT_FOLLOWUP_DAYS, limit=50)
+        now = datetime.now(timezone.utc)
+        print(f"Linking: loaded {len(commitments)} open commitments, starting...")
+        summary = knowledge_linking.run_linking(commitments, db, now)
+        print(f"Linking complete: {summary}")
+
+    background_tasks.add_task(_run)
+    return {"status": "started"}
+
+
 def _run_backfill():
     import time as _time
 
