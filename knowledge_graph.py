@@ -6,6 +6,7 @@ Firestore, and provides query functions for surfacing institutional memory in
 Momo's chat responses.
 """
 
+import hashlib
 import json
 import re
 import threading
@@ -118,6 +119,25 @@ def _entry_date_key(entry: dict) -> datetime:
 
 def _normalize_text(value: str | None) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", (value or "").lower()))
+
+
+def stable_key(entity: dict) -> str:
+    """Generate a stable, deterministic key for entity dedup in nudge system.
+    
+    Produces a 16-character lowercase hex string from source_id and normalized name.
+    Used for nudge dedup in KG v2 Phase 0.5 to maintain stable identity across
+    Firestore document-id changes.
+    
+    Args:
+        entity: dict with optional 'source_id' and 'name' keys
+        
+    Returns:
+        16-character lowercase hex string (first 16 chars of SHA1 hexdigest)
+    """
+    source_id = str(entity.get("source_id") or "")
+    normalized_name = _normalize_text(str(entity.get("name") or ""))
+    key_input = f"{source_id}|{normalized_name}".encode()
+    return hashlib.sha1(key_input).hexdigest()[:16]
 
 
 def _person_tokens(value: str | None) -> list[str]:
@@ -830,12 +850,44 @@ def semantic_search(query: str, limit: int | None = None,
             break
 
     if not rerank_on or len(candidates) <= 1:
-        return candidates[:limit]
+        return _canonicalize_results(candidates[:limit])
 
     from claude_client import rerank
     texts = [_build_embedding_text(c, source_type=c.get("source_type", "")) for c in candidates]
     order = rerank(query, texts, top_k=limit)
-    return [candidates[i] for i in order]
+    return _canonicalize_results([candidates[i] for i in order])
+
+
+def _canonicalize_results(results: list[dict]) -> list[dict]:
+    """Display-level canonicalization of semantic_search results (KG v2 Phase 1).
+
+    Maps owner / related_people values through resolve_canonical so every
+    consumer of semantic_search sees canonical display names. No-op when
+    KG_RESOLUTION_ENABLED is false. Operates ONLY on the result dicts
+    (_doc_to_dict returns fresh dicts per doc) — raw knowledge_graph docs are
+    never mutated.
+    """
+    if not config.KG_RESOLUTION_ENABLED or not results:
+        return results
+
+    names: set[str] = set()
+    for entity in results:
+        if entity.get("owner"):
+            names.add(str(entity["owner"]))
+        for person in entity.get("related_people") or []:
+            names.add(str(person))
+    if not names:
+        return results
+
+    mapping = resolve_canonical(sorted(names))
+    for entity in results:
+        if entity.get("owner"):
+            entity["owner"] = mapping.get(str(entity["owner"]), entity["owner"])
+        if entity.get("related_people"):
+            entity["related_people"] = [
+                mapping.get(str(p), p) for p in entity["related_people"]
+            ]
+    return results
 
 
 def embed_backfill(include_stale: bool = False) -> dict:
@@ -1033,3 +1085,99 @@ def query_knowledge_graph(user_message: str) -> str:
         return ""
 
     return format_knowledge_for_context(results)
+
+
+# ── Canonical resolution (KG v2 Phase 1, read-time overlay) ──
+# Mirrors the _kg_cache / _kg_cache_lock TTLCache pattern above, but kept
+# separate so canonical lookups and raw-entry caches expire independently.
+# resolve_canonical NEVER mutates raw knowledge_graph docs — it only READS the
+# kg_canonical overlay collection.
+_canonical_cache = TTLCache(maxsize=8, ttl=300)
+_canonical_cache_lock = threading.Lock()
+
+
+def _load_canonical_map() -> dict[str, str]:
+    """Build {normalized_alias -> display_name} from the kg_canonical overlay,
+    cached for 300s (mirrors _load_all_entries)."""
+    cache_key = ("canonical_map",)
+    with _canonical_cache_lock:
+        cached = _canonical_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    db = get_db()
+    mapping: dict[str, str] = {}
+    for doc in db.collection(config.FIRESTORE_KG_CANONICAL_COLLECTION).stream():
+        data = doc.to_dict()
+        display = data.get("display_name") or ""
+        if not display:
+            continue
+        for alias in data.get("aliases", []):
+            normalized = _normalize_text(alias)
+            if normalized:
+                mapping[normalized] = display
+
+    with _canonical_cache_lock:
+        _canonical_cache[cache_key] = mapping
+    return mapping
+
+
+def resolve_canonical(names: list[str]) -> dict[str, str]:
+    """Map raw name/email strings to canonical display names (read-time overlay).
+
+    Returns an identity mapping ({name: name}) when KG_RESOLUTION_ENABLED is
+    false OR when the kg_canonical overlay is empty. This is a pure read against
+    the kg_canonical overlay and NEVER mutates raw knowledge_graph docs.
+    """
+    identity = {name: name for name in names}
+    if not config.KG_RESOLUTION_ENABLED:
+        return identity
+
+    mapping = _load_canonical_map()
+    if not mapping:
+        return identity
+
+    return {name: mapping.get(_normalize_text(name), name) for name in names}
+
+
+def _load_canonical_groups() -> dict[str, list[str]]:
+    """Build {normalized_alias -> full alias list} from the kg_canonical overlay,
+    cached for 300s (mirrors _load_canonical_map). Used by get_canonical_aliases
+    to expand a single name into every alias of its canonical group."""
+    cache_key = ("canonical_groups",)
+    with _canonical_cache_lock:
+        cached = _canonical_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    db = get_db()
+    groups: dict[str, list[str]] = {}
+    for doc in db.collection(config.FIRESTORE_KG_CANONICAL_COLLECTION).stream():
+        data = doc.to_dict()
+        aliases = list(data.get("aliases", []))
+        if not aliases:
+            continue
+        for alias in aliases:
+            normalized = _normalize_text(alias)
+            if normalized:
+                groups[normalized] = aliases
+
+    with _canonical_cache_lock:
+        _canonical_cache[cache_key] = groups
+    return groups
+
+
+def get_canonical_aliases(name: str) -> list[str]:
+    """Return every alias of the canonical group ``name`` belongs to.
+
+    Returns an empty list when KG_RESOLUTION_ENABLED is false OR when ``name``
+    has no canonical match (so callers can unconditionally expand a lookup set
+    without changing behaviour while the flag is off). Pure read against the
+    kg_canonical overlay — NEVER mutates raw knowledge_graph docs.
+    """
+    if not config.KG_RESOLUTION_ENABLED:
+        return []
+    normalized = _normalize_text(name)
+    if not normalized:
+        return []
+    return list(_load_canonical_groups().get(normalized, []))
