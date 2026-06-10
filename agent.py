@@ -273,6 +273,13 @@ def _build_optional_tools() -> list:
             }),
         ))
 
+    if config.MCP_ENABLED:
+        try:
+            import mcp_client
+            extra_decls.extend(mcp_client.list_all_mcp_tools())
+        except Exception as exc:
+            print(f"[agent] MCP tool discovery failed (continuing without MCP tools): {exc}")
+
     if not extra_decls:
         return []
     return list(extra_decls)
@@ -408,6 +415,10 @@ def _dispatch(name: str, args: dict, pending_task_actions: list[dict] | None = N
             return json.dumps(result)
         return json.dumps({"status": "not_found", "message": "No matching memory found."})
 
+    if name.startswith("mcp_"):
+        import mcp_client
+        return mcp_client.call_mcp_tool(name, args)
+
     return f"Unknown tool: {name}"
 
 
@@ -428,7 +439,7 @@ If the user asks what you remember about them, summarize the memories from the [
 
 AGENT_SYSTEM_PROMPT = f"""You are Momo, a chill, sharp, and low-key hilarious AI assistant living inside Google Chat. You talk like someone's most competent friend — the one who's somehow always got the answer but never makes it weird.
 {_OWNER_LINE}
-You have access to tools that let you read Gmail, Google Calendar, Google Tasks, a knowledge graph of institutional memory, Granola meeting notes, and Jira tickets. You also have tools to create, update, complete, and delete tasks.
+You have access to tools that let you read Gmail, Google Calendar, Google Tasks, a knowledge graph of institutional memory, Granola meeting notes, and Jira tickets. You also have tools to create, update, complete, and delete tasks. You can also ask RoktGPT — Rokt's internal company AI — anything Rokt-related via the mcp_roktgpt_ask_roktgpt tool: company policies, processes, people, internal docs, systems, and engineering questions. RoktGPT answers from Rokt's internal knowledge bases.
 
 === VIBE ===
 You're a young NYC twenty-something texting your people. modern gen-z/gen-alpha, not millennial. lowercase ALWAYS. caps only for emphasis or being dramatic on purpose.
@@ -483,6 +494,7 @@ You MUST call tools to get real data before answering questions about emails, ca
 NEVER guess, fabricate, or hallucinate data. If you don't have data from a tool call, say so.
 Be efficient — call only the tools you need. Don't call everything "just in case".
 If one tool doesn't return what you need, try a different one. For example, if search_knowledge_graph doesn't find it, try search_emails.
+For anything about Rokt the company — policies, processes, people, internal tools, systems, engineering details — use mcp_roktgpt_ask_roktgpt. Pass a clear, self-contained question (it doesn't see this conversation). It's slower than other tools, so use it when the question is actually rokt-internal, not for the user's own emails/calendar/tasks.
 For task changes (create, update, complete, delete), use the task tools to prepare the request. Those tools do NOT execute immediately — they queue a pending approval.
 After queueing a task change, explicitly say it's waiting for approval and tell the user to reply "yes" to approve or "no" to cancel.
 Never say a task was already created, updated, completed, or deleted before approval happens.
@@ -687,7 +699,7 @@ def run_agent_loop(user_message: str, conversation_history: list[dict],
     parent_run_tree = _get_run_tree()
 
     def _dispatch_tool(name, tool_input):
-        timeout = _TOOL_TIMEOUTS.get(name, 10)
+        timeout = _TOOL_TIMEOUTS.get(name, config.MCP_DEFAULT_TIMEOUT if name.startswith("mcp_") else 10)
 
         def _run_tool(rt=parent_run_tree):
             if rt is not None:
