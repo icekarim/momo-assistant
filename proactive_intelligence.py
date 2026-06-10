@@ -32,11 +32,14 @@ from conversation_store import (
 )
 from knowledge_graph import (
     format_knowledge_for_context,
+    get_canonical_aliases,
     query_all_entries,
     query_by_person,
     query_by_project,
     query_open_by_age,
     query_recent,
+    resolve_canonical,
+    stable_key,
     update_entity_status,
 )
 
@@ -128,13 +131,25 @@ def _build_meeting_prep(meeting: dict) -> str | None:
     seen_ids = set()
     title = meeting.get("title", "")
 
+    # Expand each attendee with their canonical aliases. get_canonical_aliases
+    # returns [] when KG_RESOLUTION_ENABLED is off, so query_names equals the
+    # attendee set then — a no-op. Deduped by normalized form.
+    query_names: list[str] = []
+    seen_query: set[str] = set()
+    for attendee in attendee_names:
+        for candidate in [attendee, *get_canonical_aliases(attendee)]:
+            normalized = candidate.strip().lower()
+            if normalized and normalized not in seen_query:
+                seen_query.add(normalized)
+                query_names.append(candidate)
+
     # Query KG in parallel: by each attendee AND by meeting title (semantic search)
     from knowledge_graph import semantic_search as _semantic_search
-    workers = max(len(attendee_names) + 1, 4)
+    workers = max(len(query_names) + 1, 4)
     with ThreadPoolExecutor(max_workers=workers) as pool:
         person_futures = {
-            pool.submit(query_by_person, attendee, None, 8): f"person:{attendee}"
-            for attendee in attendee_names
+            pool.submit(query_by_person, name, None, 8): f"person:{name}"
+            for name in query_names
         }
         # Also search by meeting title to catch topic-based KG entries.
         # rerank=True: async/background path, so the ~3s reranking latency is
@@ -317,8 +332,11 @@ def _run_commitment_engine() -> list[dict]:
 
     nudges = []
     for entry in overdue:
-        nudge_id = _nudge_key("commitment", entry.get("id", entry.get("name", "")))
-        if has_nudge_been_sent(nudge_id):
+        # Dual-read transition: legacy dedup docs use the old Firestore-id key;
+        # read both so the cooldown keeps suppressing. Only new_key is written.
+        new_key = _nudge_key("commitment", stable_key(entry))
+        old_key = _nudge_key("commitment", entry.get("id", entry.get("name", "")))
+        if has_nudge_been_sent(new_key) or has_nudge_been_sent(old_key):
             continue
 
         evidence = _check_commitment_evidence(entry)
@@ -350,7 +368,7 @@ def _run_commitment_engine() -> list[dict]:
             ),
             "related_entity_ids": [entry.get("id", "")],
             "delivery": "both" if priority == "high" else "briefing",
-            "_nudge_key": nudge_id,
+            "_nudge_key": new_key,
         })
 
     return nudges
@@ -385,12 +403,23 @@ def _run_pattern_engine() -> list[dict]:
     tag_counter: Counter = Counter()
     project_types: dict[str, list[str]] = defaultdict(list)
 
+    # Canonicalize counter keys so split variants ("Sarah" / "Sarah Chen") merge.
+    # resolve_canonical returns an identity map when KG_RESOLUTION_ENABLED is off,
+    # so counting is unchanged in that case.
+    person_canonical = resolve_canonical(
+        list({p for e in entries for p in e.get("related_people", [])})
+    )
+    project_canonical = resolve_canonical(
+        list({p for e in entries for p in e.get("related_projects", [])})
+    )
+
     for e in entries:
         for person in e.get("related_people", []):
-            people_counter[person] += 1
+            people_counter[person_canonical.get(person, person)] += 1
         for project in e.get("related_projects", []):
-            project_counter[project] += 1
-            project_types[project].append(e.get("entity_type", "topic"))
+            canonical_project = project_canonical.get(project, project)
+            project_counter[canonical_project] += 1
+            project_types[canonical_project].append(e.get("entity_type", "topic"))
         for tag in e.get("tags", []):
             tag_counter[tag] += 1
 
