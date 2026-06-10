@@ -17,3 +17,8 @@ PLAN_*.md
 test_generated*.py
 .DS_Store
 **/.DS_Store
+
+# KG v2 eval evidence (reproducible) + unreviewed candidates
+qa/candidates/
+qa/*.json
+qa/*.txt
