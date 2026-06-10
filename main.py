@@ -416,6 +416,30 @@ async def granola_token_refresh():
 
 # ── Granola Self-Serve Re-Auth ───────────────────────────────
 
+
+@app.post("/mcp-token-refresh")
+async def mcp_token_refresh():
+    """Proactively refresh tokens for all enabled OAuth MCP servers.
+
+    Add to Cloud Scheduler (e.g. every 4h) alongside granola-token-refresh.
+    RoktGPT tokens last 8h but rotate on each refresh, so frequent keepalives
+    prevent the refresh chain from going stale.
+    """
+    if not config.MCP_ENABLED:
+        return {"status": "skipped", "reason": "mcp disabled"}
+    try:
+        from mcp_client import refresh_all_tokens
+        results = refresh_all_tokens()
+        all_ok = all(results.values()) if results else True
+        return {
+            "status": "ok" if all_ok else "partial",
+            "servers": results,
+        }
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "message": f"MCP token refresh failed: {str(e)}"}
+
+
 @app.get("/granola-auth/start")
 async def granola_auth_start(request: Request):
     """Browser-based Granola re-authentication.
