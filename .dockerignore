@@ -2,6 +2,7 @@
 .env.*
 token.json
 granola_token.json
+mcp_token_*.json
 client_secret.json
 service_account.json
 .mcp.json
