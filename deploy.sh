@@ -54,6 +54,23 @@ print('  Google token synced to Firestore')
 " 2>/dev/null || echo "  (Firestore sync skipped — will use env var fallback)"
 fi
 
+# Sync MCP server tokens (mcp_token_<server>.json) to Firestore so Cloud Run has them
+for mcp_token_file in mcp_token_*.json; do
+    [ -f "$mcp_token_file" ] || continue
+    server_name="${mcp_token_file#mcp_token_}"
+    server_name="${server_name%.json}"
+    echo "Syncing MCP token for '${server_name}' to Firestore..."
+    SERVER_NAME="$server_name" TOKEN_FILE="$mcp_token_file" python3 -c "
+import json, os
+from mcp_client import _write_token_to_firestore
+with open(os.environ['TOKEN_FILE']) as f:
+    token = json.load(f)
+_write_token_to_firestore(os.environ['SERVER_NAME'], token)
+print('  MCP token synced to Firestore')
+" 2>/dev/null || echo "  (Firestore sync skipped — will use env var fallback)"
+done
+
+
 # Read token files into variables for passing as env vars
 GOOGLE_TOKEN_JSON="${GOOGLE_TOKEN_JSON:-$(cat token.json 2>/dev/null || echo "")}"
 GRANOLA_TOKEN_JSON=$(cat granola_token.json 2>/dev/null || echo "")
@@ -79,6 +96,7 @@ gcloud run deploy $SERVICE_NAME \
   --set-env-vars="LANGSMITH_TRACING=true,LANGSMITH_API_KEY=${LANGSMITH_API_KEY},LANGSMITH_PROJECT=momo" \
   --set-env-vars="OWNER_NAME=${OWNER_NAME:-},MOMO_API_SECRET=${MOMO_API_SECRET}" \
   --set-env-vars="MOMO_SERVICE_URL=${EXISTING_URL}" \
+  --set-env-vars="MCP_ENABLED=true" \
   --set-env-vars="^##^GOOGLE_TOKEN_JSON=${GOOGLE_TOKEN_JSON}##GRANOLA_TOKEN_JSON=${GRANOLA_TOKEN_JSON}" \
   --memory=2Gi \
   --timeout=300 \
