@@ -90,6 +90,26 @@ SEMANTIC_SEARCH_LIMIT = int(os.getenv("SEMANTIC_SEARCH_LIMIT", "15"))
 RERANK_ENABLED = os.getenv("RERANK_ENABLED", "true").lower() == "true"
 RERANK_CANDIDATES = int(os.getenv("RERANK_CANDIDATES", "30"))
 
+# ── KG v2 — Entity Resolution (Phase 1, overlay model) ───────
+# Default OFF. When false, resolve_canonical returns identity mappings and the
+# resolution batch job is a no-op. Rollback for the whole phase = flag off; the
+# raw knowledge_graph collection is never mutated either way.
+KG_RESOLUTION_ENABLED = os.getenv("KG_RESOLUTION_ENABLED", "false").lower() == "true"
+# Hybrid merge policy thresholds (Momus-approved plan): auto-apply at >=0.90
+# confidence, queue 0.75-0.90 for one-tap approval, drop below 0.75.
+KG_MERGE_AUTO_THRESHOLD = float(os.getenv("KG_MERGE_AUTO_THRESHOLD", "0.90"))
+KG_MERGE_QUEUE_THRESHOLD = float(os.getenv("KG_MERGE_QUEUE_THRESHOLD", "0.75"))
+# Overlay collections — written by knowledge_resolution.py ONLY. Never the raw
+# knowledge_graph collection.
+FIRESTORE_KG_CANONICAL_COLLECTION = "kg_canonical"
+FIRESTORE_KG_MERGE_QUEUE_COLLECTION = "kg_merge_queue"
+
+# ── KG v2 — Commitment-Evidence Linking (Phase 2, overlay model) ──
+# Default OFF. Links are written by knowledge_linking.py ONLY, to kg_links.
+KG_LINKING_ENABLED = os.getenv("KG_LINKING_ENABLED", "false").lower() == "true"
+KG_LINK_MIN_CONFIDENCE = float(os.getenv("KG_LINK_MIN_CONFIDENCE", "0.85"))
+FIRESTORE_KG_LINKS_COLLECTION = "kg_links"
+
 # ── User Memory ─────────────────────────────────────────────
 USER_MEMORY_ENABLED = os.getenv("USER_MEMORY_ENABLED", "true").lower() == "true"
 FIRESTORE_USER_MEMORY_COLLECTION = "user_memories"
