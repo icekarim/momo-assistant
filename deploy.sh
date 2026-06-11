@@ -30,15 +30,18 @@ gcloud config set project $PROJECT_ID
 if [ -f granola_token.json ]; then
     echo "Syncing Granola token to Firestore..."
     python3 -c "
-from granola_service import _write_token_to_firestore
-import json, time
+from granola_service import _read_token_from_firestore, _write_token_to_firestore
+import json, os
 with open('granola_token.json') as f:
     token = json.load(f)
 if '_expires_at' not in token:
-    import os
     token['_expires_at'] = os.path.getmtime('granola_token.json') + token.get('expires_in', 21600)
-_write_token_to_firestore(token)
-print('  Granola token synced to Firestore')
+existing = _read_token_from_firestore()
+if existing and existing.get('_expires_at', 0) >= token['_expires_at']:
+    print('  Firestore Granola token is fresher — keeping it (local file is stale)')
+else:
+    _write_token_to_firestore(token)
+    print('  Granola token synced to Firestore')
 " 2>/dev/null || echo "  (Firestore sync skipped — will use env var fallback)"
 fi
 
@@ -62,11 +65,18 @@ for mcp_token_file in mcp_token_*.json; do
     echo "Syncing MCP token for '${server_name}' to Firestore..."
     SERVER_NAME="$server_name" TOKEN_FILE="$mcp_token_file" python3 -c "
 import json, os
-from mcp_client import _write_token_to_firestore
+from mcp_client import _read_token_from_firestore, _write_token_to_firestore
+name = os.environ['SERVER_NAME']
 with open(os.environ['TOKEN_FILE']) as f:
     token = json.load(f)
-_write_token_to_firestore(os.environ['SERVER_NAME'], token)
-print('  MCP token synced to Firestore')
+if '_expires_at' not in token:
+    token['_expires_at'] = os.path.getmtime(os.environ['TOKEN_FILE']) + token.get('expires_in', 28800)
+existing = _read_token_from_firestore(name)
+if existing and existing.get('_expires_at', 0) >= token['_expires_at']:
+    print('  Firestore MCP token is fresher — keeping it (local file is stale)')
+else:
+    _write_token_to_firestore(name, token)
+    print('  MCP token synced to Firestore')
 " 2>/dev/null || echo "  (Firestore sync skipped — will use env var fallback)"
 done
 
