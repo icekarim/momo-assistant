@@ -35,6 +35,40 @@ def test_max_tokens_always_set(monkeypatch):
     assert seen["model"] == "claude-haiku-4-5-20251001"
 
 
+def test_generate_passes_tier_timeout(monkeypatch):
+    seen = {}
+
+    class FakeMsgs:
+        def create(self, **kw):
+            seen.update(kw)
+            return _fake_message("ok")
+
+    monkeypatch.setattr(cc._client, "messages", FakeMsgs())
+    cc.generate("hi", tier=T.LIGHT)
+    assert seen["timeout"] == cc.TIER_TIMEOUTS[T.LIGHT]
+    cc.generate("hi", tier=T.STANDARD)
+    assert seen["timeout"] == cc.TIER_TIMEOUTS[T.STANDARD]
+    cc.generate("hi", tier=T.DEEP, allow_fallback=False)
+    assert seen["timeout"] == cc.TIER_TIMEOUTS[T.DEEP]
+
+
+def test_generate_explicit_timeout_override(monkeypatch):
+    seen = {}
+
+    class FakeMsgs:
+        def create(self, **kw):
+            seen.update(kw)
+            return _fake_message("ok")
+
+    monkeypatch.setattr(cc._client, "messages", FakeMsgs())
+    cc.generate("hi", tier=T.STANDARD, timeout=12)
+    assert seen["timeout"] == 12
+
+
+def test_interactive_client_max_retries_is_one():
+    assert cc._client.max_retries == 1
+
+
 def test_extract_text_joins_text_blocks():
     msg = type("M", (), {"content": [
         type("B", (), {"type": "text", "text": "foo "})(),

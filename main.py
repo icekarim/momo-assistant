@@ -17,12 +17,16 @@ Endpoints:
 
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
+import asyncio
 import html
 import traceback
 import threading
+import uuid
 
 import re
+from datetime import datetime, timezone
 import config
+from cards import build_task_tray_card
 from briefing import run_morning_briefing, run_proactive_email_alerts, run_post_meeting_debrief
 from gmail_service import (
     fetch_unread_client_emails,
@@ -52,6 +56,11 @@ from conversation_store import (
     clear_pending_task_actions,
     store_pending_task_actions,
     store_pending_task_actions_if_empty,
+    store_task_batch,
+    get_task_batch,
+    update_task_batch,
+    claim_message_once,
+    release_message_claim,
 )
 
 app = FastAPI(title="Momo")
@@ -81,6 +90,9 @@ async def startup_warmup():
     """Pre-initialize Google credentials, discovery docs, and KG embeddings on startup."""
     if not config.MOMO_API_SECRET:
         print("WARNING: MOMO_API_SECRET is not set — all protected endpoints are exposed without auth")
+    if not config.MOMO_SERVICE_URL:
+        print("WARNING: MOMO_SERVICE_URL is not set — task-card buttons will use a relative '/chat' "
+              "function the add-on cannot route (clicks will silently fail). Set MOMO_SERVICE_URL.")
     from google_auth import warmup
     warmup()
     try:
@@ -100,7 +112,8 @@ async def startup_warmup():
 def _parse_event(body: dict) -> dict:
     """Parse both standard Chat events and Workspace Add-on events into a
     normalized dict with keys: event_type, text, user_id, user_name, space,
-    is_addon, attachments."""
+    is_addon, attachments, invoked_function, parameters, form_inputs,
+    message_name, dialog_event_type."""
     is_addon = "commonEventObject" in body or "chat" in body
 
     event_type = body.get("type")
@@ -109,6 +122,11 @@ def _parse_event(body: dict) -> dict:
     user_name = "there"
     space = ""
     attachments = []
+    invoked_function = ""
+    parameters: dict = {}
+    form_inputs: dict = {}
+    message_name = ""
+    dialog_event_type = ""
 
     if is_addon:
         chat_payload = body.get("chat", {})
@@ -133,6 +151,28 @@ def _parse_event(body: dict) -> dict:
 
         space_info = msg_payload.get("space", {})
         space = space_info.get("name", "")
+
+        btn = chat_payload.get("buttonClickedPayload", {})
+        # In a Workspace add-on event, commonEventObject (parameters /
+        # invokedFunction / formInputs) is TOP-LEVEL on the body, a sibling of
+        # "chat" (HANDOFF §4b + Google's add-on event format). Read it there
+        # first; fall back to the nested locations for robustness.
+        common_obj = (
+            body.get("commonEventObject")
+            or btn.get("commonEventObject")
+            or chat_payload.get("commonEventObject")
+            or {}
+        )
+        invoked_function = common_obj.get("invokedFunction", "")
+        raw_params = common_obj.get("parameters", {})
+        parameters = (
+            {p["key"]: p["value"] for p in raw_params}
+            if isinstance(raw_params, list)
+            else dict(raw_params)
+        )
+        form_inputs = common_obj.get("formInputs", {})
+        message_name = btn.get("message", {}).get("name", "") or msg.get("name", "")
+        dialog_event_type = body.get("dialogEventType", "") or ""
     else:
         msg = body.get("message", {})
         text = msg.get("argumentText", msg.get("text", "")).strip()
@@ -142,6 +182,18 @@ def _parse_event(body: dict) -> dict:
         user_name = user.get("displayName", "there")
         space = body.get("space", {}).get("name", "")
 
+        common = body.get("common", {})
+        invoked_function = common.get("invokedFunction", "")
+        raw_params = common.get("parameters", {})
+        parameters = (
+            {p["key"]: p["value"] for p in raw_params}
+            if isinstance(raw_params, list)
+            else dict(raw_params)
+        )
+        form_inputs = common.get("formInputs", {})
+        message_name = msg.get("name", "")
+        dialog_event_type = body.get("dialogEventType", "") or ""
+
     return {
         "event_type": event_type,
         "text": text,
@@ -150,6 +202,11 @@ def _parse_event(body: dict) -> dict:
         "space": space,
         "is_addon": is_addon,
         "attachments": attachments,
+        "invoked_function": invoked_function,
+        "parameters": parameters,
+        "form_inputs": form_inputs,
+        "message_name": message_name,
+        "dialog_event_type": dialog_event_type,
     }
 
 
@@ -170,6 +227,292 @@ def _make_response(text: str, is_addon: bool) -> dict:
             }
         }
     return {"text": text}
+
+
+def _make_card_response(cards_v2: list, is_addon: bool, update: bool = True, text: str = "") -> dict:
+    """Build a Cards v2 response envelope. When ``text`` is non-empty it rides
+    alongside the card — standard Chat allows text + cardsV2 in one Message, and
+    the Add-on action message carries both. ``update=False`` is the new-message
+    (create) envelope used for synchronous conversational create cards."""
+    if is_addon:
+        try:
+            action = "updateMessageAction" if update else "createMessageAction"
+            message = {"cardsV2": cards_v2}
+            if text:
+                message["text"] = text
+            return {
+                "hostAppDataAction": {
+                    "chatDataAction": {
+                        action: {"message": message}
+                    }
+                }
+            }
+        except Exception:
+            # Safe degradation: fall through to standard-Chat shape
+            pass
+    if update:
+        response = {"actionResponse": {"type": "UPDATE_MESSAGE"}, "cardsV2": cards_v2}
+    else:
+        response = {"cardsV2": cards_v2}
+    if text:
+        response["text"] = text
+    return response
+
+
+# ── Card-click task-tray handler (PLAN_card_task_ux.md §6.4) ──
+
+def _date_to_ms_epoch(due):
+    if not due:
+        return None
+    try:
+        dt = datetime.strptime(str(due)[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except (ValueError, TypeError):
+        return None
+
+
+def _ms_epoch_to_date(ms):
+    if ms is None:
+        return None
+    try:
+        return datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+    except (ValueError, TypeError, OSError):
+        return None
+
+
+def _form_text_value(form_inputs, name):
+    try:
+        return form_inputs[name]["stringInputs"]["value"][0]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+def _form_date_ms(form_inputs, name):
+    try:
+        return form_inputs[name]["dateInput"]["msSinceEpoch"]
+    except (KeyError, TypeError):
+        return None
+
+
+def _state_for_create_result(result):
+    """Map a create_task() result to a tray row state.
+
+    create_task returns {"status": "created"|"already_exists"|"already_completed"}
+    on success or {"error": ...} (no "status") on failure. A non-dict, a dict
+    carrying "error", or one missing "status" is a hard failure — labelling it
+    "already_exists" would mislead the user ("Already in your tasks")."""
+    if not isinstance(result, dict) or "error" in result or "status" not in result:
+        return "failed"
+    status = result.get("status")
+    if status == "created":
+        return "added"
+    if status == "already_completed":
+        return "already_completed"
+    if status == "already_exists":
+        return "already_exists"
+    return "failed"
+
+
+def _chat_url() -> str:
+    return config.MOMO_SERVICE_URL.rstrip("/") + "/chat"
+
+
+def _make_edit_dialog(batch_id, row, is_addon: bool = False, chat_url: str = ""):
+    picker = {"name": "due", "label": "Due date", "type": "DATE_ONLY"}
+    due_ms = _date_to_ms_epoch(row.get("due"))
+    if due_ms is not None:
+        picker["valueMsEpoch"] = due_ms
+
+    widgets = [
+        {"textInput": {"name": "title", "label": "Task", "value": row.get("title", "")}},
+        {"dateTimePicker": picker},
+        {"buttonList": {"buttons": [
+            {"text": "Save", "onClick": {"action": {
+                "function": chat_url,
+                "parameters": [
+                    {"key": "actionName", "value": "task_edit_submit"},
+                    {"key": "batchId", "value": batch_id},
+                    {"key": "taskId", "value": row.get("taskId")},
+                ],
+            }}},
+        ]}},
+    ]
+    standard_dialog = {
+        "actionResponse": {
+            "type": "DIALOG",
+            "dialogAction": {"dialog": {"body": {"sections": [
+                {"header": "Edit task", "widgets": widgets}
+            ]}}},
+        }
+    }
+    if is_addon:
+        try:
+            # Add-on Edit dialog may need the navigations/pushCard model (HANDOFF
+            # §4d); standard-Chat DIALOG is kept for v1 and degrades safely.
+            return standard_dialog
+        except Exception:
+            pass
+    return standard_dialog
+
+
+def _safe_create_state(row):
+    """Run create_task for a row and map the result to a state, treating any
+    exception as a 'failed' state so a Tasks-API error never aborts the click
+    or leaves a batch half-mutated."""
+    try:
+        return _state_for_create_result(
+            create_task(
+                title=row["title"],
+                notes=row.get("notes", ""),
+                due_date=row.get("due"),
+            )
+        )
+    except Exception as e:
+        print(f"create_task failed for {row.get('title')!r}: {e}")
+        return "failed"
+
+
+_CARD_STATE_PHRASES = {
+    "added": "added to Google Tasks",
+    "already_exists": "already on the list",
+    "already_completed": "already completed",
+    "failed": "failed to add",
+    "dismissed": "dismissed (not added)",
+}
+
+
+def _log_card_action_to_history(batch: dict, affected: list) -> None:
+    """Mirror a task-tray button outcome into conversation history.
+
+    Card clicks mutate the task_batches doc and re-render the card, but they
+    never write a conversation turn — so the agent reads stale history on the
+    next message and thinks a created task is "still pending approval" (the
+    phantom-approval loop the text-reply flow already guards against at
+    _apply_pending_task_actions_background). Logging an assistant turn here
+    gives the agent ground truth that the task was actually added/dismissed.
+
+    The batch stores the space it was created in; conversation history is
+    space-scoped (conversation_scope -> "space:{space}"), so we reconstruct
+    the exact same scope id from batch["space"]. affected is a list of
+    (title, state) tuples for the rows this click resolved.
+    """
+    if not affected:
+        return
+    space = batch.get("space", "")
+    if not space:
+        return
+    conversation_id = conversation_scope(space=space)
+    lines = [
+        f"• {title} — {_CARD_STATE_PHRASES.get(state, state)}"
+        for title, state in affected
+    ]
+    summary = "[task card resolved]\n" + "\n".join(lines)
+    try:
+        add_turn(conversation_id, "assistant", summary)
+    except Exception as e:
+        print(f"failed to log card action to history: {e}")
+
+
+def handle_card_click(ev: dict) -> dict:
+    """Synchronously dispatch a Cards v2 task-tray button click.
+
+    Outer guard: a card click must never surface as a 500. Any unexpected
+    exception degrades to a safe no-op envelope (partial row progress is
+    persisted inside the dispatcher before any re-raise could occur).
+    """
+    is_addon = ev.get("is_addon", False)
+    try:
+        return _dispatch_card_click(ev, is_addon)
+    except Exception as e:
+        print(f"handle_card_click failed: {e}")
+        traceback.print_exc()
+        return _make_response("", is_addon)
+
+
+def _dispatch_card_click(ev: dict, is_addon: bool) -> dict:
+    """Load the batch named by the click, mutate the targeted row(s), persist
+    the batch, and re-render the whole tray inside an UPDATE_MESSAGE. Unknown
+    functions or a missing batch return a safe empty response."""
+    params = ev.get("parameters", {})
+    # Add-on buttons set function=<URL>, so the action lives in actionName;
+    # standard Chat still uses invoked_function. Dispatch on actionName first.
+    func = params.get("actionName") or ev.get("invoked_function", "")
+    batch_id = params.get("batchId")
+    task_id = params.get("taskId")
+    form_inputs = ev.get("form_inputs", {})
+    chat_url = _chat_url()
+
+    batch = get_task_batch(batch_id) if batch_id else None
+    if not batch:
+        return {}
+
+    rows = batch.get("rows", [])
+    source = batch.get("source", "")
+
+    def _find_row(tid):
+        for row in rows:
+            if row.get("taskId") == tid:
+                return row
+        return None
+
+    def _rerender():
+        update_task_batch(batch_id, rows)
+        tray = build_task_tray_card(batch_id, source, rows, chat_url=chat_url)
+        return _make_card_response(tray, is_addon, update=True)
+
+    if func == "task_add":
+        row = _find_row(task_id)
+        if row is not None:
+            row["state"] = _safe_create_state(row)
+            _log_card_action_to_history(batch, [(row.get("title", ""), row["state"])])
+        return _rerender()
+
+    if func == "task_dismiss":
+        row = _find_row(task_id)
+        if row is not None:
+            row["state"] = "dismissed"
+            _log_card_action_to_history(batch, [(row.get("title", ""), "dismissed")])
+        return _rerender()
+
+    if func == "task_add_all":
+        # One row failing must not abort the loop or skip the persist: every
+        # pending row is attempted and the batch is always re-rendered/persisted.
+        affected = []
+        for row in rows:
+            if row.get("state") == "pending":
+                row["state"] = _safe_create_state(row)
+                affected.append((row.get("title", ""), row["state"]))
+        _log_card_action_to_history(batch, affected)
+        return _rerender()
+
+    if func == "task_dismiss_all":
+        affected = []
+        for row in rows:
+            if row.get("state") == "pending":
+                row["state"] = "dismissed"
+                affected.append((row.get("title", ""), "dismissed"))
+        _log_card_action_to_history(batch, affected)
+        return _rerender()
+
+    if func == "task_edit":
+        row = _find_row(task_id)
+        if row is None:
+            return {}
+        return _make_edit_dialog(batch_id, row, is_addon=is_addon, chat_url=chat_url)
+
+    if func == "task_edit_submit":
+        row = _find_row(task_id)
+        if row is not None:
+            new_title = _form_text_value(form_inputs, "title")
+            if new_title:
+                row["title"] = new_title
+            new_due = _ms_epoch_to_date(_form_date_ms(form_inputs, "due"))
+            if new_due:
+                row["due"] = new_due
+            row["state"] = "pending"
+        return _rerender()
+
+    return {}
 
 
 # ── Health Check ─────────────────────────────────────────────
@@ -871,6 +1214,9 @@ async def chat_webhook(request: Request, background_tasks: BackgroundTasks):
     if event_type == "MESSAGE":
         return await handle_message(ev, background_tasks)
 
+    if event_type == "CARD_CLICKED":
+        return handle_card_click(ev)
+
     return _make_response("Momo is here. Send me a message to get started.", is_addon)
 
 
@@ -1194,26 +1540,17 @@ def _user_task_scope(user_id: str, space: str) -> str:
     return f"user:{space or 'direct'}:{user_id}"
 
 
-def _space_task_scope(space: str) -> str | None:
-    """Scope scheduled debrief approvals to the chat space."""
-    if not space:
-        return None
-    return f"space:{space}"
-
-
 def _get_pending_task_request(user_id: str, space: str) -> tuple[dict | None, str | None]:
-    """Fetch the highest-priority pending task request for this message."""
+    """Fetch the user-scope pending task request for this message.
+
+    Debrief suggestions now flow through tray cards (task_batches), so a
+    ``space:``-scoped pending doc is never written — only the user scope is
+    checked here.
+    """
     user_scope = _user_task_scope(user_id, space)
     pending = get_pending_task_actions(scope_id=user_scope)
     if pending:
         return pending, user_scope
-
-    space_scope = _space_task_scope(space)
-    if space_scope:
-        pending = get_pending_task_actions(scope_id=space_scope)
-        if pending:
-            return pending, space_scope
-
     return None, None
 
 
@@ -1429,18 +1766,64 @@ async def handle_message(ev: dict, background_tasks: BackgroundTasks) -> dict:
             # don't fall through to the agent (prevents phantom approval loops
             # where the LLM hallucinates having queued a task).
             if _check_pending_task_intent(lower):
-                return _make_response(
-                    "nothing pending to approve right now — what task do you need?",
-                    is_addon,
-                )
+                # A bare "yes"/"no" may instead be answering the agent's own
+                # clarifying question (nothing queued because it asked rather
+                # than acted). If the last assistant turn ended with "?", fall
+                # through so the agent sees its question + this reply; only the
+                # context-free case keeps the phantom-approval guard.
+                last_assistant_was_question = False
+                try:
+                    history = get_conversation(
+                        conversation_scope(user_id=user_id, space=space)
+                    )
+                except Exception:
+                    history = None
+                for turn in reversed(history or []):
+                    if turn.get("role") == "assistant":
+                        last_assistant_was_question = (
+                            turn.get("content") or ""
+                        ).strip().endswith("?")
+                        break
+                if not last_assistant_was_question:
+                    return _make_response(
+                        "nothing pending to approve — tell me what you'd "
+                        "like me to do.",
+                        is_addon,
+                    )
 
     target_space = space or config.CHAT_SPACE_ID
-    background_tasks.add_task(
-        _process_message_background,
-        text, user_id, target_space, audio_attachments,
-    )
 
-    return _make_response("", is_addon)
+    # Voice/audio stays on the async background path: transcription happens there
+    # and an immediate empty ack returns well within Chat's 30s deadline (no claim
+    # guard needed). Cloud Run keeps CPU allocated for the BackgroundTask.
+    if audio_attachments:
+        background_tasks.add_task(
+            _process_message_background,
+            text, user_id, target_space, audio_attachments,
+        )
+        return _make_response("", is_addon)
+
+    # Text: run the agent loop SYNCHRONOUSLY so a conversational create can return
+    # an interactive tray card as the HTTP response — the only way add-on card
+    # buttons call back (HANDOFF §6). claim_message_once makes a Chat 30s-deadline
+    # retry idempotent: a retry that finds a live claim no-ops, so create_task /
+    # store_task_batch never run twice. The claim is KEPT on success (a late >30s
+    # response may be dropped by Chat, but a task is never double-created) and
+    # released ONLY on failure so a transient error can be retried.
+    message_name = ev.get("message_name", "")
+    if message_name and not claim_message_once(message_name):
+        return {}
+    try:
+        history = get_conversation(conversation_scope(user_id=user_id, space=space))
+        return await asyncio.to_thread(
+            _process_message_sync,
+            text, user_id, target_space, history, background_tasks, is_addon,
+        )
+    except Exception as e:
+        if message_name:
+            release_message_claim(message_name)
+        traceback.print_exc()
+        return _make_response(f"sorry, something went wrong: {str(e)}", is_addon)
 
 
 def _apply_pending_task_actions_background(
@@ -1549,7 +1932,12 @@ def _transcribe_voice_message(audio_attachments, existing_text, space):
 
 
 def _process_message_background(text, user_id, space, audio_attachments=None):
-    """Heavy processing in background thread — no 30s webhook pressure."""
+    """Run the agent loop and send the reply on the async background path.
+
+    Queued by handle_message for both text and voice messages so Cloud Run keeps
+    CPU allocated until the loop finishes (works under cpu-throttling=true). All
+    pending task actions (create/update/complete/delete) route through the TEXT
+    'reply yes' approval flow; KG extraction runs inline after the reply."""
     import time
     _t0 = time.time()
     print(f"[perf] processing message ({len(text or '')} chars)")
@@ -1561,13 +1949,12 @@ def _process_message_background(text, user_id, space, audio_attachments=None):
 
         conversation_id = conversation_scope(user_id=user_id, space=space)
         history = get_conversation(conversation_id)
-        _t1 = time.time()
-        print(f"[perf] get_conversation: {_t1 - _t0:.2f}s (history={len(history)} turns)")
 
-        pending_task_actions = []
         if config.AGENTIC_MODE_ENABLED:
             from agent import run_agent_loop
-            response, pending_task_actions = run_agent_loop(text, history, thread_id=conversation_id, user_id=user_id)
+            response, pending_task_actions = run_agent_loop(
+                text, history, thread_id=conversation_id, user_id=user_id
+            )
             if pending_task_actions:
                 response = _strip_llm_approval_block(response)
                 pending_scope_id = _user_task_scope(user_id, space)
@@ -1589,23 +1976,14 @@ def _process_message_background(text, user_id, space, audio_attachments=None):
             response = chat_response(text, history, context_data, thread_id=conversation_id)
             response = _remove_task_tags(response)
 
-        _t2 = time.time()
-        print(f"[perf] response: {_t2 - _t1:.2f}s ({len(response or '')} chars)")
-
         add_turn(conversation_id, "user", text)
         add_turn(conversation_id, "assistant", response)
 
-        formatted = format_for_google_chat(response)
-        _t3 = time.time()
-        send_chat_message(space, formatted)
-        _t4 = time.time()
-        print(f"[perf] send_chat_message: {_t4 - _t3:.2f}s")
+        send_chat_message(space, format_for_google_chat(response))
 
-        # KG extraction runs synchronously after the reply is sent — under
-        # cpu-throttling=true a spawned daemon thread would be CPU-starved
-        # 100ms after this BackgroundTask returns, and the work would silently
-        # drop. Running inline keeps it inside the request scope where CPU
-        # stays allocated. Adds ~2-5s post-response; user already saw the reply.
+        # KG extraction runs inline — under cpu-throttling=true a spawned daemon
+        # thread would be CPU-starved ~100ms after this BackgroundTask returns and
+        # the work would silently drop. Inline keeps it in request scope.
         if config.KNOWLEDGE_GRAPH_ENABLED:
             from datetime import datetime as _dt
             from knowledge_graph import extract_and_store
@@ -1627,6 +2005,107 @@ def _process_message_background(text, user_id, space, audio_attachments=None):
             send_chat_message(space, f"sorry, something went wrong: {str(e)}")
         except Exception:
             print(f"Failed to send error message: {e}")
+
+
+def _kg_extract_chat(text, user_id):
+    from knowledge_graph import extract_and_store
+    _now = datetime.now()
+    extract_and_store(
+        source_type="chat",
+        source_id=f"chat-{user_id}-{_now.strftime('%Y%m%d%H%M%S')}",
+        source_title="Chat message",
+        source_date=_now.strftime("%Y-%m-%d"),
+        content=text,
+        attendees=[],
+    )
+
+
+def _queue_kg(background_tasks, text, user_id):
+    if config.KNOWLEDGE_GRAPH_ENABLED:
+        background_tasks.add_task(_kg_extract_chat, text, user_id)
+
+
+def _build_create_rows(create_actions):
+    """Map agent CREATE actions ({"action":"create","title","due"?,"notes"?}) to
+    tray rows. taskId is the 1-based position; rows start pending."""
+    rows = []
+    for i, action in enumerate(create_actions, start=1):
+        rows.append({
+            "taskId": f"t{i}",
+            "title": action.get("title", ""),
+            "due": action.get("due"),
+            "notes": action.get("notes", ""),
+            "owner": None,
+            "priority": None,
+            "state": "pending",
+        })
+    return rows
+
+
+def _process_message_sync(text, user_id, space, history, background_tasks, is_addon):
+    """Run the agent loop in-request and return the HTTP response envelope.
+
+    A conversational CREATE returns an interactive tray card SYNCHRONOUSLY as the
+    response to the MESSAGE event — the only way add-on card buttons call back
+    (HANDOFF §6). Non-create or MIXED turns fall back to the TEXT "reply yes"
+    approval flow; plain replies return text. KG extraction is deferred to
+    background_tasks so it never adds latency before the (30s-bounded) response.
+    """
+    conversation_id = conversation_scope(user_id=user_id, space=space)
+
+    if not config.AGENTIC_MODE_ENABLED:
+        context_data = _build_context(text)
+        response = _remove_task_tags(
+            chat_response(text, history, context_data, thread_id=conversation_id)
+        )
+        add_turn(conversation_id, "user", text)
+        add_turn(conversation_id, "assistant", response)
+        _queue_kg(background_tasks, text, user_id)
+        return _make_response(response, is_addon)
+
+    from agent import run_agent_loop
+    response, actions = run_agent_loop(
+        text, history, thread_id=conversation_id, user_id=user_id
+    )
+
+    create_only = bool(actions) and all(a.get("action") == "create" for a in actions)
+
+    if create_only:
+        response = _strip_llm_approval_block(response)
+        batch_id = uuid.uuid4().hex
+        rows = _build_create_rows(actions)
+        store_task_batch(batch_id, "New tasks", space, rows)
+        add_turn(conversation_id, "user", text)
+        add_turn(conversation_id, "assistant", response)
+        _queue_kg(background_tasks, text, user_id)
+        tray = build_task_tray_card(batch_id, "New tasks", rows, chat_url=_chat_url())
+        return _make_card_response(tray, is_addon, update=False, text=response)
+
+    if actions:
+        # Mixed (create + non-create) or non-create only: keep the proven TEXT
+        # approval flow (only a pure-create turn becomes a card).
+        response = _strip_llm_approval_block(response)
+        pending_scope_id = _user_task_scope(user_id, space)
+        approval_response = _append_task_approval_block(response, actions)
+        if store_pending_task_actions_if_empty(
+            actions, scope_id=pending_scope_id, approval_message=approval_response
+        ):
+            response = approval_response
+        else:
+            existing_pending = get_pending_task_actions(scope_id=pending_scope_id)
+            if existing_pending:
+                response = _build_pending_conflict_reply(existing_pending)
+            else:
+                response = "sorry, something went wrong queueing that task change — try again?"
+        add_turn(conversation_id, "user", text)
+        add_turn(conversation_id, "assistant", response)
+        _queue_kg(background_tasks, text, user_id)
+        return _make_response(response, is_addon)
+
+    add_turn(conversation_id, "user", text)
+    add_turn(conversation_id, "assistant", response)
+    _queue_kg(background_tasks, text, user_id)
+    return _make_response(response, is_addon)
 
 
 def _remove_task_tags(response):

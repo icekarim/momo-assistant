@@ -34,8 +34,11 @@ TIER_TIMEOUTS = {
 _DEEP_FALLBACK = TaskComplexity.STANDARD
 _MAX_FALLBACK_ATTEMPTS = 1
 
+# max_retries=1: the interactive agent path runs synchronously under Google
+# Chat's 30s deadline, so a third attempt (each up to the per-call timeout) would
+# blow the worst-case wall time. One retry still rides out a transient blip.
 _client = wrap_anthropic(
-    anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY, max_retries=2)
+    anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY, max_retries=1)
 )
 
 
@@ -90,7 +93,7 @@ def _is_downshiftable(exc: Exception) -> bool:
 
 def generate(prompt=None, *, tier=TaskComplexity.STANDARD, system=None,
              tools=None, messages=None, max_tokens=None, model=None,
-             temperature=None, allow_fallback=True):
+             temperature=None, allow_fallback=True, timeout=None):
     if messages is None:
         if prompt is None:
             raise ValueError("generate requires either prompt or messages")
@@ -99,8 +102,12 @@ def generate(prompt=None, *, tier=TaskComplexity.STANDARD, system=None,
     resolved_model = model or TASK_MODEL_MAP[tier]
     resolved_max = max_tokens or TASK_MAX_TOKENS[tier]
     resolved_temp = config.CLAUDE_TEMPERATURE if temperature is None else temperature
+    # Bound the call so it can't hang for the SDK default (~600s). The tier
+    # timeout doubles as the interactive deadline budget; callers may override.
+    resolved_timeout = TIER_TIMEOUTS.get(tier, TIER_TIMEOUTS[TaskComplexity.STANDARD]) if timeout is None else timeout
     kwargs = {"model": resolved_model, "max_tokens": resolved_max,
-              "temperature": resolved_temp, "messages": messages}
+              "temperature": resolved_temp, "messages": messages,
+              "timeout": resolved_timeout}
     if system is not None:
         kwargs["system"] = system
     if tools is not None:
@@ -111,7 +118,8 @@ def generate(prompt=None, *, tier=TaskComplexity.STANDARD, system=None,
     except Exception as exc:
         if (allow_fallback and tier == TaskComplexity.DEEP
                 and _is_downshiftable(exc)):
-            return _fallback(messages, system, tools, max_tokens, temperature)
+            return _fallback(messages, system, tools, max_tokens, temperature,
+                             timeout=resolved_timeout)
         raise
 
 
@@ -176,11 +184,12 @@ def run_tool_loop(*, messages, tools, system, dispatch, max_iterations=6,
     return "", last_stop
 
 
-def _fallback(messages, system, tools, max_tokens, temperature=None):
+def _fallback(messages, system, tools, max_tokens, temperature=None, timeout=None):
     attempts = 0
     tier = _DEEP_FALLBACK
     last_exc = None
     resolved_temp = config.CLAUDE_TEMPERATURE if temperature is None else temperature
+    resolved_timeout = TIER_TIMEOUTS[tier] if timeout is None else timeout
     while attempts < _MAX_FALLBACK_ATTEMPTS:
         attempts += 1
         kwargs = {
@@ -188,6 +197,7 @@ def _fallback(messages, system, tools, max_tokens, temperature=None):
             "max_tokens": max_tokens or TASK_MAX_TOKENS[tier],
             "temperature": resolved_temp,
             "messages": messages,
+            "timeout": resolved_timeout,
         }
         if system is not None:
             kwargs["system"] = system

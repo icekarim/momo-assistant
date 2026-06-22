@@ -18,6 +18,11 @@ _MODULES_TO_ISOLATE = [
     "granola_service",
     "google",
     "google.generativeai",
+    "claude_client",
+    "anthropic",
+    "langsmith",
+    "langsmith.wrappers",
+    "langsmith_config",
 ]
 _ORIGINAL_MODULES = {
     name: sys.modules.get(name, _SENTINEL)
@@ -28,6 +33,11 @@ for name in _MODULES_TO_ISOLATE:
 
 sys.modules["google"] = MagicMock()
 sys.modules["google.generativeai"] = MagicMock()
+sys.modules["anthropic"] = MagicMock()
+sys.modules["langsmith"] = MagicMock()
+sys.modules["langsmith.wrappers"] = MagicMock()
+sys.modules["langsmith_config"] = MagicMock()
+sys.modules["claude_client"] = MagicMock()
 
 config_mock = MagicMock()
 config_mock.GRANOLA_ENABLED = True
@@ -99,6 +109,7 @@ class TestPostMeetingDebriefGraceWindow(unittest.TestCase):
         self.store.has_debrief_been_sent.reset_mock(return_value=True)
         self.store.has_debrief_been_sent.return_value = False
         self.store.mark_debrief_sent.reset_mock()
+        _TASKS_MOCK.fetch_open_tasks.return_value = []
 
     def _meeting(self, minutes_since_end):
         ended_at = datetime.now().astimezone() - timedelta(minutes=minutes_since_end)
@@ -123,6 +134,7 @@ class TestPostMeetingDebriefGraceWindow(unittest.TestCase):
             ["Ari"],
             "",
             unittest.mock.ANY,
+            open_tasks=unittest.mock.ANY,
         )
         self.chat.send_chat_message.assert_called_once_with("spaces/test", "Debrief Content")
         self.store.mark_debrief_sent.assert_called_once_with("calendar-1", "Partner sync")
@@ -142,6 +154,7 @@ class TestPostMeetingDebriefGraceWindow(unittest.TestCase):
             ["Ari"],
             "",
             unittest.mock.ANY,
+            open_tasks=unittest.mock.ANY,
         )
         self.chat.send_chat_message.assert_called_once_with("spaces/test", "Debrief Content")
         self.store.mark_debrief_sent.assert_called_once_with("calendar-1", "Partner sync")
@@ -163,6 +176,7 @@ class TestPostMeetingDebriefGraceWindow(unittest.TestCase):
             ["Ari"],
             "",
             unittest.mock.ANY,
+            open_tasks=unittest.mock.ANY,
         )
         self.chat.send_chat_message.assert_called_once_with("spaces/test", "Debrief Content")
         self.store.mark_debrief_sent.assert_called_once_with("calendar-1", "Partner sync")
