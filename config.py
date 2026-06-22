@@ -75,6 +75,11 @@ CHAT_SPACE_ID = os.getenv("CHAT_SPACE_ID", "")
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "")
 FIRESTORE_DATABASE = os.getenv("FIRESTORE_DATABASE", "testing")
 FIRESTORE_COLLECTION = "conversations"
+# Idempotency guard for the synchronous inbound message path. Google Chat
+# retries the webhook when the synchronous agent loop exceeds its 30s deadline;
+# a claim doc keyed by the Chat message_name makes processing exactly-once so a
+# retry never re-runs store_task_batch / create_task.
+FIRESTORE_PROCESSED_MESSAGES_COLLECTION = "processed_messages"
 FIRESTORE_EMAIL_ALERTS_COLLECTION = "email_alerts"
 FIRESTORE_MEETING_DEBRIEFS_COLLECTION = "meeting_debriefs"
 FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION = "knowledge_graph"
@@ -129,6 +134,7 @@ NUDGE_COOLDOWN_DAYS = int(os.getenv("NUDGE_COOLDOWN_DAYS", "7"))
 FIRESTORE_MEETING_PREP_COLLECTION = "meeting_prep_sent"
 FIRESTORE_NUDGES_COLLECTION = "proactive_nudges_sent"
 FIRESTORE_PENDING_TASKS_COLLECTION = "pending_task_proposals"
+FIRESTORE_TASK_BATCHES_COLLECTION = "task_batches"
 
 # ── Granola MCP ──────────────────────────────────────────────
 GRANOLA_ENABLED = os.getenv("GRANOLA_ENABLED", "false").lower() == "true"
@@ -198,8 +204,9 @@ def _parse_mcp_servers() -> list[dict]:
 MCP_SERVERS: list[dict] = _parse_mcp_servers()
 
 # Default per-call timeout for MCP tool calls (seconds).
-# RoktGPT thinking-mode responses can be slow — 60s keeps headroom.
-MCP_DEFAULT_TIMEOUT = int(os.getenv("MCP_DEFAULT_TIMEOUT", "60"))
+# Bounded at 25s so a single slow MCP call (e.g. RoktGPT thinking-mode) can't by
+# itself blow past Google Chat's 30s synchronous deadline on the text path.
+MCP_DEFAULT_TIMEOUT = int(os.getenv("MCP_DEFAULT_TIMEOUT", "25"))
 
 # ── Server ───────────────────────────────────────────────────
 PORT = int(os.getenv("PORT", "8080"))

@@ -33,8 +33,8 @@ _TOOL_TIMEOUTS = {
     "delete_task": 10,
     "get_recent_emails": 15,
     "search_emails": 15,
-    "search_knowledge_graph": 30,
-    "get_meeting_notes": 30,
+    "search_knowledge_graph": 20,
+    "get_meeting_notes": 20,
     "get_jira_tickets": 12,
     "get_jira_issue": 12,
     "search_jira_tickets": 12,
@@ -586,9 +586,11 @@ NEVER guess, fabricate, or hallucinate data. If you don't have data from a tool 
 Be efficient — call only the tools you need. Don't call everything "just in case".
 If one tool doesn't return what you need, try a different one. For example, if search_knowledge_graph doesn't find it, try search_emails.
 For anything about Rokt the company — policies, processes, people, internal tools, systems, engineering details — use mcp_roktgpt_ask_roktgpt. Pass a clear, self-contained question (it doesn't see this conversation). It's slower than other tools, so use it when the question is actually rokt-internal, not for the user's own emails/calendar/tasks.
-For task changes (create, update, complete, delete), use the task tools to prepare the request. Those tools do NOT execute immediately — they queue a pending approval.
-After queueing a task change, explicitly say it's waiting for approval and tell the user to reply "yes" to approve or "no" to cancel.
-Never say a task was already created, updated, completed, or deleted before approval happens.
+For task changes (create, update, complete, delete), use the task tools to prepare the request. Those tools do NOT execute immediately — they wait for the user to approve. Approval works one of two ways depending on the change:
+- Creating a task (or several): an interactive card with "add" / "edit" / "dismiss" buttons drops into chat. the user approves by TAPPING a button, not by replying. so do NOT tell them to "reply yes" — just say something chill like "dropped it in the tray, hit add to lock it in" and stop. don't claim it's on their list until they actually tap add.
+- Updating, completing, or deleting a task (or any MIX of changes): no card — the user approves by replying. say it's waiting and tell them to reply "yes" to confirm or "no" to cancel.
+When the user later confirms, you'll see a note in the conversation history — a "[task card resolved]" line for cards, or an approval confirmation for the reply flow. TRUST it: a task shown as added IS on their list now, so never say it's "still pending" or "needs approval first" once you see it was resolved. you can complete / update / delete it from there.
+Never say a task was already created, updated, completed, or deleted before approval actually happens.
 When a tool returns an error, tell the user naturally — don't retry endlessly.
 
 The search_knowledge_graph tool searches across ALL of Momo's memory — meetings, emails, calendar events, tasks, chat history, and Granola notes. Use it for any "what happened", "what did we discuss", "who said what", "what was decided" type questions.

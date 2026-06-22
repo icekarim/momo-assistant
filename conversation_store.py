@@ -293,38 +293,118 @@ def clear_pending_task_actions(scope_id="latest"):
     ).delete()
 
 
-def store_pending_tasks(tasks, meeting_title="", scope_id="latest"):
-    """Store proposed create-task suggestions for user confirmation later."""
-    actions = []
-    for task in tasks:
-        action = {"action": "create", "title": task["title"]}
-        if task.get("due"):
-            action["due"] = task["due"]
-        if task.get("notes"):
-            action["notes"] = task["notes"]
-        actions.append(action)
-    store_pending_task_actions(actions, scope_id=scope_id, meeting_title=meeting_title)
+# ── Inbound-message idempotency guard ─────────────────────────────────────────
+# Google Chat retries the webhook when the synchronous agent loop exceeds its 30s
+# deadline; the retry would otherwise re-run the whole loop and duplicate its
+# side effects (store_task_batch / create_task). A claim doc keyed by the Chat
+# message_name makes processing exactly-once. Built on the same create-if-absent
+# pattern as store_pending_task_actions_if_empty.
 
 
-def get_pending_tasks(scope_id="latest"):
-    """Backward-compatible wrapper for create-task proposals."""
-    pending = get_pending_task_actions(scope_id=scope_id)
-    if not pending:
-        return [], ""
+def claim_message_once(message_name: str, ttl_hours: int = 1) -> bool:
+    """Atomically claim an inbound message so it is processed exactly once.
 
-    tasks = []
-    for action in pending["actions"]:
-        if action.get("action", "create") != "create":
-            continue
-        task = {"title": action["title"]}
-        if action.get("due"):
-            task["due"] = action["due"]
-        if action.get("notes"):
-            task["notes"] = action["notes"]
-        tasks.append(task)
-    return tasks, pending.get("meeting_title", "")
+    Returns True if the claim is NEW (caller should process), or False if a live
+    claim already exists (a duplicate/retry — caller should no-op). A claim older
+    than ``ttl_hours`` is lazily reclaimed so a message that crashed before
+    release isn't wedged forever.
+    """
+    db = get_db()
+    doc_ref = db.collection(config.FIRESTORE_PROCESSED_MESSAGES_COLLECTION).document(
+        _safe_doc_id(message_name)
+    )
+    payload = {
+        "message_name": message_name,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "ttl_hours": ttl_hours,
+    }
+    try:
+        doc_ref.create(payload)
+        return True
+    except Exception:
+        existing = doc_ref.get()
+        if existing.exists:
+            created = existing.to_dict().get("created_at", "")
+            if created:
+                try:
+                    created_dt = datetime.fromisoformat(created)
+                    age_hours = (datetime.now(timezone.utc) - created_dt).total_seconds() / 3600
+                    if age_hours > ttl_hours:
+                        doc_ref.set(payload)
+                        return True
+                except (ValueError, TypeError):
+                    pass
+        return False
 
 
-def clear_pending_tasks(scope_id="latest"):
-    """Backward-compatible wrapper for pending create-task proposals."""
-    clear_pending_task_actions(scope_id=scope_id)
+def release_message_claim(message_name: str) -> None:
+    """Delete a message claim so a genuine processing crash can be retried."""
+    db = get_db()
+    db.collection(config.FIRESTORE_PROCESSED_MESSAGES_COLLECTION).document(
+        _safe_doc_id(message_name)
+    ).delete()
+
+
+# ── Task-batch state store ────────────────────────────────────────────────────
+# Keyed by batch_id so multiple concurrent batches never overwrite each other.
+# Fixes the "vanishing task" bug caused by the single-slot pending model.
+#
+# Row schema: {"taskId": str, "title": str, "due": str|None, "owner": str|None,
+#              "priority": str|None, "state": str}
+# state values: "pending" | "added" | "already_exists" | "dismissed"
+#
+# Doc schema (Firestore): source, space, rows, created_at (ISO UTC), expires_hours.
+
+
+def store_task_batch(batch_id: str, source: str, space: str, rows: list,
+                     expires_hours: int = 24) -> None:
+    """Write a new task-batch document keyed by batch_id.
+
+    Each batch_id gets its own Firestore document so concurrent batches
+    are fully independent — the document key is the batch_id itself.
+    """
+    db = get_db()
+    db.collection(config.FIRESTORE_TASK_BATCHES_COLLECTION).document(batch_id).set(
+        {
+            "source": source,
+            "space": space,
+            "rows": rows,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "expires_hours": expires_hours,
+        }
+    )
+
+
+def get_task_batch(batch_id: str) -> dict | None:
+    """Retrieve a task-batch by batch_id.
+
+    Returns the batch dict (keys: source, space, rows, created_at) or None
+    if the document does not exist.  Lazily deletes and returns None when the
+    batch is older than its configured expiry window (mirrors the 24-hour lazy-
+    expiry pattern used by get_pending_task_actions).
+    """
+    db = get_db()
+    doc = db.collection(config.FIRESTORE_TASK_BATCHES_COLLECTION).document(batch_id).get()
+    if not doc.exists:
+        return None
+    data = doc.to_dict()
+    created = data.get("created_at", "")
+    if created:
+        try:
+            created_dt = datetime.fromisoformat(created)
+            expires_hours = data.get("expires_hours", 24)
+            age_hours = (datetime.now(timezone.utc) - created_dt).total_seconds() / 3600
+            if age_hours > expires_hours:
+                db.collection(config.FIRESTORE_TASK_BATCHES_COLLECTION).document(batch_id).delete()
+                return None
+        except (ValueError, TypeError):
+            pass
+    return data
+
+
+def update_task_batch(batch_id: str, rows: list) -> None:
+    """Replace the rows array on an existing task-batch document."""
+    db = get_db()
+    db.collection(config.FIRESTORE_TASK_BATCHES_COLLECTION).document(batch_id).update(
+        {"rows": rows}
+    )
