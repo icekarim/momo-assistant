@@ -364,47 +364,57 @@ def _gemini_triage_emails(emails):
     return flagged
 
 
-def _process_debrief_tasks(debrief_text, meeting_title="", scope_id="latest"):
-    """Parse [CREATE_TASK] tags from a debrief, store them as pending
-    proposals for user confirmation, and return cleaned text with a
-    nicely formatted suggestion section replacing the raw tags."""
-    import re
-    from conversation_store import store_pending_tasks
+def _process_debrief_tasks(debrief_text, meeting_title="", space="", scope_id=""):
+    """Parse [CREATE_TASK] tags, dedup against open tasks, and append a plain-text
+    "Suggested follow-ups" list to the cleaned debrief.
 
-    pattern = r'\[CREATE_TASK\]\s*title="([^"]+)"(?:\s*due="([^"]*)")?(?:\s*notes="([^"]*)")?'
+    Reverted from interactive tray cards: async REST cards posted by the service
+    account never deliver CARD_CLICKED button events in Google Chat, so debrief
+    suggestions are rendered as text. The user creates any they want via a normal
+    conversational request, which returns a synchronous (working) tray card. No
+    task batch is stored and no card is sent here — the caller sends the returned
+    text. ``space`` / ``scope_id`` are accepted for call-site compatibility.
+    """
+    import re
+    import tasks_service
+
+    pattern = r'\[CREATE_TASK\]\s*title="([^"]+)"(?:\s*due="([^"]*)")?(?:\s*owner="([^"]*)")?(?:\s*priority="([^"]*)")?'
     matches = list(re.finditer(pattern, debrief_text))
     if not matches:
         return debrief_text
 
     cleaned = re.sub(r'\[CREATE_TASK\][^\n]*\n?', '', debrief_text).rstrip()
 
-    pending = []
-    suggestion_lines = []
-    for idx, match in enumerate(matches, start=1):
+    try:
+        open_tasks = tasks_service.fetch_open_tasks()
+    except Exception:
+        open_tasks = []
+
+    suggestions = []
+    for match in matches:
         title = match.group(1)
         due = match.group(2) or None
-        notes = match.group(3) or ""
-        task = {"title": title}
-        if due:
-            task["due"] = due
-        if notes:
-            task["notes"] = notes
-        pending.append(task)
-        due_str = f" (due {due})" if due else ""
-        suggestion_lines.append(f"  {idx}. {title}{due_str}")
 
-    store_pending_tasks(pending, meeting_title=meeting_title, scope_id=scope_id)
-
-    cleaned += "\n\n📋 *Suggested tasks:*\n" + "\n".join(suggestion_lines)
-    if len(pending) == 1:
-        cleaned += "\n\n_Reply *yes* to create this task in Google Tasks, or *no* to dismiss it_"
-    else:
-        cleaned += (
-            f"\n\n_Reply *yes* to create all {len(pending)} tasks in Google Tasks, "
-            "*approve 2* to create only task #2, or *no* to dismiss them_"
+        is_dup = any(
+            tasks_service._task_identity_match(title, due, t.get("title", ""), t.get("due"))
+            for t in open_tasks
         )
+        if is_dup:
+            continue
+        suggestions.append((title, due))
 
-    return cleaned
+    if not suggestions:
+        return cleaned
+
+    lines = ["📋 Suggested follow-ups:"]
+    for title, due in suggestions:
+        lines.append(f"• {title} (due {due})" if due else f"• {title}")
+    lines.append("")
+    lines.append(
+        f'want any of these added? just tell me — e.g. "add the {suggestions[0][0]} task".'
+    )
+
+    return f"{cleaned}\n\n" + "\n".join(lines)
 
 
 def _notes_are_substantive(granola_notes: str) -> bool:
@@ -533,12 +543,15 @@ def run_post_meeting_debrief(bg_tasks=None):
         try:
             end_time = meeting.get("end_time", "")
             event_id = meeting.get("id", "")
-            debrief = generate_post_meeting_debrief(title, attendees, granola_notes, end_time)
-            pending_scope = f"space:{config.CHAT_SPACE_ID}" if config.CHAT_SPACE_ID else "latest"
+            try:
+                open_tasks = fetch_open_tasks()
+            except Exception:
+                open_tasks = []
+            debrief = generate_post_meeting_debrief(title, attendees, granola_notes, end_time, open_tasks=open_tasks)
             debrief = _process_debrief_tasks(
                 debrief,
                 meeting_title=title,
-                scope_id=pending_scope,
+                space=config.CHAT_SPACE_ID,
             )
             formatted = format_for_google_chat(debrief)
             send_chat_message(config.CHAT_SPACE_ID, formatted)
@@ -580,8 +593,12 @@ def run_post_meeting_debrief(bg_tasks=None):
             print(f"    {reason} past grace window ({grace}m), sending without notes")
             try:
                 end_time = meeting.get("end_time", "")
-                debrief = generate_post_meeting_debrief(title, attendees, "", end_time)
-                debrief = _process_debrief_tasks(debrief, meeting_title=title)
+                try:
+                    nm_open_tasks = fetch_open_tasks()
+                except Exception:
+                    nm_open_tasks = []
+                debrief = generate_post_meeting_debrief(title, attendees, "", end_time, open_tasks=nm_open_tasks)
+                debrief = _process_debrief_tasks(debrief, meeting_title=title, space=config.CHAT_SPACE_ID)
                 formatted = format_for_google_chat(debrief)
                 send_chat_message(config.CHAT_SPACE_ID, formatted)
                 _store_proactive_message(debrief, config.CHAT_SPACE_ID)

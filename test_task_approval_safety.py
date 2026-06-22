@@ -96,9 +96,11 @@ class TestTaskApprovalSafety(unittest.TestCase):
             "meeting_title": "",
             "approval_message": "",
         }
+        # Creates now emit a tray card and bypass this single-slot pending flow,
+        # so the anti-overwrite guard only applies to update/complete/delete.
         agent.run_agent_loop.return_value = (
             "done. i've queued that update.",
-            [{"action": "create", "title": "Follow up on project sync, credential rotation, and partner stats"}],
+            [{"action": "update", "find": "Follow up on project sync", "due": "2026-04-01"}],
         )
 
         main._process_message_background("move the report task to friday", "users/456", "spaces/123")

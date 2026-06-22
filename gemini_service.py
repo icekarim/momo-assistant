@@ -362,11 +362,21 @@ def chat_response(user_message, conversation_history, context_data, thread_id=No
 
 
 @traceable(name="post-meeting-debrief", tags=["proactive", "scheduled"])
-def generate_post_meeting_debrief(meeting_title, attendees, granola_notes, end_time=""):
+def generate_post_meeting_debrief(meeting_title, attendees, granola_notes, end_time="", open_tasks=None):
     """Generate a short post-meeting debrief (summary + action items)."""
     attendee_str = ", ".join(attendees) if attendees else "unknown attendees"
 
     notes_section = granola_notes if granola_notes else "No notes were captured for this meeting."
+
+    open_tasks_section = ""
+    if open_tasks:
+        task_lines = [f'- {t.get("title", "")}' for t in open_tasks if t.get("title")]
+        if task_lines:
+            open_tasks_section = (
+                "\n=== ALREADY OPEN TASKS (do NOT suggest these again) ===\n"
+                + "\n".join(task_lines[:20])
+                + "\n"
+            )
 
     prompt = f"""You just got out of a meeting. Write a very short post-meeting debrief.
 
@@ -376,7 +386,7 @@ Time: ended at {end_time or "recently"}
 
 === MEETING NOTES (from Granola) ===
 {notes_section}
-
+{open_tasks_section}
 Format:
 🗒️ *meeting debrief — {meeting_title}*
 
@@ -387,6 +397,7 @@ Format:
 After the debrief text, suggest follow-up tasks using ONLY this tag format (one per line):
 [CREATE_TASK] title="Task title here" due="YYYY-MM-DD"
 Only suggest tasks that are clearly actionable from the meeting. Set due dates based on any mentioned deadlines, or default to one week from now.
+Do NOT suggest any task already listed under ALREADY OPEN TASKS above.
 Do NOT include any other text on the same line as a [CREATE_TASK] tag.
 
 Keep it tight — this goes to Google Chat right after the meeting. No fluff."""

@@ -55,22 +55,30 @@ def download_attachment(resource_name: str) -> tuple[bytes, str] | None:
         return None
 
 
-def send_chat_message(space_id, text):
+def send_chat_message(space_id, text=None, cards=None):
     """Send a message to a Google Chat space as the bot (app credentials).
+    Pass text= for plain text (auto-split at 4000 chars) or cards= for cardsV2.
     Retries up to 3 times on transient network/SSL errors."""
     session = _get_chat_session()
     url = f"https://chat.googleapis.com/v1/{space_id}/messages"
 
+    if cards is not None:
+        _send_with_retry(session, url, space_id, cards=cards)
+        return
+
     chunks = _split_message(text, max_len=4000)
-
     for chunk in chunks:
-        _send_with_retry(session, url, chunk, space_id)
+        _send_with_retry(session, url, space_id, text=chunk)
 
 
-def _send_with_retry(session, url, text, space_id, max_retries=3):
+def _send_with_retry(session, url, space_id, text=None, cards=None, max_retries=3):
+    # PLAN §6.7: message name capture only if async PATCH is ever pursued
     for attempt in range(max_retries):
         try:
-            resp = session.post(url, json={"text": text})
+            if cards is not None:
+                resp = session.post(url, json={"cardsV2": cards})
+            else:
+                resp = session.post(url, json={"text": text})
             if resp.status_code != 200:
                 print(f"Chat API error ({resp.status_code}): {resp.text}")
             else:

@@ -22,3 +22,8 @@ test_generated*.py
 qa/candidates/
 qa/*.json
 qa/*.txt
+
+# Local agent/tooling artifacts (never committed)
+.codex/
+.omo/
+eval_report_gemini.json

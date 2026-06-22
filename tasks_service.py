@@ -1,5 +1,8 @@
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+
+_ISO_DATE_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}")
 
 from googleapiclient.discovery import build
 from google_auth import get_credentials
@@ -93,7 +96,6 @@ def create_task(title, notes="", due_date=None, task_list_name=None):
                 target_list = tl
                 break
 
-    title_lower = title.lower().strip()
     for tl in task_lists:
         tasks_resp = svc.tasks().list(
             tasklist=tl["id"],
@@ -105,7 +107,7 @@ def create_task(title, notes="", due_date=None, task_list_name=None):
             existing_title = (existing.get("title", "") or "").strip()
             if not existing_title:
                 continue
-            if existing_title.lower() == title_lower or _titles_match(title_lower, existing_title.lower()):
+            if _task_identity_match(title, due_date, existing_title, existing.get("due")):
                 return {
                     "id": existing["id"],
                     "title": existing_title,
@@ -154,6 +156,43 @@ def _titles_match(a: str, b: str) -> bool:
     overlap = a_words & b_words
     smaller = min(len(a_words), len(b_words))
     return smaller >= 2 and len(overlap) / smaller >= 0.7
+
+
+def _normalize_due(due):
+    """Normalize a due value to a 'YYYY-MM-DD' date string, or None if absent.
+
+    Coerces every shape that flows through dedup: already-ISO dates
+    ('2026-06-17'), the RFC3339 timestamps the Google Tasks API returns
+    ('2026-06-17T00:00:00.000Z'), and the human display format that
+    fetch_open_tasks emits via strftime ('Jun 17, 2026'). An unparseable value
+    degrades to its best-effort stripped form rather than crashing."""
+    if not due:
+        return None
+    due = str(due).strip()
+    if not due:
+        return None
+    if _ISO_DATE_PREFIX.match(due):
+        return due[:10]
+    try:
+        return datetime.strptime(due, "%b %d, %Y").strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        return due
+
+
+def _task_identity_match(title, due, existing_title, existing_due) -> bool:
+    """True if a new task (title, due) is the same task as an existing one.
+
+    Identity is title (exact or fuzzy via _titles_match) AND the same due date,
+    normalized to 'YYYY-MM-DD'. Two tasks with the same title but different due
+    dates are NOT the same task; two tasks that both lack a due date dedup on
+    title alone."""
+    a = (title or "").lower().strip()
+    b = (existing_title or "").lower().strip()
+    if not a or not b:
+        return False
+    if not (a == b or _titles_match(a, b)):
+        return False
+    return _normalize_due(due) == _normalize_due(existing_due)
 
 
 def update_task(task_title, new_title=None, new_notes=None, new_due=None):
