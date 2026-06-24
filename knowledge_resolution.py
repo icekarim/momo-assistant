@@ -31,7 +31,7 @@ import config
 from knowledge_graph import _EMAIL_RE, _normalize_text, _person_tokens
 
 # Single-token alias that is a strict subset of a multi-token name
-# (e.g. "Karim" ⊂ "Alex Rivera"): kept inside the [queue, auto) band so it is
+# (e.g. "Jordan" ⊂ "Jordan Tanaka"): kept inside the [queue, auto) band so it is
 # QUEUED for review, never auto-merged.
 _SUBSET_SINGLE_TOKEN_CONFIDENCE = 0.80
 # Multi-token alias that is a strict subset of a longer name

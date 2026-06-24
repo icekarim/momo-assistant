@@ -476,7 +476,7 @@ def _match_merge_pair(pair_text: str, pending: list[dict]) -> dict | None:
     reference text (substring, case-insensitive).
 
     When several pending pairs fully match (overlapping alias chains like
-    ("Karim", "Alex Rivera") vs ("Alex Rivera", "user@example.com")), prefer
+    ("Alex", "Alex Rivera") vs ("Alex Rivera", "alex@example.com")), prefer
     the most specific match — one where neither name is a strict substring of a
     name in another match. If multiple matches remain, return
     {"status": "ambiguous", "candidates": [...]} so the caller writes nothing.
