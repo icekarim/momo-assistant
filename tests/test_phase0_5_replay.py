@@ -42,7 +42,7 @@ DOC_B = "fsdoc_auto_DOC_B"
 # test. Keyed so the writer can assert every scenario actually ran.
 _EVIDENCE: dict = {"scenarios": {}}
 
-_EVIDENCE_PATH = os.path.join(os.path.dirname(__file__), "qa", "phase0_5_dedup.txt")
+_EVIDENCE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "qa", "phase0_5_dedup.txt")
 
 
 def _commitment_fixture(doc_id: str = DOC_A) -> dict:

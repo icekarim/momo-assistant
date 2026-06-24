@@ -98,14 +98,14 @@ def _seed_queue(db, a, b, status, kind="person", confidence=0.80):
 
 
 class TestRerunPreservesDecisions:
-    # Entities that re-mine the ("Karim", "Alex Rivera") queue-band pair.
-    _ENTITIES = [{"related_people": ["Karim", "Alex Rivera"],
+    # Entities that re-mine the ("Alex", "Alex Rivera") queue-band pair.
+    _ENTITIES = [{"related_people": ["Alex", "Alex Rivera"],
                   "related_projects": []}]
 
     @pytest.mark.parametrize("decided_status", ["rejected", "approved"])
     def test_rerun_preserves_decided_status(self, decided_status):
         db = FakeDB()
-        doc_id = _seed_queue(db, "Karim", "Alex Rivera", decided_status)
+        doc_id = _seed_queue(db, "Alex", "Alex Rivera", decided_status)
 
         summary = kr.run_resolution(self._ENTITIES, db, _NOW)
 
@@ -119,7 +119,7 @@ class TestRerunPreservesDecisions:
     def test_rerun_still_queues_genuinely_pending(self):
         """A pre-existing 'pending' doc is still (re)queued, not preserved."""
         db = FakeDB()
-        doc_id = _seed_queue(db, "Karim", "Alex Rivera", "pending")
+        doc_id = _seed_queue(db, "Alex", "Alex Rivera", "pending")
 
         summary = kr.run_resolution(self._ENTITIES, db, _NOW)
 
@@ -200,23 +200,23 @@ class TestDecisionParsing:
 class TestMatchMergePairSpecificity:
     def _pending(self):
         return [
-            {"pair": ["Karim", "Alex Rivera"], "kind": "person",
+            {"pair": ["Alex", "Alex Rivera"], "kind": "person",
              "confidence": 0.80, "status": "pending"},
-            {"pair": ["Alex Rivera", "user@example.com"], "kind": "person",
+            {"pair": ["Alex Rivera", "alex@example.com"], "kind": "person",
              "confidence": 0.95, "status": "pending"},
         ]
 
     def test_most_specific_pair_wins_over_substring(self):
         match = agent._match_merge_pair(
-            "approve Alex Rivera and user@example.com", self._pending()
+            "approve Alex Rivera and alex@example.com", self._pending()
         )
         assert match is not None
-        assert match.get("pair") == ["Alex Rivera", "user@example.com"]
+        assert match.get("pair") == ["Alex Rivera", "alex@example.com"]
 
     def test_single_full_match_unaffected(self):
-        match = agent._match_merge_pair("Karim and Alex Rivera", self._pending())
+        match = agent._match_merge_pair("Alex and Alex Rivera", self._pending())
         assert match is not None
-        assert match.get("pair") == ["Karim", "Alex Rivera"]
+        assert match.get("pair") == ["Alex", "Alex Rivera"]
 
     def test_genuinely_ambiguous_returns_ambiguous_no_write(self, monkeypatch):
         monkeypatch.setattr(config, "KG_RESOLUTION_ENABLED", True)

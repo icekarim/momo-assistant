@@ -93,7 +93,7 @@ def _load_real_tasks_service():
         sys.modules.setdefault(_name, MagicMock())
     spec = importlib.util.spec_from_file_location(
         "_real_tasks_service_dedup",
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "tasks_service.py"),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tasks_service.py"),
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

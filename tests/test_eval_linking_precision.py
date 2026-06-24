@@ -9,8 +9,8 @@ from pathlib import Path
 import pytest
 
 # Bootstrap path so the script module is importable from repo root
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────

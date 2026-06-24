@@ -96,7 +96,7 @@ class TestPersonScoring:
 
     def test_email_single_token(self):
         """Single-token name vs its email → email-discounted high confidence."""
-        score = kr.score_person_pair("Craig", "colleague@example.com")
+        score = kr.score_person_pair("Sam", "sam@example.com")
         assert score == pytest.approx(0.95)
 
     def test_last_comma_first_reorder(self):
@@ -105,9 +105,9 @@ class TestPersonScoring:
         assert score >= 0.9
 
     def test_single_token_subset_is_queue_band(self):
-        """Single token ⊂ multi-token name (Karim ⊂ Alex Rivera) → QUEUE,
+        """Single token ⊂ multi-token name (Alex ⊂ Alex Rivera) → QUEUE,
         not auto: confidence in [queue, auto)."""
-        score = kr.score_person_pair("Karim", "Alex Rivera")
+        score = kr.score_person_pair("Alex", "Alex Rivera")
         assert config.KG_MERGE_QUEUE_THRESHOLD <= score < config.KG_MERGE_AUTO_THRESHOLD
 
     def test_shared_first_name_different_surname_dropped(self):
@@ -194,7 +194,7 @@ class TestScorePairDispatcher:
     def test_judge_fn_can_override_queue_band(self):
         """A judge_fn also applies to the [queue, auto) subset band."""
         score = kr.score_pair(
-            "Karim", "Alex Rivera", "person", judge_fn=lambda ctx: 0.1
+            "Alex", "Alex Rivera", "person", judge_fn=lambda ctx: 0.1
         )
         assert score == pytest.approx(0.1)
 
@@ -246,14 +246,14 @@ class TestApplyPolicy:
     def test_queue_writes_pending(self):
         db = FakeDB()
         action = kr.apply_resolution(
-            ("Karim", "Alex Rivera"), "person", 0.80, db, _NOW
+            ("Alex", "Alex Rivera"), "person", 0.80, db, _NOW
         )
         assert action == "queue"
         queue = db.collection(config.FIRESTORE_KG_MERGE_QUEUE_COLLECTION).docs
         assert len(queue) == 1
         doc = next(iter(queue.values()))
         assert doc["status"] == "pending"
-        assert doc["pair"] == ["Karim", "Alex Rivera"]
+        assert doc["pair"] == ["Alex", "Alex Rivera"]
         assert doc["kind"] == "person"
         assert doc["confidence"] == pytest.approx(0.80)
         assert "proposed_at" in doc
@@ -281,7 +281,7 @@ class TestApplyPolicy:
         """A score exactly at the queue threshold queues (not dropped)."""
         db = FakeDB()
         action = kr.apply_resolution(
-            ("Karim", "Alex Rivera"), "person", config.KG_MERGE_QUEUE_THRESHOLD, db, _NOW
+            ("Alex", "Alex Rivera"), "person", config.KG_MERGE_QUEUE_THRESHOLD, db, _NOW
         )
         assert action == "queue"
 
@@ -350,7 +350,7 @@ class TestDisplayNameSelection:
         assert name == "Sarah Chen"
 
     def test_prefers_longer_full_name(self):
-        name = kr._select_display_name(["Karim", "Alex Rivera"], "person")
+        name = kr._select_display_name(["Alex", "Alex Rivera"], "person")
         assert name == "Alex Rivera"
 
     def test_falls_back_to_email_when_only_email(self):
@@ -374,7 +374,7 @@ class TestRunResolution:
                 "related_projects": [],
             },
             {
-                "related_people": ["Karim"],
+                "related_people": ["Alex"],
                 "related_projects": ["Ads Team", "ads team"],
             },
         ]
@@ -382,7 +382,7 @@ class TestRunResolution:
     def test_summary_counts(self):
         db = FakeDB()
         summary = kr.run_resolution(self._entities(), db, _NOW)
-        # Sarah↔email (auto), Karim↔Alex Rivera (queue), Ads Team↔ads team (auto)
+        # Sarah↔email (auto), Alex↔Alex Rivera (queue), Ads Team↔ads team (auto)
         assert summary["candidates"] == 3
         assert summary["auto"] == 2
         assert summary["queued"] == 1

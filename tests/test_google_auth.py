@@ -114,7 +114,7 @@ class TestGoogleAuthSelfHealing(unittest.TestCase):
 
     def test_write_credentials_to_file_never_touches_repo_token_json(self):
         repo_token = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "token.json"
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "token.json"
         )
         self.assertNotEqual(
             os.path.abspath(google_auth.config.GOOGLE_TOKEN_FILE),
