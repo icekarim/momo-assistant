@@ -12,6 +12,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+.pytest_cache/
 .cursor/
 PLAN_*.md
 test_generated*.py
@@ -26,4 +27,8 @@ qa/*.txt
 # Local agent/tooling artifacts (never committed)
 .codex/
 .omo/
-eval_report_gemini.json
+
+# Eval evidence / labeled sets (contain real data — regenerate locally, never commit)
+eval_report_*.json
+eval_kg_labels.json
+eval_kg_golden.csv
