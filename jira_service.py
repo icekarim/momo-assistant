@@ -52,11 +52,69 @@ def _search(jql: str, max_results: int = 50, fields: list[str] | None = None) ->
 
 _ISSUE_FIELDS = ["summary", "status", "priority", "assignee", "reporter", "updated", "created", "issuetype"]
 
+_KG_FIELDS = _ISSUE_FIELDS + ["description", "project", "labels"]
+
 
 def fetch_active_jira_tickets() -> str:
     """Fetch active Jira tickets using the configured JQL filter."""
     issues = _search(config.JIRA_JQL_FILTER, fields=_ISSUE_FIELDS)
     return _format_issues(issues)
+
+
+def fetch_active_jira_tickets_data() -> list[dict]:
+    """Fetch active Jira tickets as normalized dicts for knowledge-graph extraction.
+
+    Unlike fetch_active_jira_tickets (which returns a formatted text block for
+    Gemini context), this returns structured records including the ticket
+    description so the knowledge graph can extract decisions, blockers, and
+    owners from each ticket.
+    """
+    issues = _search(config.JIRA_JQL_FILTER, fields=_KG_FIELDS)
+    return [_normalize_issue(i) for i in issues]
+
+
+def _normalize_issue(issue: dict) -> dict:
+    """Flatten a raw Jira issue dict into a normalized record."""
+    fields = issue.get("fields", {})
+    return {
+        "key": issue.get("key", ""),
+        "summary": fields.get("summary", ""),
+        "status": (fields.get("status") or {}).get("name", ""),
+        "priority": (fields.get("priority") or {}).get("name", ""),
+        "issue_type": (fields.get("issuetype") or {}).get("name", ""),
+        "assignee": (fields.get("assignee") or {}).get("displayName", ""),
+        "reporter": (fields.get("reporter") or {}).get("displayName", ""),
+        "project": (fields.get("project") or {}).get("name", ""),
+        "labels": fields.get("labels", []) or [],
+        "updated": (fields.get("updated") or "")[:10],
+        "description": _adf_to_text(fields.get("description")).strip(),
+    }
+
+
+def _adf_to_text(node) -> str:
+    """Flatten an Atlassian Document Format (ADF) node into plain text.
+
+    Jira Cloud REST v3 returns rich-text fields (e.g. description) as nested
+    ADF JSON rather than plain strings. This walks the tree collecting text
+    nodes, inserting newlines at block boundaries for readability.
+    """
+    if node is None:
+        return ""
+    if isinstance(node, str):
+        return node
+    if isinstance(node, list):
+        return "".join(_adf_to_text(n) for n in node)
+    if isinstance(node, dict):
+        node_type = node.get("type")
+        if node_type == "text":
+            return node.get("text", "")
+        if node_type == "hardBreak":
+            return "\n"
+        text = _adf_to_text(node.get("content"))
+        if node_type in ("paragraph", "heading", "blockquote", "listItem", "codeBlock"):
+            return text + "\n"
+        return text
+    return ""
 
 
 def search_jira_tickets(query: str) -> str:
