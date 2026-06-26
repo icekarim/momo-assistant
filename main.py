@@ -1170,9 +1170,23 @@ def _run_backfill():
         print(f"  Backfill: tasks processing failed: {e}")
         traceback.print_exc()
 
+    # Jira tickets — extract active tickets
+    jira_ok = 0
+    if config.JIRA_ENABLED:
+        try:
+            from jira_service import fetch_active_jira_tickets_data
+            from knowledge_graph import extract_from_jira_tickets
+            jira_tickets = fetch_active_jira_tickets_data()
+            print(f"Backfill: found {len(jira_tickets)} Jira tickets to process")
+            extract_from_jira_tickets(jira_tickets)
+            jira_ok = len(jira_tickets)
+        except Exception as e:
+            print(f"  Backfill: Jira processing failed: {e}")
+            traceback.print_exc()
+
     print(f"Backfill complete: meetings={meetings_ok} ok/{meetings_fail} fail, "
           f"emails={emails_ok} ok/{emails_fail} fail, "
-          f"calendar={calendar_ok}, tasks={tasks_ok}")
+          f"calendar={calendar_ok}, tasks={tasks_ok}, jira={jira_ok}")
 
 
 # ── Google Chat Webhook ──────────────────────────────────────

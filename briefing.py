@@ -233,6 +233,13 @@ def _extract_briefing_sources_to_kg(meetings, tasks, granola_ctx, bg_tasks=None)
         if granola_ctx:
             print("  KG: extracting from Granola notes...")
             extract_from_granola_notes(granola_ctx, bg_tasks=bg_tasks)
+        if config.JIRA_ENABLED:
+            from jira_service import fetch_active_jira_tickets_data
+            from knowledge_graph import extract_from_jira_tickets
+            jira_tickets = fetch_active_jira_tickets_data()
+            if jira_tickets:
+                print("  KG: extracting from Jira tickets...")
+                extract_from_jira_tickets(jira_tickets, bg_tasks=bg_tasks)
     except Exception as e:
         print(f"  KG extraction from briefing sources failed: {e}")
 
