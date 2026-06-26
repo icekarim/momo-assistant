@@ -549,6 +549,59 @@ def extract_from_granola_notes(granola_context: str, source_date: str | None = N
         extract_and_store_background(**kwargs)
 
 
+def extract_from_jira_tickets(tickets: list[dict], bg_tasks=None):
+    """Extract knowledge from Jira tickets (background, per-ticket).
+
+    source_id is the ticket key plus its last-updated date, so a ticket is
+    re-extracted when it changes but not on every run. Assignee and reporter
+    are passed as attendees so the model populates related_people.
+
+    When bg_tasks is supplied (FastAPI BackgroundTasks), extraction is queued
+    onto it so Cloud Run keeps CPU alive until completion. Otherwise falls back
+    to daemon threads.
+    """
+    if not config.KNOWLEDGE_GRAPH_ENABLED or not tickets:
+        return
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    for ticket in tickets:
+        key = ticket.get("key", "")
+        if not key:
+            continue
+
+        people = [p for p in (ticket.get("assignee"), ticket.get("reporter")) if p]
+        parts = [f"Jira ticket {key}: {ticket.get('summary', '')}"]
+        parts.append(
+            f"Type: {ticket.get('issue_type', '')} | "
+            f"Status: {ticket.get('status', '')} | "
+            f"Priority: {ticket.get('priority', '')}"
+        )
+        if ticket.get("project"):
+            parts.append(f"Project: {ticket['project']}")
+        if ticket.get("assignee"):
+            parts.append(f"Assignee: {ticket['assignee']}")
+        if ticket.get("reporter"):
+            parts.append(f"Reporter: {ticket['reporter']}")
+        if ticket.get("labels"):
+            parts.append(f"Labels: {', '.join(ticket['labels'])}")
+        if ticket.get("description"):
+            parts.append(f"Description: {ticket['description']}")
+
+        updated = ticket.get("updated") or today
+        kwargs = dict(
+            source_type="jira",
+            source_id=f"jira-{key}-{updated}",
+            source_title=f"{key}: {ticket.get('summary', '')}",
+            source_date=updated,
+            content="\n".join(parts),
+            attendees=people,
+        )
+        if bg_tasks is not None:
+            extract_and_store_via_bg_tasks(bg_tasks, **kwargs)
+        else:
+            extract_and_store_background(**kwargs)
+
+
 # ── Query functions ──────────────────────────────────────────
 
 
