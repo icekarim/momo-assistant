@@ -1,0 +1,51 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Momo",
+  "colors": {
+    "primary": "#0D9488",
+    "light": "#14B8A6",
+    "dark": "#0F766E"
+  },
+  "navigation": {
+    "groups": [
+      {
+        "group": "Getting Started",
+        "pages": [
+          "index"
+        ]
+      },
+      {
+        "group": "Features",
+        "pages": [
+          "features/morning-briefing",
+          "features/email-alerts",
+          "features/meeting-debriefs",
+          "features/agentic-assistant",
+          "features/task-management",
+          "features/meeting-intelligence",
+          "features/knowledge-graph",
+          "features/proactive-intelligence",
+          "features/personality"
+        ]
+      },
+      {
+        "group": "Architecture",
+        "pages": [
+          "architecture/overview",
+          "architecture/endpoints",
+          "architecture/data-flow"
+        ]
+      },
+      {
+        "group": "Setup & Deployment",
+        "pages": [
+          "setup/installation",
+          "setup/google-auth",
+          "setup/configuration",
+          "setup/deployment"
+        ]
+      }
+    ]
+  }
+}

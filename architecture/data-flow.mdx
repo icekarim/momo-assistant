@@ -1,0 +1,85 @@
+---
+title: "Data Flow & Storage"
+description: "How a chat message flows through the system, plus file structure and Firestore collections"
+---
+
+## Data flow for a chat message
+
+```
+User message in Google Chat
+    │
+    ▼
+Parse event format (standard Chat vs. Workspace Add-on)
+    │
+    ▼
+Load conversation history from Firestore (up to 50 turns)
+    │
+    ▼
+Agent loop (agent.py) — Gemini with tool declarations:
+    │
+    ├─► Gemini decides which tools to call
+    │     │
+    │     ▼
+    │   Execute tools in thread pool (per-tool timeouts):
+    │     - get_todays_calendar, get_open_tasks, get_recent_emails
+    │     - search_emails, search_knowledge_graph (semantic)
+    │     - create_task, update_task, complete_task, delete_task
+    │     - get_meeting_notes, get_jira_tickets, search_jira_tickets
+    │     │
+    │     ▼
+    │   Return results to Gemini → may call more tools
+    │     │
+    │     (repeats up to 6 iterations)
+    │
+    ▼
+Final text response from Gemini
+    │
+    ▼
+Save turn to Firestore conversation history
+    │
+    ├─► Extract entities to knowledge graph (background, with embedding)
+    │
+    ▼
+format_for_google_chat() → send reply (auto-split at 4000 chars)
+```
+
+## File structure
+
+```
+momo/
+├── main.py                    # FastAPI app, endpoints, event parsing, chat routing
+├── agent.py                   # Agentic tool-use loop: tool declarations, executor, agent system prompt
+├── gemini_service.py          # Gemini API wrapper, system prompt, chat/briefing/debrief generation
+├── proactive_intelligence.py  # Proactive intelligence: pre-meeting prep, commitment follow-up, patterns, drift
+├── knowledge_graph.py         # Entity extraction, vector embeddings, semantic search, Firestore storage
+├── briefing.py                # Morning briefing, proactive email alerts, post-meeting debrief pipelines
+├── gmail_service.py           # Gmail API: fetch unread, search, alert candidates, format for context
+├── calendar_service.py        # Calendar API: today's events, upcoming, recently ended, format for context
+├── tasks_service.py           # Tasks API: fetch, create, update, complete, delete, find completed
+├── chat_service.py            # Chat API: send messages (auto-split at 4000 chars), format markdown
+├── conversation_store.py      # Firestore: conversation history, email/debrief/prep/nudge dedup
+├── granola_service.py         # Granola MCP client: meeting notes, transcripts, token lifecycle
+├── granola_auth_setup.py      # One-time local OAuth2 + PKCE flow for Granola authentication
+├── google_auth.py             # Thread-safe OAuth credential loading, Firestore persistence, and self-healing reauth
+├── auth_setup.py              # One-time local script to generate token.json via browser OAuth flow
+├── config.py                  # All configuration loaded from environment variables
+├── Dockerfile                 # python:3.12-slim, uvicorn entrypoint
+├── deploy.sh                  # gcloud run deploy wrapper with .env fallback for CHAT_SPACE_ID
+├── requirements.txt
+├── .env.example               # Template for local environment variables
+└── .gitignore
+```
+
+## Firestore collections
+
+| Collection | Document key | Purpose |
+|---|---|---|
+| `conversations` | sanitized user ID | Stores up to 50 conversation turns per user |
+| `email_alerts` | Gmail message ID | Tracks which emails have already triggered an alert |
+| `meeting_debriefs` | Google Calendar event ID | Tracks which meetings have already been debriefed |
+| `meeting_prep_sent` | Google Calendar event ID | Tracks which meetings have had prep briefs sent |
+| `proactive_nudges_sent` | hashed nudge key (MD5) | Deduplicates nudges with configurable cooldown window |
+| `knowledge_graph` | auto-generated | Extracted entities with provenance, vector embeddings, and metadata (source type/ID/title/date, related people/projects, tags) |
+| `google_auth` | `token` | Stores the Google OAuth token JSON and derived web client config used by Cloud Run |
+| `google_auth_pending` | `reauth_required` / `last_reauth_alert` | Tracks Google reauth state and throttled reauth alerts |
+| `granola_auth` | `token` | Stores the Granola OAuth token for Cloud Run (auto-refreshed) |

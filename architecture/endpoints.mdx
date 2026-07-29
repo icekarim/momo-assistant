@@ -1,0 +1,93 @@
+---
+title: "Endpoints & Scheduled Jobs"
+description: "HTTP endpoints and the Cloud Scheduler jobs that drive them"
+---
+
+## Endpoints
+
+| Endpoint | Method | Trigger | Description |
+|---|---|---|---|
+| `/` | GET | On-demand | Index / status check |
+| `/health` | GET | Load balancer | Health check |
+| `/chat` | GET/POST | Google Chat webhook | Receive and respond to user messages |
+| `/briefing` | POST | Cloud Scheduler (daily) | Generate and send morning briefing |
+| `/email-alerts` | POST | Cloud Scheduler (every 5 min) | Triage inbox and send urgent alerts |
+| `/meeting-debrief` | POST | Cloud Scheduler (every 10 min) | Post-meeting debriefs with Granola notes |
+| `/meeting-prep` | POST | Cloud Scheduler (every 10 min) | Pre-meeting prep briefs with KG context |
+| `/knowledge-backfill` | POST | One-time | Bootstrap knowledge graph from meetings, emails, calendar, tasks |
+| `/knowledge-embed-backfill` | POST | One-time | Add vector embeddings to existing KG entities |
+| `/google-token-refresh` | POST | Cloud Scheduler (every ~4h) | Keep Google OAuth token alive and surface reauth |
+| `/google-auth/start` | GET | Chat reauth link | Browser-based Google reauth (requires one-time ticket `?t=`) |
+| `/google-auth/callback` | GET | Google OAuth redirect | Completes Google reauth and stores credentials |
+| `/granola-token-refresh` | POST | Cloud Scheduler (every 4h) | Keep Granola OAuth token alive |
+
+## Scheduled jobs (Cloud Scheduler)
+
+```
+Cloud Scheduler ──► POST /briefing                (daily at 8 AM)
+Cloud Scheduler ──► POST /email-alerts            (every 5 minutes)
+Cloud Scheduler ──► POST /meeting-debrief         (every 10 minutes, work hours)
+Cloud Scheduler ──► POST /meeting-prep            (every 10 minutes, work hours)
+One-time         ──► POST /knowledge-backfill      (bootstrap knowledge graph)
+One-time         ──► POST /knowledge-embed-backfill (add embeddings to existing entities)
+Cloud Scheduler ──► POST /google-token-refresh     (every 4 hours - keeps Google token alive)
+Cloud Scheduler ──► POST /granola-token-refresh    (every 4 hours — keeps token alive)
+```
+
+## What each job does
+
+**`/briefing`** — orchestrated by `briefing.py`:
+
+1. Fetches unread emails, today's meetings, all open tasks (in parallel)
+2. Optionally fetches yesterday's meeting notes from Granola
+3. Runs proactive intelligence engines (commitment follow-up, pattern detection, drift detection)
+4. Sends all context + nudges to Gemini → formatted morning briefing
+5. Posts the result to the configured Google Chat space
+6. Feeds calendar events, tasks, and Granola notes into the knowledge graph (background)
+
+**`/email-alerts`** — also in `briefing.py`:
+
+1. Fetches recent inbox emails matching the configured query
+2. Filters out any already alerted (checked against Firestore)
+3. Batches up to 10 unseen emails → Gemini triage (returns JSON with `alert: true/false`, `priority`, `summary`)
+4. Posts alerts to Chat for emails that pass triage; marks each as sent in Firestore to prevent duplicates
+5. Triggers background knowledge graph extraction for each alerted email
+
+**`/meeting-debrief`** — also in `briefing.py`:
+
+1. Fetches today's calendar meetings whose end time falls within the lookback window (default 120 min)
+2. Builds a title-to-ID map from Granola (fuzzy matching), then batch-fetches notes
+3. Skips any already debriefed (checked against Firestore)
+4. If notes aren't ready yet and grace period hasn't expired, defers to next run
+5. Sends a short debrief to Chat with key decisions and action items; marks meeting as debriefed
+6. Triggers background knowledge graph extraction for meetings with notes
+
+**`/meeting-prep`** — orchestrated by `proactive_intelligence.py`:
+
+1. Fetches upcoming meetings within the lookahead window (default 1 hour)
+2. For each unsent meeting, queries the knowledge graph for attendee history, open commitments, and related projects
+3. Generates a short prep brief via Gemini Flash with key context, open items, and talking points
+4. Posts the brief to Chat and marks it as sent in Firestore to prevent duplicates
+
+**`/knowledge-backfill`** — in `main.py`:
+
+1. Fetches the last 30 days of Granola meetings and recent inbox emails
+2. Fetches today's calendar events and current open tasks
+3. Batch-extracts entities (decisions, commitments, blockers, etc.) via Gemini Flash
+4. Generates vector embeddings for each entity using gemini-embedding-001
+5. Stores everything in the `knowledge_graph` Firestore collection
+6. Idempotent — skips sources that have already been processed
+7. Runs in a background thread so the endpoint returns immediately
+
+**`/knowledge-embed-backfill`** — in `main.py`:
+
+1. Reads all existing KG entities from Firestore
+2. Generates vector embeddings for entities that don't have one yet
+3. Updates each document in-place with the embedding
+4. Idempotent — skips entities that already have embeddings
+
+**`/granola-token-refresh`** — in `main.py`:
+
+1. Forces a proactive refresh of the Granola OAuth token
+2. Scheduled every 4 hours via Cloud Scheduler to prevent the refresh_token from expiring due to inactivity
+3. Granola access tokens last 6 hours — refreshing at 4h intervals keeps the token chain alive permanently

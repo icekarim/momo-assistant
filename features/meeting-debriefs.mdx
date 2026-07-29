@@ -1,0 +1,32 @@
+---
+title: "Meeting Debriefs & Prep Briefs"
+description: "Post-meeting debriefs from Granola notes and pre-meeting prep from the knowledge graph"
+---
+
+## Post-meeting debriefs
+
+Within minutes of a calendar meeting ending, Momo pulls the Granola notes for that meeting and sends a short debrief to Chat: what was decided, what action items came out, and who owns them. If Granola hasn't finished processing the notes yet, Momo defers and retries until a configurable grace period expires (default 45 min), at which point it sends whatever is available. Debriefed meetings are extracted into the knowledge graph automatically.
+
+The `/meeting-debrief` endpoint (in `briefing.py`) runs every 10 minutes during work hours:
+
+1. Fetches today's calendar meetings whose end time falls within the lookback window (default 120 min)
+2. Builds a title-to-ID map from Granola (fuzzy matching), then batch-fetches notes
+3. Skips any already debriefed (checked against Firestore)
+4. If notes aren't ready yet and grace period hasn't expired, defers to next run
+5. Sends a short debrief to Chat with key decisions and action items; marks meeting as debriefed
+6. Triggers background knowledge graph extraction for meetings with notes
+
+## Pre-meeting prep briefs
+
+Before each meeting (configurable, default 1 hour ahead), Momo queries the knowledge graph for context about the attendees — past interactions, open commitments involving them, related project history, and outstanding blockers — then sends a short prep brief to Chat. Each prep fires once per calendar event.
+
+The `/meeting-prep` endpoint (orchestrated by `proactive_intelligence.py`) runs every 10 minutes during work hours:
+
+1. Fetches upcoming meetings within the lookahead window (default 1 hour)
+2. For each unsent meeting, queries the knowledge graph for attendee history, open commitments, and related projects
+3. Generates a short prep brief via Gemini Flash with key context, open items, and talking points
+4. Posts the brief to Chat and marks it as sent in Firestore to prevent duplicates
+
+<Note>
+Debrief timing is controlled by `MEETING_DEBRIEF_LOOKBACK_MINUTES` (default 120) and `MEETING_DEBRIEF_GRACE_MINUTES` (default 45). Prep timing is controlled by `MEETING_PREP_LOOKAHEAD_HOURS` (default 1).
+</Note>
