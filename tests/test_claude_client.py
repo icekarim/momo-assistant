@@ -17,8 +17,8 @@ def _fake_message(text):
 
 def test_tier_model_mapping():
     assert cc.TASK_MODEL_MAP[T.LIGHT] == "claude-haiku-4-5-20251001"
-    assert cc.TASK_MODEL_MAP[T.STANDARD] == "claude-sonnet-4-6"
-    assert cc.TASK_MODEL_MAP[T.DEEP] == "claude-opus-4-8"
+    assert cc.TASK_MODEL_MAP[T.STANDARD] == "claude-sonnet-5"
+    assert cc.TASK_MODEL_MAP[T.DEEP] == "claude-opus-5"
 
 
 def test_max_tokens_always_set(monkeypatch):
@@ -104,7 +104,7 @@ def test_deep_downshifts_on_transient(monkeypatch):
     class FakeMsgs:
         def create(self, **kw):
             calls["n"] += 1
-            if kw["model"] == "claude-opus-4-8":
+            if kw["model"] == "claude-opus-5":
                 raise anthropic.InternalServerError("overloaded", response=_resp(529), body=None)
             return _fake_message("recovered")
 
