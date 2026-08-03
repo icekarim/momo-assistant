@@ -24,9 +24,9 @@ The `/meeting-prep` endpoint (orchestrated by `proactive_intelligence.py`) runs 
 
 1. Fetches upcoming meetings within the lookahead window (default 1 hour)
 2. For each unsent meeting, queries the knowledge graph for attendee history, open commitments, and related projects
-3. Generates a short prep brief via Claude with key context, open items, and talking points
+3. Generates a short prep brief via Claude Haiku 4.5 with key context, open items, and talking points
 4. Posts the brief to Chat and marks it as sent in Firestore to prevent duplicates
 
 <Note>
-  Debrief timing is controlled by `MEETING_DEBRIEF_LOOKBACK_MINUTES` (default 120) and `MEETING_DEBRIEF_GRACE_MINUTES` (default 45). Prep timing is controlled by `MEETING_PREP_LOOKAHEAD_HOURS` (default 1).
+Debrief timing is controlled by `MEETING_DEBRIEF_LOOKBACK_MINUTES` (default 120) and `MEETING_DEBRIEF_GRACE_MINUTES` (default 45). Prep timing is controlled by `MEETING_PREP_LOOKAHEAD_HOURS` (default 1).
 </Note>

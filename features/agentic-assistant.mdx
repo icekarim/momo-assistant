@@ -1,26 +1,26 @@
 ---
 title: "Agentic Conversational Assistant"
-description: "A Claude-powered agent loop with tool calling across 13 tools"
+description: "A Claude Sonnet 4.6-powered agent loop with tool calling across 13 tools"
 ---
 
-Momo uses a **Claude-powered agent loop with tool calling**. When you send a message, Claude autonomously decides which tools to invoke (Gmail, Calendar, Tasks, Knowledge Graph, Granola, Jira), executes them, observes the results, and iterates (up to 6 rounds) until it has enough data to respond. Each tool has its own timeout (10-15s) and runs in a thread pool.
+Momo uses a **Claude Sonnet 4.6-powered agent loop with tool calling**. When you send a message, Claude autonomously decides which tools to invoke — Gmail, Calendar, Tasks, Knowledge Graph, Granola, Jira — executes them, observes the results, and iterates (up to 6 rounds) until it has enough data to respond. Each tool has its own timeout (10-15s) and runs in a thread pool.
 
 Ask Momo anything about your work context in plain language:
 
-- _"what's on my calendar today?"_ → calls `get_todays_calendar`
-- _"any urgent emails from clients?"_ → calls `get_recent_emails`
-- _"what did we decide in the product standup?"_ → calls `search_knowledge_graph`
-- _"pull up the action items from yesterday's call"_ → calls `get_meeting_notes` \+ `search_knowledge_graph`
-- _"push all my tasks to Friday"_ → calls `get_open_tasks` then `update_task` for each
-- _"what commitments have I made this week?"_ → calls `search_knowledge_graph`
-- _"create a task to follow up with Sarah by Friday"_ → calls `create_task`
+- *"what's on my calendar today?"* → calls `get_todays_calendar`
+- *"any urgent emails from clients?"* → calls `get_recent_emails`
+- *"what did we decide in the product standup?"* → calls `search_knowledge_graph`
+- *"pull up the action items from yesterday's call"* → calls `get_meeting_notes` + `search_knowledge_graph`
+- *"push all my tasks to Friday"* → calls `get_open_tasks` then `update_task` for each
+- *"what commitments have I made this week?"* → calls `search_knowledge_graph`
+- *"create a task to follow up with Sarah by Friday"* → calls `create_task`
 
 ## The 13 tools
 
 The agent has access to **13 tools**:
 
 | Tool | Description |
-| --- | --- |
+|---|---|
 | `get_todays_calendar` | Today's meetings with times, attendees, details |
 | `get_calendar_for_date` | Meetings for a specific date |
 | `get_open_tasks` | All open tasks across task lists |
@@ -38,5 +38,5 @@ The agent has access to **13 tools**:
 Chat messages are also extracted into the knowledge graph in the background, so context from conversations is captured alongside meetings and emails.
 
 <Note>
-  Agentic mode is on by default (`AGENTIC_MODE_ENABLED=true`). If disabled, Momo falls back to a legacy context mode for chat.
+Agentic mode is on by default (`AGENTIC_MODE_ENABLED=true`). If disabled, Momo falls back to a legacy context mode for chat.
 </Note>

@@ -3,7 +3,7 @@ title: "Proactive Email Alerts"
 description: "Inbox triage every 5 minutes with one-time, deduplicated alerts"
 ---
 
-Runs every 5 minutes. Momo triages your inbox with Claude and pings you in Chat the moment something genuinely needs your attention — client emails, escalations, deadlines, blockers. Each alert fires once and is never duplicated. Alerted emails are also extracted into the knowledge graph for future cross-referencing.
+Runs every 5 minutes. Momo triages your inbox with Claude Haiku 4.5 and pings you in Chat the moment something genuinely needs your attention — client emails, escalations, deadlines, blockers. Each alert fires once and is never duplicated. Alerted emails are also extracted into the knowledge graph for future cross-referencing.
 
 ## How it works
 
@@ -11,7 +11,7 @@ The `/email-alerts` endpoint (in `briefing.py`) is triggered by Cloud Scheduler 
 
 1. Fetches recent inbox emails matching the configured query
 2. Filters out any already alerted (checked against Firestore)
-3. Batches up to 10 unseen emails and runs Claude triage (returns JSON with `alert: true/false`, `priority`, `summary`)
+3. Batches up to 10 unseen emails → Claude Haiku 4.5 triage (returns JSON with `alert: true/false`, `priority`, `summary`)
 4. Posts alerts to Chat for emails that pass triage; marks each as sent in Firestore to prevent duplicates
 5. Triggers background knowledge graph extraction for each alerted email
 

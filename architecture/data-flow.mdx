@@ -5,7 +5,7 @@ description: "How a chat message flows through the system, plus file structure a
 
 ## Data flow for a chat message
 
-```text
+```
 User message in Google Chat
     │
     ▼
@@ -15,7 +15,7 @@ Parse event format (standard Chat vs. Workspace Add-on)
 Load conversation history from Firestore (up to 50 turns)
     │
     ▼
-Agent loop (agent.py) with Claude and tool declarations:
+Agent loop (agent.py) — Claude Sonnet 4.6 with tool declarations:
     │
     ├─► Claude decides which tools to call
     │     │
@@ -27,7 +27,7 @@ Agent loop (agent.py) with Claude and tool declarations:
     │     - get_meeting_notes, get_jira_tickets, search_jira_tickets
     │     │
     │     ▼
-    │   Return results to Claude, which may call more tools
+    │   Return results to Claude → may call more tools
     │     │
     │     (repeats up to 6 iterations)
     │
@@ -45,11 +45,11 @@ format_for_google_chat() → send reply (auto-split at 4000 chars)
 
 ## File structure
 
-```text
+```
 momo/
 ├── main.py                    # FastAPI app, endpoints, event parsing, chat routing
 ├── agent.py                   # Agentic tool-use loop: tool declarations, executor, agent system prompt
-├── gemini_service.py          # LLM service (Claude via claude_client): system prompt, chat/briefing/debrief generation
+├── gemini_service.py          # LLM generation wrapper (Claude — legacy filename): system prompt, chat/briefing/debrief generation
 ├── claude_client.py           # Anthropic Claude wrapper: tiered model selection, tool-use loop, retries
 ├── proactive_intelligence.py  # Proactive intelligence: pre-meeting prep, commitment follow-up, patterns, drift
 ├── knowledge_graph.py         # Entity extraction, vector embeddings, semantic search, Firestore storage
@@ -74,7 +74,7 @@ momo/
 ## Firestore collections
 
 | Collection | Document key | Purpose |
-| --- | --- | --- |
+|---|---|---|
 | `conversations` | sanitized user ID | Stores up to 50 conversation turns per user |
 | `email_alerts` | Gmail message ID | Tracks which emails have already triggered an alert |
 | `meeting_debriefs` | Google Calendar event ID | Tracks which meetings have already been debriefed |
