@@ -1,13 +1,13 @@
 ---
 title: "Architecture Overview"
-description: "FastAPI + Gemini agent loop on Cloud Run, driven by Google Chat and Cloud Scheduler"
+description: "FastAPI + Claude agent loop on Cloud Run, driven by Google Chat and Cloud Scheduler"
 ---
 
-Momo is built with **FastAPI** + **Gemini Flash** (agentic tool-use loop), deployed on **Google Cloud Run**. Google Chat delivers user messages via webhook, and Cloud Scheduler drives the proactive pipelines.
+Momo is built with **FastAPI** \+ **Claude** (agentic tool-use loop), with **Gemini embeddings** powering knowledge graph semantic search. Deployed on **Google Cloud Run**. Google Chat delivers user messages via webhook, and Cloud Scheduler drives the proactive pipelines.
 
 ## System diagram
 
-```
+```text
 Google Chat
     │
     ▼ POST /chat (webhook)
@@ -21,11 +21,11 @@ Google Chat
 │  └──────────────────────────┬──────────────────────────────┘ │
 │                              │                               │
 │                    ┌─────────▼─────────┐                     │
-│                    │   Agent Loop      │  Gemini decides      │
+│                    │   Agent Loop      │  Claude decides      │
 │                    │   (agent.py)      │  which tools to call │
 │                    └─────────┬─────────┘                     │
 │                              │                               │
-│              Gemini calls tools iteratively:                  │
+│              Claude calls tools iteratively:                  │
 │    ┌──────────┬──────────┬───┴───┬──────────┬─────────┐      │
 │    ▼          ▼          ▼       ▼          ▼         ▼      │
 │  Gmail    Calendar     Tasks  Granola   Knowledge   Jira     │
@@ -51,7 +51,7 @@ Cloud Scheduler ──► POST /briefing
                          │
               ┌──────────┼──────────┐
               ▼          ▼          ▼
-        Gemini       Knowledge   Knowledge
+        Claude       Knowledge   Knowledge
        (briefing)   Graph Feed   Graph Feed
                    (cal+tasks)   (granola)
                          ▼
@@ -62,7 +62,7 @@ Cloud Scheduler ──► POST /email-alerts
                     Gmail Service
                    (alert candidates)
                          │
-                    Gemini (triage)
+                    Claude (triage)
                          │
                    ┌─────┴──────┐
                    ▼            ▼
@@ -80,7 +80,7 @@ Cloud Scheduler ──► POST /meeting-debrief
                          │
                    ┌─────┴──────┐
                    ▼            ▼
-             Gemini         Knowledge
+             Claude         Knowledge
             (debrief)     Graph Extract
                 │         (+ embedding)
                 ▼
@@ -94,7 +94,7 @@ Cloud Scheduler ──► POST /meeting-prep
       (upcoming meetings)         (semantic search)
                 └────────┬────────────────┘
                          ▼
-                   Gemini (prep brief)
+                   Claude (prep brief)
                          ▼
                    Google Chat
 ```
@@ -102,24 +102,24 @@ Cloud Scheduler ──► POST /meeting-prep
 ## Model usage
 
 | Use case | Model |
-|---|---|
-| Agentic chat (tool-use loop) | Gemini Flash |
-| Entity extraction | Gemini Flash |
-| Email triage | Gemini Flash |
-| Briefings, debriefs, meeting prep | Gemini Flash |
+| --- | --- |
+| Agentic chat (tool-use loop) | Claude (Haiku / Sonnet / Opus, tiered by task complexity) |
+| Entity extraction | Claude Haiku |
+| Email triage | Claude Haiku |
+| Briefings, debriefs, meeting prep | Claude Sonnet |
 | Vector embeddings | gemini-embedding-001 (numpy-vectorized cosine similarity) |
 
 ## Google services used
 
 | Service | Usage | Auth |
-|---|---|---|
+| --- | --- | --- |
 | Gmail API | Read inbox, search emails | OAuth 2.0 (`gmail.readonly`) |
 | Google Calendar API | Read events, upcoming and recently ended meetings | OAuth 2.0 (`calendar.readonly`) |
-| Google Tasks API | Read + write tasks (create, update, complete, delete) | OAuth 2.0 (`tasks`) |
+| Google Tasks API | Read \+ write tasks (create, update, complete, delete) | OAuth 2.0 (`tasks`) |
 | Google Chat API | Receive webhook events, send messages | Application Default Credentials (service account) |
 | Cloud Firestore | Conversations, dedup (alerts/debriefs/preps/nudges), knowledge graph, `google_auth`, `google_auth_pending`, Granola token | ADC / service account |
 | Cloud Run | Hosts the FastAPI server | N/A |
 | Cloud Scheduler | Triggers `/briefing`, `/email-alerts`, `/meeting-debrief`, `/meeting-prep`, `/google-token-refresh`, `/granola-token-refresh` | N/A |
 | Granola MCP | Fetch meeting notes, transcripts, action items | OAuth 2.0 (PKCE, auto-refresh) |
-| Gemini Flash | Agentic chat (tool-use loop), briefings, debriefs, meeting prep, entity extraction, email triage | API key |
+| Anthropic Claude | Agentic chat (tool-use loop), briefings, debriefs, meeting prep, entity extraction, email triage | API key |
 | Gemini gemini-embedding-001 | Vector embeddings for knowledge graph semantic search (numpy-accelerated) | API key |

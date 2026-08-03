@@ -7,6 +7,7 @@ Set your secrets in the environment, then run:
 
 ```bash
 export PROJECT_ID="your-gcp-project-id"
+export ANTHROPIC_API_KEY="your-anthropic-api-key"
 export GEMINI_API_KEY="your-gemini-api-key"
 export CHAT_SPACE_ID="spaces/XXXXXXXXX"
 
@@ -16,7 +17,7 @@ export CHAT_SPACE_ID="spaces/XXXXXXXXX"
 ## What the deploy script does
 
 - Seeds Firestore from local `token.json`, then passes `GOOGLE_TOKEN_JSON` only as a Cloud Run seed, or break-glass fallback
-- Resolves Google creds at runtime from in-memory cache -> Firestore -> `GOOGLE_TOKEN_JSON` -> local file fallback
+- Resolves Google creds at runtime from in-memory cache -\> Firestore -\> `GOOGLE_TOKEN_JSON` -\> local file fallback
 - Syncs the Granola token to Firestore (if present)
 - Falls back to reading `CHAT_SPACE_ID` from `.env` if not in the environment, and warns if still unset
 - Deploys to Cloud Run with 2Gi memory, 300s timeout, 0-3 instances, unauthenticated access

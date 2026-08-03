@@ -6,7 +6,7 @@ description: "HTTP endpoints and the Cloud Scheduler jobs that drive them"
 ## Endpoints
 
 | Endpoint | Method | Trigger | Description |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `/` | GET | On-demand | Index / status check |
 | `/health` | GET | Load balancer | Health check |
 | `/chat` | GET/POST | Google Chat webhook | Receive and respond to user messages |
@@ -23,7 +23,7 @@ description: "HTTP endpoints and the Cloud Scheduler jobs that drive them"
 
 ## Scheduled jobs (Cloud Scheduler)
 
-```
+```text
 Cloud Scheduler ──► POST /briefing                (daily at 8 AM)
 Cloud Scheduler ──► POST /email-alerts            (every 5 minutes)
 Cloud Scheduler ──► POST /meeting-debrief         (every 10 minutes, work hours)
@@ -41,7 +41,7 @@ Cloud Scheduler ──► POST /granola-token-refresh    (every 4 hours — keep
 1. Fetches unread emails, today's meetings, all open tasks (in parallel)
 2. Optionally fetches yesterday's meeting notes from Granola
 3. Runs proactive intelligence engines (commitment follow-up, pattern detection, drift detection)
-4. Sends all context + nudges to Gemini → formatted morning briefing
+4. Sends all context \+ nudges to Claude, which returns the formatted morning briefing
 5. Posts the result to the configured Google Chat space
 6. Feeds calendar events, tasks, and Granola notes into the knowledge graph (background)
 
@@ -49,7 +49,7 @@ Cloud Scheduler ──► POST /granola-token-refresh    (every 4 hours — keep
 
 1. Fetches recent inbox emails matching the configured query
 2. Filters out any already alerted (checked against Firestore)
-3. Batches up to 10 unseen emails → Gemini triage (returns JSON with `alert: true/false`, `priority`, `summary`)
+3. Batches up to 10 unseen emails and runs Claude triage (returns JSON with `alert: true/false`, `priority`, `summary`)
 4. Posts alerts to Chat for emails that pass triage; marks each as sent in Firestore to prevent duplicates
 5. Triggers background knowledge graph extraction for each alerted email
 
@@ -66,14 +66,14 @@ Cloud Scheduler ──► POST /granola-token-refresh    (every 4 hours — keep
 
 1. Fetches upcoming meetings within the lookahead window (default 1 hour)
 2. For each unsent meeting, queries the knowledge graph for attendee history, open commitments, and related projects
-3. Generates a short prep brief via Gemini Flash with key context, open items, and talking points
+3. Generates a short prep brief via Claude with key context, open items, and talking points
 4. Posts the brief to Chat and marks it as sent in Firestore to prevent duplicates
 
 **`/knowledge-backfill`** — in `main.py`:
 
 1. Fetches the last 30 days of Granola meetings and recent inbox emails
 2. Fetches today's calendar events and current open tasks
-3. Batch-extracts entities (decisions, commitments, blockers, etc.) via Gemini Flash
+3. Batch-extracts entities (decisions, commitments, blockers, etc.) via Claude
 4. Generates vector embeddings for each entity using gemini-embedding-001
 5. Stores everything in the `knowledge_graph` Firestore collection
 6. Idempotent — skips sources that have already been processed
@@ -89,5 +89,5 @@ Cloud Scheduler ──► POST /granola-token-refresh    (every 4 hours — keep
 **`/granola-token-refresh`** — in `main.py`:
 
 1. Forces a proactive refresh of the Granola OAuth token
-2. Scheduled every 4 hours via Cloud Scheduler to prevent the refresh_token from expiring due to inactivity
+2. Scheduled every 4 hours via Cloud Scheduler to prevent the refresh\_token from expiring due to inactivity
 3. Granola access tokens last 6 hours — refreshing at 4h intervals keeps the token chain alive permanently

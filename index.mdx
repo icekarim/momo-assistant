@@ -7,13 +7,13 @@ Momo is a personal AI chief of staff that lives in Google Chat. It knows your in
 
 Every morning it drops a briefing in Chat: what needs your attention in your inbox, what's on your calendar, what's open in your task list, and what came out of yesterday's meetings. Throughout the day you can message it like a colleague — ask questions, get summaries, delegate tasks, or dig into what was decided in a meeting last week.
 
-Momo is **agentic** — when you send a message, Gemini decides which tools to call (Gmail, Calendar, Tasks, Knowledge Graph, Granola, Jira), executes them, observes the results, and iterates until it has enough information to respond. No pre-fetching everything on every message. No keyword gating. Momo pulls exactly the data it needs, when it needs it.
+Momo is **agentic**: when you send a message, Claude decides which tools to call (Gmail, Calendar, Tasks, Knowledge Graph, Granola, Jira), executes them, observes the results, and iterates until it has enough information to respond. No pre-fetching everything on every message. No keyword gating. Momo pulls exactly the data it needs, when it needs it.
 
 Momo builds a **cross-meeting knowledge graph** with **vector embeddings** — it extracts decisions, commitments, action items, blockers, and topics from every meeting, email, calendar event, task, and chat conversation, then embeds them for semantic search. Ask about anything in natural language and Momo finds the relevant context across all sources.
 
 On top of that, Momo runs a **proactive intelligence engine** — it surfaces insights before you ask. Pre-meeting prep briefs, commitment follow-ups with auto-resolution, pattern detection across meetings, and drift alerts for projects that have gone quiet. All delivered as nudges in your morning briefing or as standalone Chat messages for urgent items.
 
-Built with **FastAPI** + **Gemini Flash** (agentic tool-use loop), deployed on **Google Cloud Run**.
+Built with **FastAPI** \+ **Claude** (agentic tool-use loop) and **Gemini embeddings** (knowledge graph semantic search), deployed on **Google Cloud Run**.
 
 ## Quick tour
 
@@ -21,18 +21,23 @@ Built with **FastAPI** + **Gemini Flash** (agentic tool-use loop), deployed on *
   <Card title="Morning briefing" href="/features/morning-briefing">
     A structured daily briefing at 8 AM covering inbox, calendar, tasks, yesterday's meetings, and proactive nudges.
   </Card>
+
   <Card title="Proactive email alerts" href="/features/email-alerts">
     Inbox triage every 5 minutes — Momo pings you the moment something genuinely needs attention.
   </Card>
+
   <Card title="Meeting debriefs & prep" href="/features/meeting-debriefs">
     Post-meeting debriefs from Granola notes and pre-meeting prep briefs from the knowledge graph.
   </Card>
+
   <Card title="Agentic assistant" href="/features/agentic-assistant">
-    A Gemini-powered agent loop with 13 tools across Gmail, Calendar, Tasks, Knowledge Graph, Granola, and Jira.
+    A Claude-powered agent loop with 13 tools across Gmail, Calendar, Tasks, Knowledge Graph, Granola, and Jira.
   </Card>
+
   <Card title="Knowledge graph" href="/features/knowledge-graph">
     Persistent institutional memory with vector embeddings and semantic search across six source types.
   </Card>
+
   <Card title="Proactive intelligence" href="/features/proactive-intelligence">
     Four engines that surface insights before you ask: meeting prep, commitment follow-up, patterns, and drift.
   </Card>

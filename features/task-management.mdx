@@ -3,14 +3,14 @@ title: "Task Management"
 description: "Full CRUD over Google Tasks via the agent's tool-use loop"
 ---
 
-Full CRUD over Google Tasks via the agent's tool-use loop. Gemini calls task tools directly — `create_task`, `update_task`, `complete_task`, `delete_task` — with automatic dedup checking and fuzzy title matching. Bulk operations like *"push all my tasks to Friday"* work naturally since the agent can call `get_open_tasks` and then `update_task` for each one in a single loop.
+Full CRUD over Google Tasks via the agent's tool-use loop. Claude calls task tools directly — `create_task`, `update_task`, `complete_task`, `delete_task` — with automatic dedup checking and fuzzy title matching. Bulk operations like _"push all my tasks to Friday"_ work naturally since the agent can call `get_open_tasks` and then `update_task` for each one in a single loop.
 
 ## How task management works
 
 The agent calls task tools directly during the tool-use loop — no regex parsing or tag extraction needed:
 
-1. **Gemini decides** — based on the user's message, the agent calls `create_task`, `update_task`, `complete_task`, or `delete_task`
+1. **Claude decides**: based on the user's message, the agent calls `create_task`, `update_task`, `complete_task`, or `delete_task`
 2. **Dedup checking** — `create_task` automatically checks for existing tasks with matching titles before creating
 3. **Fuzzy matching** — `update_task`, `complete_task`, and `delete_task` find tasks by fuzzy title match across all task lists
-4. **Bulk operations** — for requests like *"push all my tasks to Friday"*, the agent calls `get_open_tasks` first, then `update_task` for each one in a multi-iteration loop
-5. **Results in context** — tool results are returned to Gemini, which incorporates them naturally into its response
+4. **Bulk operations** — for requests like _"push all my tasks to Friday"_, the agent calls `get_open_tasks` first, then `update_task` for each one in a multi-iteration loop
+5. **Results in context**: tool results are returned to Claude, which incorporates them naturally into its response
