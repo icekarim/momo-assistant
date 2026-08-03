@@ -3,7 +3,7 @@ title: "Architecture Overview"
 description: "FastAPI + Claude agent loop on Cloud Run, driven by Google Chat and Cloud Scheduler"
 ---
 
-Momo is built with **FastAPI** + **Anthropic Claude** (Sonnet 4.6 agentic tool-use loop, with Haiku/Opus tiers), **Gemini embeddings** for semantic search, deployed on **Google Cloud Run**. Google Chat delivers user messages via webhook, and Cloud Scheduler drives the proactive pipelines.
+Momo is built with **FastAPI** + **Anthropic Claude** (Sonnet 5 agentic tool-use loop, with Haiku/Opus tiers), **Gemini embeddings** for semantic search, deployed on **Google Cloud Run**. Google Chat delivers user messages via webhook, and Cloud Scheduler drives the proactive pipelines.
 
 ## System diagram
 
@@ -103,12 +103,12 @@ Cloud Scheduler ──► POST /meeting-prep
 
 | Use case | Model |
 |---|---|
-| Agentic chat (tool-use loop) | Claude Sonnet 4.6 |
+| Agentic chat (tool-use loop) | Claude Sonnet 5 |
 | Entity extraction | Claude Haiku 4.5 |
 | Email triage | Claude Haiku 4.5 |
-| Briefings, debriefs | Claude Sonnet 4.6 |
+| Briefings, debriefs | Claude Sonnet 5 |
 | Meeting prep | Claude Haiku 4.5 |
-| Deep responses (with knowledge-graph context) | Claude Opus 4.8 |
+| Deep responses (with knowledge-graph context) | Claude Opus 5 |
 | Vector embeddings | gemini-embedding-001 (numpy-vectorized cosine similarity) |
 
 ## Services used
@@ -123,5 +123,5 @@ Cloud Scheduler ──► POST /meeting-prep
 | Cloud Run | Hosts the FastAPI server | N/A |
 | Cloud Scheduler | Triggers `/briefing`, `/email-alerts`, `/meeting-debrief`, `/meeting-prep`, `/google-token-refresh`, `/granola-token-refresh` | N/A |
 | Granola MCP | Fetch meeting notes, transcripts, action items | OAuth 2.0 (PKCE, auto-refresh) |
-| Anthropic Claude (Sonnet 4.6 / Haiku 4.5 / Opus 4.8 tiers) | Agentic chat (tool-use loop), briefings, debriefs, meeting prep, entity extraction, email triage | API key |
+| Anthropic Claude (Sonnet 5 / Haiku 4.5 / Opus 5 tiers) | Agentic chat (tool-use loop), briefings, debriefs, meeting prep, entity extraction, email triage | API key |
 | Gemini gemini-embedding-001 | Vector embeddings for knowledge graph semantic search (numpy-accelerated) | API key |

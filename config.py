@@ -17,8 +17,8 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 # Cost-aware tiers: Haiku=light (extraction/triage/memory),
 # Sonnet=standard (chat/agent), Opus=deep (KG-context reasoning).
 CLAUDE_MODEL_HAIKU = os.getenv("CLAUDE_MODEL_HAIKU", "claude-haiku-4-5-20251001")
-CLAUDE_MODEL_SONNET = os.getenv("CLAUDE_MODEL_SONNET", "claude-sonnet-4-6")
-CLAUDE_MODEL_OPUS = os.getenv("CLAUDE_MODEL_OPUS", "claude-opus-4-8")
+CLAUDE_MODEL_SONNET = os.getenv("CLAUDE_MODEL_SONNET", "claude-sonnet-5")
+CLAUDE_MODEL_OPUS = os.getenv("CLAUDE_MODEL_OPUS", "claude-opus-5")
 # Per-tier max_tokens (Claude requires explicit max_tokens per call).
 CLAUDE_MAX_TOKENS_LIGHT = int(os.getenv("CLAUDE_MAX_TOKENS_LIGHT", "1024"))
 CLAUDE_MAX_TOKENS_STANDARD = int(os.getenv("CLAUDE_MAX_TOKENS_STANDARD", "2048"))
