@@ -118,7 +118,7 @@ Write a short pre-meeting prep (3-6 bullet points max). Include:
 
 If there's very little context, just say so briefly — don't pad it out.
 Format for Google Chat: use *bold* for names and topics, bullet points for items.
-Start with: 📋 *meeting prep — {title}*"""
+Do NOT write a header or title line — output only the bullet points (and an optional short closing line)."""
 
 
 def _build_meeting_prep(meeting: dict) -> str | None:
@@ -205,7 +205,16 @@ def _build_meeting_prep(meeting: dict) -> str | None:
 
     try:
         msg = generate(prompt=prompt, tier=TaskComplexity.LIGHT)
-        return extract_text(msg).strip()
+        body = extract_text(msg).strip()
+        # Defensive: drop any header line the model emits despite instructions.
+        # The header is prepended deterministically below so the meeting title
+        # is never LLM-transcribed (a model slip once glued words onto it).
+        lines = body.split("\n")
+        if lines and ("meeting prep" in lines[0].lower() or lines[0].lstrip().startswith("📋")):
+            body = "\n".join(lines[1:]).lstrip("\n")
+        if not body:
+            return None
+        return f"📋 *meeting prep — {title}*\n\n{body}"
     except Exception as exc:
         print(f"  Meeting prep generation failed: {exc}")
         return None
