@@ -21,3 +21,13 @@ The `/briefing` endpoint is triggered daily by Cloud Scheduler and orchestrated 
 4. Sends all context + nudges to Claude Sonnet 5 → formatted morning briefing
 5. Posts the result to the configured Google Chat space
 6. Feeds calendar events, tasks, and Granola notes into the knowledge graph (background)
+
+## When a connector needs re-auth
+
+If a source (Gmail, Calendar, Tasks, Granola, or Jira) can't authenticate when the briefing runs, Momo prepends a visible line to the briefing instead of quietly leaving that section empty:
+
+```
+⚠️ Jira connection needs re-auth
+```
+
+That way you can see at a glance that the missing content is a credential problem, not a genuinely quiet day. Reconnect the flagged service to restore that section on the next run.
