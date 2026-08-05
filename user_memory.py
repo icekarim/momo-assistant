@@ -14,7 +14,7 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 
 import config
 from conversation_store import get_db
-from langsmith_config import traceable
+from observability import observe
 from claude_client import generate, extract_text, TaskComplexity
 
 
@@ -35,7 +35,7 @@ def _collection():
 # ── Read ────────────────────────────────────────────────────
 
 
-@traceable(run_type="tool", name="get-user-memories")
+@observe(name="get-user-memories", as_type="tool")
 def get_user_memories(user_id: str) -> list[dict]:
     """Load all active memories for a user. Cached for 2 minutes."""
     key = _safe_key(user_id)
@@ -68,7 +68,7 @@ def get_user_memories(user_id: str) -> list[dict]:
 # ── Write ───────────────────────────────────────────────────
 
 
-@traceable(run_type="tool", name="add-user-memory")
+@observe(name="add-user-memory", as_type="tool")
 def add_memory(
     user_id: str,
     content: str,
@@ -125,7 +125,7 @@ def add_memory(
 # ── Delete (soft) ───────────────────────────────────────────
 
 
-@traceable(run_type="tool", name="remove-user-memory")
+@observe(name="remove-user-memory", as_type="tool")
 def remove_memory(user_id: str, content_hint: str) -> dict | None:
     """Soft-delete the memory best matching content_hint.
 

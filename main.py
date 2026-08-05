@@ -22,10 +22,12 @@ import html
 import traceback
 import threading
 import uuid
+from contextlib import asynccontextmanager
 
 import re
 from datetime import datetime, timezone
 import config
+import observability
 from cards import build_task_tray_card
 from briefing import run_morning_briefing, run_proactive_email_alerts, run_post_meeting_debrief
 from gmail_service import (
@@ -67,7 +69,16 @@ from conversation_store import (
     release_message_claim,
 )
 
-app = FastAPI(title="Momo")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _startup_warmup()
+    yield
+    # Cloud Run gives ~10s between SIGTERM and SIGKILL — flush + shut down the
+    # Langfuse exporter so in-flight spans aren't lost (no-op when disabled).
+    observability.shutdown()
+
+
+app = FastAPI(title="Momo", lifespan=lifespan)
 
 # ── API Secret Middleware ────────────────────────────────────
 # Protects all endpoints except /health, /, and /chat (Google Chat webhook)
@@ -89,9 +100,9 @@ async def api_secret_middleware(request: Request, call_next):
     return await call_next(request)
 
 
-@app.on_event("startup")
-async def startup_warmup():
-    """Pre-initialize Google credentials, discovery docs, and KG embeddings on startup."""
+def _startup_warmup():
+    """Pre-initialize Google credentials, discovery docs, and KG embeddings on
+    startup (called from the FastAPI lifespan)."""
     if not config.MOMO_API_SECRET:
         print("WARNING: MOMO_API_SECRET is not set — all protected endpoints are exposed without auth")
     if not config.MOMO_SERVICE_URL:
@@ -542,6 +553,8 @@ async def trigger_briefing(background_tasks: BackgroundTasks):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Internal server error")
+    finally:
+        observability.flush()
 
 
 @app.post("/email-alerts")
@@ -553,6 +566,8 @@ async def trigger_email_alerts(background_tasks: BackgroundTasks):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Internal server error")
+    finally:
+        observability.flush()
 
 
 # ── Post-Meeting Debrief Trigger ─────────────────────────────
@@ -567,6 +582,8 @@ async def trigger_meeting_debrief(background_tasks: BackgroundTasks):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Internal server error")
+    finally:
+        observability.flush()
 
 
 # ── Pre-Meeting Prep Trigger ─────────────────────────────────
@@ -582,6 +599,8 @@ async def trigger_meeting_prep():
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Internal server error")
+    finally:
+        observability.flush()
 
 
 # ── KG + Meeting Prep E2E Test ────────────────────────────────
@@ -663,15 +682,15 @@ async def test_kg(query: str = "test", person: str = ""):
     return results
 
 
-# ── LangSmith Evals Trigger ──────────────────────────────────
+# ── Langfuse Evals Trigger ───────────────────────────────────
 
 @app.post("/run-evals")
 async def trigger_evals():
     """Called by Cloud Scheduler once daily to run LLM-as-judge evals
-    against production traces collected in the momo-prod-traces dataset."""
+    against the momo-eval-golden dataset (live agent, Langfuse experiments)."""
     from datetime import datetime
     try:
-        from scripts.run_langsmith_evals import run_evals
+        from scripts.run_langfuse_evals import run_evals
         prefix = f"momo-eval-{datetime.now().strftime('%Y%m%d')}"
         run_evals(prefix=prefix, limit=50)
         return {"status": "ok", "experiment": prefix}
@@ -681,6 +700,8 @@ async def trigger_evals():
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Internal server error")
+    finally:
+        observability.flush()
 
 
 @app.post("/promote-eval-failures")
@@ -766,7 +787,7 @@ async def granola_token_refresh():
 @app.post("/connection-health")
 async def connection_health_check():
     """Probe every external connector (Jira, Google Workspace/Chat, Granola,
-    MCP servers, Anthropic, Gemini, Firestore, LangSmith) and alert in Chat on
+    MCP servers, Anthropic, Gemini, Firestore, Langfuse) and alert in Chat on
     auth-state transitions. Called by Cloud Scheduler (e.g. hourly).
 
     Protected by the MOMO_API_SECRET middleware like the neighboring

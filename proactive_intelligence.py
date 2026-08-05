@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 import config
-from langsmith_config import traceable
+from observability import observe
 from claude_client import generate, extract_text, TaskComplexity
 from calendar_service import fetch_upcoming_meetings
 from chat_service import format_for_google_chat, send_chat_message
@@ -348,7 +348,7 @@ def _build_meeting_prep(meeting: dict) -> str | None:
 def run_meeting_prep() -> dict:
     """Check for upcoming meetings and send prep briefs for unsent ones.
 
-    Only creates a LangSmith trace when there are actual meetings to prep,
+    Only creates a Langfuse trace when there are actual meetings to prep,
     so idle polling runs don't flood the trace dashboard.
     """
     if not config.PROACTIVE_INTELLIGENCE_ENABLED or not config.MEETING_PREP_ENABLED:
@@ -379,7 +379,7 @@ def run_meeting_prep() -> dict:
     return _run_meeting_prep_traced(meetings_to_prep)
 
 
-@traceable(name="meeting-prep", tags=["proactive", "scheduled"])
+@observe(name="meeting-prep", capture_input=False)
 def _run_meeting_prep_traced(meetings: list) -> dict:
     """Traced inner function — only called when there are meetings to prep."""
     sent_count = 0
@@ -705,7 +705,7 @@ def _run_drift_engine() -> list[dict]:
 # ── Coordinators ─────────────────────────────────────────────
 
 
-@traceable(name="daily-nudges", tags=["proactive", "scheduled"])
+@observe(name="daily-nudges", capture_input=False)
 def generate_daily_nudges() -> str:
     """Run commitment, pattern, and drift engines. Returns formatted text
     for inclusion in the morning briefing, or empty string if nothing to report."""

@@ -279,23 +279,27 @@ def probe_firestore() -> dict:
         return _classify_exception("firestore", True, exc)
 
 
-def probe_langsmith() -> dict:
-    import os
-    if os.getenv("LANGSMITH_TRACING", "false").lower() != "true":
-        return _result("langsmith", False, "skipped")
+def probe_langfuse() -> dict:
+    if (not config.LANGFUSE_TRACING_ENABLED
+            or not config.LANGFUSE_PUBLIC_KEY or not config.LANGFUSE_SECRET_KEY):
+        return _result("langfuse", False, "skipped")
     try:
-        from langsmith import Client
-        client = Client()
-        next(iter(client.list_projects(limit=1)), None)
-        return _result("langsmith", True, "ok")
+        import httpx
+        resp = httpx.get(
+            f"{config.LANGFUSE_BASE_URL.rstrip('/')}/api/public/projects",
+            auth=(config.LANGFUSE_PUBLIC_KEY, config.LANGFUSE_SECRET_KEY),
+            timeout=5,
+        )
+        if resp.status_code in (401, 403):
+            return _result("langfuse", True, "auth_failed",
+                           error_kind="auth",
+                           error_message=f"/api/public/projects returned {resp.status_code}",
+                           user_message="Langfuse keys rejected — check LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY")
+        resp.raise_for_status()
+        return _result("langfuse", True, "ok")
     except Exception as exc:
-        # LangSmith is observability-only: classify but it never blocks health.
-        text = str(exc)
-        if "401" in text or "403" in text:
-            return _result("langsmith", True, "auth_failed",
-                           error_kind="auth", error_message=text,
-                           user_message="LangSmith API key rejected — check LANGSMITH_API_KEY")
-        return _classify_exception("langsmith", True, exc)
+        # Langfuse is observability-only: classify but it never blocks health.
+        return _classify_exception("langfuse", True, exc)
 
 
 def _build_registry() -> list:
@@ -318,7 +322,7 @@ def _build_registry() -> list:
         ("anthropic", probe_anthropic),
         ("gemini", probe_gemini),
         ("firestore", probe_firestore),
-        ("langsmith", probe_langsmith),
+        ("langfuse", probe_langfuse),
     ])
     return probes
 

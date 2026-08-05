@@ -17,10 +17,8 @@ from claude_client import (
     TaskComplexity, run_tool_loop,
 )
 from connection_errors import ExternalConnectionError, format_for_agent
-from langsmith_config import (
-    traceable, set_trace_metadata, _get_run_tree,
-    add_trace_tags, log_eval_failure,
-)
+import observability
+from observability import log_eval_failure
 
 # ── Tool timeout map (seconds) ───────────────────────────────
 
@@ -364,7 +362,6 @@ def _get_all_tools() -> list:
 # ── Tool executor ────────────────────────────────────────────
 
 
-@traceable(run_type="tool", name="agent-tool")
 def execute_tool(name: str, args: dict, pending_task_actions: list[dict] | None = None,
                  user_id: str | None = None, user_message: str | None = None,
                  pending_jira_actions: list[dict] | None = None) -> str:
@@ -810,36 +807,35 @@ def _build_history(conversation_history: list[dict], user_memories_context: str 
     return history
 
 
-def _flush_trace_metrics(metrics: dict, t0: float):
-    """Write accumulated trajectory metrics to the current LangSmith trace."""
+def _build_trace_metadata(metrics: dict, t0: float) -> dict:
+    """Shape accumulated trajectory metrics for the root observation metadata."""
     elapsed = time.time() - t0
-    set_trace_metadata(
-        iteration_count=metrics["iteration_count"],
-        total_tool_calls=metrics["total_tool_calls"],
-        unique_tools=list(metrics["unique_tools"]),
-        tool_sequence=metrics["tool_names"],
-        total_latency_s=round(elapsed, 3),
-        tool_details=metrics["tool_calls"],
-        errors=metrics["errors"],
-    )
-    # Auto-tag the trace with behavior categories based on tools used
+    # Behavior categories derived from the tools that ran
     behavior_tags = set()
     for category, tool_set in _TOOL_CATEGORIES.items():
         if metrics["unique_tools"] & tool_set:
             behavior_tags.add(category)
     if len(metrics["unique_tools"]) >= 3:
         behavior_tags.add("multi_tool")
-    if behavior_tags:
-        add_trace_tags(*behavior_tags)
+    return {
+        "iteration_count": metrics["iteration_count"],
+        "total_tool_calls": metrics["total_tool_calls"],
+        "unique_tools": sorted(metrics["unique_tools"]),
+        "tool_sequence": metrics["tool_names"],
+        "total_latency_s": round(elapsed, 3),
+        "tool_details": metrics["tool_calls"],
+        "errors": metrics["errors"],
+        "behavior_tags": sorted(behavior_tags),
+    }
 
 
-@traceable(name="agent-loop", tags=["chat", "user-initiated"])
 def run_agent_loop(user_message: str, conversation_history: list[dict],
                    max_iterations: int = 6,
                    thread_id: str | None = None,
                    user_id: str | None = None,
-                   jira_actions_sink: list[dict] | None = None) -> tuple[str, list[dict]]:
-    """Run the agentic tool-use loop.
+                   jira_actions_sink: list[dict] | None = None,
+                   metrics_sink: dict | None = None) -> tuple[str, list[dict]]:
+    """Run the agentic tool-use loop (root Langfuse observation for the turn).
 
     Sends the user message to Claude with tool declarations.  If Claude
     responds with tool calls, executes them and sends results back.
@@ -848,9 +844,36 @@ def run_agent_loop(user_message: str, conversation_history: list[dict],
     Returns the final text response and any queued TASK actions. Queued JIRA
     write actions are appended to jira_actions_sink (if provided) and kept on a
     SEPARATE list so a task approval can never apply a Jira write.
+    metrics_sink, when provided, receives the loop's trajectory metadata
+    (iteration_count, tool_sequence, ...) — used by the eval harness.
     """
-    if thread_id:
-        set_trace_metadata(thread_id=thread_id)
+    # EXPLICIT INPUT ONLY (skill rule): the trace input is just the user's
+    # message — never the full history/config, which may contain secrets.
+    with observability.start_as_current_observation(
+        name="agent-loop", as_type="agent", input={"message": user_message},
+    ) as root_span, observability.propagate_attributes(
+        user_id=user_id, session_id=thread_id, tags=["chat"],
+    ):
+        reply, pending_task_actions, metadata = _run_agent_loop_inner(
+            user_message, conversation_history,
+            max_iterations=max_iterations, user_id=user_id,
+            jira_actions_sink=jira_actions_sink,
+        )
+        if metrics_sink is not None:
+            metrics_sink.update(metadata)
+        try:
+            root_span.update(output=reply, metadata=metadata)
+        except Exception:
+            pass
+        return reply, pending_task_actions
+
+
+def _run_agent_loop_inner(user_message: str, conversation_history: list[dict],
+                          max_iterations: int = 6,
+                          user_id: str | None = None,
+                          jira_actions_sink: list[dict] | None = None,
+                          ) -> tuple[str, list[dict], dict]:
+    """The actual loop. Returns (reply, pending_task_actions, trace_metadata)."""
     tools = _get_all_tools()
 
     user_memories_context = ""
@@ -879,33 +902,37 @@ def run_agent_loop(user_message: str, conversation_history: list[dict],
 
     pending_task_actions: list[dict] = []
     pending_jira_actions: list[dict] = jira_actions_sink if jira_actions_sink is not None else []
-    parent_run_tree = _get_run_tree()
 
     def _dispatch_tool(name, tool_input):
         timeout = _TOOL_TIMEOUTS.get(name, config.MCP_DEFAULT_TIMEOUT if name.startswith("mcp_") else 10)
 
-        def _run_tool(rt=parent_run_tree):
-            if rt is not None:
-                try:
-                    from langsmith.run_helpers import _PARENT_RUN_TREE
-                    _PARENT_RUN_TREE.set(rt)
-                except (ImportError, AttributeError):
-                    pass
+        def _run_tool():
+            # ThreadingInstrumentor propagates the OTel context into this
+            # worker thread, so nested observations land under the tool span.
             return execute_tool(name, tool_input, pending_task_actions,
                                 user_id=user_id, user_message=user_message,
                                 pending_jira_actions=pending_jira_actions)
 
         _tool_t0 = time.time()
-        try:
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                result_str = pool.submit(_run_tool).result(timeout=timeout)
-        except FuturesTimeoutError:
-            result_str = f"Tool '{name}' timed out after {timeout}s"
-            print(f"[agent] tool '{name}' timed out")
-            _trace_metrics["errors"].append(f"timeout: {name}")
-        except Exception as exc:
-            result_str = f"Tool '{name}' failed: {str(exc)}"
-            _trace_metrics["errors"].append(f"exception: {name}: {exc}")
+        # One observation per tool dispatch (unit budget: no micro-op spans).
+        # Explicit input: only the model-provided tool args.
+        with observability.start_as_current_observation(
+            name=f"tool:{name}", as_type="tool", input={"args": tool_input},
+        ) as tool_span:
+            try:
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    result_str = pool.submit(_run_tool).result(timeout=timeout)
+            except FuturesTimeoutError:
+                result_str = f"Tool '{name}' timed out after {timeout}s"
+                print(f"[agent] tool '{name}' timed out")
+                _trace_metrics["errors"].append(f"timeout: {name}")
+            except Exception as exc:
+                result_str = f"Tool '{name}' failed: {str(exc)}"
+                _trace_metrics["errors"].append(f"exception: {name}: {exc}")
+            try:
+                tool_span.update(output=(result_str or "")[:1000])
+            except Exception:
+                pass
         _trace_metrics["tool_calls"].append({
             "name": name,
             "elapsed_s": round(time.time() - _tool_t0, 3),
@@ -928,13 +955,13 @@ def run_agent_loop(user_message: str, conversation_history: list[dict],
         print(f"[agent] loop failed: {exc}")
         traceback.print_exc()
         _trace_metrics["errors"].append(f"loop: {exc}")
-        _flush_trace_metrics(_trace_metrics, t0)
-        return "sorry, something went wrong — try again in a sec?", pending_task_actions
+        return ("sorry, something went wrong — try again in a sec?",
+                pending_task_actions, _build_trace_metadata(_trace_metrics, t0))
 
     _trace_metrics["iteration_count"] = len(_trace_metrics["tool_names"]) or 1
     elapsed = time.time() - t0
     print(f"[agent] done, {elapsed:.2f}s total")
-    _flush_trace_metrics(_trace_metrics, t0)
+    metadata = _build_trace_metadata(_trace_metrics, t0)
 
     if not final_text:
         log_eval_failure(
@@ -945,4 +972,5 @@ def run_agent_loop(user_message: str, conversation_history: list[dict],
             category="agent_loop_exhaustion",
         )
 
-    return final_text or "i pulled a lot of info but couldn't put it together — try asking differently?", pending_task_actions
+    reply = final_text or "i pulled a lot of info but couldn't put it together — try asking differently?"
+    return reply, pending_task_actions, metadata

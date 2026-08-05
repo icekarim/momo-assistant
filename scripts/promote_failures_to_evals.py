@@ -19,7 +19,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from google.cloud import firestore
-from langsmith import Client
 
 import config
 
@@ -34,8 +33,18 @@ def _get_firestore_client():
     )
 
 
-def _get_langsmith_client():
-    return Client()
+def _get_langfuse_client():
+    from langfuse import get_client
+    return get_client()
+
+
+def _ensure_dataset(lf_client):
+    """Verify the golden dataset exists in Langfuse (SystemExit if missing)."""
+    try:
+        lf_client.api.datasets.get(DATASET_NAME)
+    except Exception:
+        print(f"Dataset '{DATASET_NAME}' not found. Run seed_langfuse_dataset.py first.")
+        raise SystemExit(1)
 
 
 def _fetch_pending(db):
@@ -44,23 +53,17 @@ def _fetch_pending(db):
     return [(doc.id, doc.to_dict()) for doc in docs]
 
 
-def _promote_to_dataset(ls_client, failure: dict):
+def _promote_to_dataset(lf_client, failure: dict):
     """Add a failure as a regression eval in the golden dataset."""
-    existing = list(ls_client.list_datasets(dataset_name=DATASET_NAME))
-    if not existing:
-        print(f"Dataset '{DATASET_NAME}' not found. Run seed_eval_dataset.py first.")
-        raise SystemExit(1)
-
-    dataset = existing[0]
     category = failure.get("category", "regression")
 
-    ls_client.create_example(
-        dataset_id=dataset.id,
-        inputs={
+    lf_client.create_dataset_item(
+        dataset_name=DATASET_NAME,
+        input={
             "user_message": failure["user_message"],
             "category": category,
         },
-        outputs={
+        expected_output={
             "ideal_trajectory": {
                 "tool_sequence": [],
                 "ideal_step_count": 1,
@@ -77,8 +80,8 @@ def _promote_to_dataset(ls_client, failure: dict):
             "added_date": datetime.now().strftime("%Y-%m-%d"),
             "bug_description": failure.get("actual_behavior", ""),
             "trace_url": failure.get("trace_url", ""),
+            "split": category if category != "regression" else "regression",
         },
-        split=category if category != "regression" else "regression",
     )
 
 
@@ -93,17 +96,18 @@ def _update_status(db, doc_id: str, new_status: str):
 def auto_promote():
     """Auto-promote all pending failures to the eval dataset."""
     db = _get_firestore_client()
-    ls = _get_langsmith_client()
+    lf = _get_langfuse_client()
     pending = _fetch_pending(db)
 
     if not pending:
         print("No pending failures to promote.")
         return {"promoted": 0, "total": 0}
 
+    _ensure_dataset(lf)
     promoted = 0
     for doc_id, failure in pending:
         try:
-            _promote_to_dataset(ls, failure)
+            _promote_to_dataset(lf, failure)
             _update_status(db, doc_id, "promoted")
             promoted += 1
             print(f"  Promoted: {failure.get('user_message', '')[:60]}...")
@@ -117,13 +121,14 @@ def auto_promote():
 def interactive_review():
     """Interactively review each pending failure."""
     db = _get_firestore_client()
-    ls = _get_langsmith_client()
+    lf = _get_langfuse_client()
     pending = _fetch_pending(db)
 
     if not pending:
         print("No pending failures to review.")
         return
 
+    _ensure_dataset(lf)
     print(f"Found {len(pending)} pending failure(s) to review.\n")
 
     promoted = 0
@@ -144,7 +149,7 @@ def interactive_review():
             choice = input("  [p]romote / [d]iscard / [s]kip? ").strip().lower()
             if choice in ("p", "promote"):
                 try:
-                    _promote_to_dataset(ls, failure)
+                    _promote_to_dataset(lf, failure)
                     _update_status(db, doc_id, "promoted")
                     promoted += 1
                     print("  -> Promoted to eval dataset.\n")

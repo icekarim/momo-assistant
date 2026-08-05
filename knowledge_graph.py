@@ -24,6 +24,7 @@ import config
 from claude_client import TaskComplexity, extract_json, extract_text, generate
 from connection_errors import ExternalAuthError
 from conversation_store import get_db
+from observability import observe
 
 _kg_cache = TTLCache(maxsize=128, ttl=300)
 _kg_cache_lock = threading.Lock()
@@ -91,6 +92,16 @@ def _get_embedding(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list[flo
             ) from exc
         raise
     return result["embedding"]
+
+
+@observe(name="kg-query-embedding", as_type="embedding", capture_output=False)
+def _get_query_embedding(text: str) -> list[float]:
+    """Query-time embedding (traced as an embedding observation).
+
+    Ingestion-time embeddings go through the raw _get_embedding and stay
+    untraced on purpose — they're bulk micro-ops and would burn the Langfuse
+    unit budget (Hobby = 50k units/mo)."""
+    return _get_embedding(text, task_type="RETRIEVAL_QUERY")
 
 
 _EMAIL_RE = re.compile(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}")
@@ -902,7 +913,7 @@ def semantic_search(query: str, limit: int | None = None,
     threshold = threshold if threshold is not None else config.SEMANTIC_SEARCH_THRESHOLD
 
     try:
-        query_embedding = _get_embedding(query, task_type="RETRIEVAL_QUERY")
+        query_embedding = _get_query_embedding(query)
     except ExternalAuthError:
         # Credentials expired — propagate so callers can't mistake this for
         # "no knowledge found".

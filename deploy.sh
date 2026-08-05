@@ -90,7 +90,10 @@ JIRA_SITE_URL="${JIRA_SITE_URL:-$(grep '^JIRA_SITE_URL=' .env 2>/dev/null | cut 
 JIRA_USER_EMAIL="${JIRA_USER_EMAIL:-$(grep '^JIRA_USER_EMAIL=' .env 2>/dev/null | cut -d= -f2-)}"
 JIRA_API_TOKEN="${JIRA_API_TOKEN:-$(grep '^JIRA_API_TOKEN=' .env 2>/dev/null | cut -d= -f2-)}"
 JIRA_WRITE_ENABLED="${JIRA_WRITE_ENABLED:-$(grep '^JIRA_WRITE_ENABLED=' .env 2>/dev/null | cut -d= -f2-)}"
-LANGSMITH_API_KEY="${LANGSMITH_API_KEY:-$(grep '^LANGSMITH_API_KEY=' .env 2>/dev/null | cut -d= -f2-)}"
+LANGFUSE_PUBLIC_KEY="${LANGFUSE_PUBLIC_KEY:-$(grep '^LANGFUSE_PUBLIC_KEY=' .env 2>/dev/null | cut -d= -f2-)}"
+LANGFUSE_SECRET_KEY="${LANGFUSE_SECRET_KEY:-$(grep '^LANGFUSE_SECRET_KEY=' .env 2>/dev/null | cut -d= -f2-)}"
+LANGFUSE_BASE_URL="${LANGFUSE_BASE_URL:-$(grep '^LANGFUSE_BASE_URL=' .env 2>/dev/null | cut -d= -f2-)}"
+LANGFUSE_TRACING_ENABLED="${LANGFUSE_TRACING_ENABLED:-$(grep '^LANGFUSE_TRACING_ENABLED=' .env 2>/dev/null | cut -d= -f2-)}"
 MOMO_API_SECRET="${MOMO_API_SECRET:-$(grep '^MOMO_API_SECRET=' .env 2>/dev/null | cut -d= -f2-)}"
 
 # Get existing URL for MOMO_SERVICE_URL (pre-deploy for first-time, updated post-deploy)
@@ -103,7 +106,7 @@ gcloud run deploy $SERVICE_NAME \
   --allow-unauthenticated \
   --set-env-vars="GEMINI_API_KEY=${GEMINI_API_KEY},ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY},GCP_PROJECT_ID=$PROJECT_ID,CHAT_SPACE_ID=${CHAT_SPACE_ID},GRANOLA_ENABLED=true" \
   --set-env-vars="JIRA_ENABLED=${JIRA_ENABLED:-false},JIRA_SITE_URL=${JIRA_SITE_URL},JIRA_USER_EMAIL=${JIRA_USER_EMAIL},JIRA_API_TOKEN=${JIRA_API_TOKEN},JIRA_WRITE_ENABLED=${JIRA_WRITE_ENABLED:-false}" \
-  --set-env-vars="LANGSMITH_TRACING=true,LANGSMITH_API_KEY=${LANGSMITH_API_KEY},LANGSMITH_PROJECT=momo" \
+  --set-env-vars="LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY},LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY},LANGFUSE_BASE_URL=${LANGFUSE_BASE_URL:-https://us.cloud.langfuse.com},LANGFUSE_TRACING_ENABLED=${LANGFUSE_TRACING_ENABLED:-true}" \
   --set-env-vars="OWNER_NAME=${OWNER_NAME:-},MOMO_API_SECRET=${MOMO_API_SECRET}" \
   --set-env-vars="MOMO_SERVICE_URL=${EXISTING_URL}" \
   --set-env-vars="KG_RESOLUTION_ENABLED=true,KG_LINKING_ENABLED=true,KG_LINK_MIN_CONFIDENCE=0.85" \

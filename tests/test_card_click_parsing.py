@@ -22,7 +22,7 @@ sys.modules["cachetools"] = MagicMock(TTLCache=DummyCache)
 sys.modules["fastapi"] = MagicMock()
 sys.modules["fastapi.responses"] = MagicMock()
 
-langsmith_mock = MagicMock()
+observability_mock = MagicMock()
 
 
 def traceable_mock(*args, **kwargs):
@@ -31,10 +31,8 @@ def traceable_mock(*args, **kwargs):
     return decorator
 
 
-langsmith_mock.traceable = traceable_mock
-langsmith_mock.traced_chat_send = MagicMock()
-langsmith_mock.traced_generate_content = MagicMock()
-sys.modules["langsmith_config"] = langsmith_mock
+observability_mock.observe = traceable_mock
+sys.modules["observability"] = observability_mock
 
 config_mock = MagicMock()
 config_mock.CHAT_SPACE_ID = "spaces/test_space"

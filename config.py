@@ -164,6 +164,14 @@ JIRA_WRITE_ENABLED = os.getenv("JIRA_WRITE_ENABLED", "false").lower() == "true"
 FIRESTORE_PENDING_JIRA_COLLECTION = "pending_jira_proposals"
 FIRESTORE_JIRA_AUDIT_COLLECTION = "jira_write_audit"
 
+# ── Langfuse observability ───────────────────────────────────
+# Tracing is a no-op when keys are absent or LANGFUSE_TRACING_ENABLED=false.
+LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY", "")
+LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY", "")
+LANGFUSE_BASE_URL = os.getenv("LANGFUSE_BASE_URL", "https://us.cloud.langfuse.com")
+LANGFUSE_TRACING_ENABLED = os.getenv("LANGFUSE_TRACING_ENABLED", "true").lower() == "true"
+LANGFUSE_TRACING_ENVIRONMENT = os.getenv("LANGFUSE_TRACING_ENVIRONMENT", "production")
+
 # ── Owner ────────────────────────────────────────────────────
 OWNER_NAME = os.getenv("OWNER_NAME", "")
 
