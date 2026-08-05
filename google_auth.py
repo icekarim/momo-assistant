@@ -12,6 +12,7 @@ except Exception:  # pragma: no cover - fallback for older library variants / mo
     from google_auth_oauthlib.flow import InstalledAppFlow as OAuthFlow
 
 import config
+from connection_errors import ExternalAuthError
 
 _cached_creds = None
 _creds_lock = threading.RLock()
@@ -513,6 +514,59 @@ async def complete_web_reauth(code: str, state: str) -> bool:
     except Exception as exc:
         print(f"Google auth reauth: token exchange failed: {exc}")
         return False
+
+
+def _http_error_status(exc: Exception) -> int | None:
+    """Extract the HTTP status from a googleapiclient HttpError (any version)."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        resp = getattr(exc, "resp", None)
+        status = getattr(resp, "status", None)
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def is_google_auth_error(exc: Exception) -> bool:
+    """True when exc is a googleapiclient HttpError with status 401/403 (or an
+    already-classified Google Workspace auth error)."""
+    if isinstance(exc, (ExternalAuthError, ReauthRequiredError)):
+        return True
+    return _http_error_status(exc) in (401, 403)
+
+
+def classify_google_auth_error(exc: Exception, source: str = "google_workspace") -> ExternalAuthError | None:
+    """Shared classifier for Google Workspace API failures.
+
+    When exc is a 401/403 HttpError (or ReauthRequiredError), marks reauth
+    required, fires the existing throttled Chat alert, and returns a typed
+    ExternalAuthError for the caller to raise (or log-and-continue for
+    per-item failures). Returns None for non-auth failures."""
+    if not is_google_auth_error(exc):
+        return None
+    status = _http_error_status(exc)
+    if not isinstance(exc, (ExternalAuthError, ReauthRequiredError)):
+        try:
+            _mark_reauth_required(reason=f"http_{status}", source=source)
+            _send_throttled_reauth_alert(service_url=config.MOMO_SERVICE_URL)
+        except Exception as mark_exc:
+            print(f"Google auth: failed to mark/alert reauth from {source}: {mark_exc}")
+    if isinstance(exc, ExternalAuthError):
+        return exc
+    return ExternalAuthError(
+        "google_workspace",
+        f"Google Workspace API auth failure ({source}) — {exc}",
+        status=status,
+        reconnect_hint="reconnect via the /google-auth/start link in Chat",
+    )
+
+
+def raise_if_google_auth_error(exc: Exception, source: str = "google_workspace") -> None:
+    """Raise a typed ExternalAuthError when exc is an auth failure; no-op otherwise."""
+    auth_err = classify_google_auth_error(exc, source=source)
+    if auth_err is not None:
+        raise auth_err from exc
 
 
 def warmup():

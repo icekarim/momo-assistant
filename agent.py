@@ -16,6 +16,7 @@ import config
 from claude_client import (
     TaskComplexity, run_tool_loop,
 )
+from connection_errors import ExternalConnectionError, format_for_agent
 from langsmith_config import (
     traceable, set_trace_metadata, _get_run_tree,
     add_trace_tags, log_eval_failure,
@@ -379,6 +380,13 @@ def execute_tool(name: str, args: dict, pending_task_actions: list[dict] | None 
         elapsed = time.time() - t0
         print(f"[agent] tool '{name}': {elapsed:.2f}s ({len(result)} chars)")
         return result
+    except ExternalConnectionError as exc:
+        # Typed connector failure (auth/permission): surface the stable
+        # CONNECTION_AUTH_ERROR string verbatim so the model tells the user
+        # credentials expired instead of "no data found".
+        elapsed = time.time() - t0
+        print(f"[agent] tool '{name}' CONNECTION FAILURE after {elapsed:.2f}s: {exc}")
+        return format_for_agent(exc)
     except Exception as exc:
         elapsed = time.time() - t0
         print(f"[agent] tool '{name}' FAILED after {elapsed:.2f}s: {exc}")
@@ -669,6 +677,7 @@ For task changes (create, update, complete, delete), use the task tools to prepa
 When the user later confirms, you'll see a note in the conversation history — a "[task card resolved]" line for cards, or an approval confirmation for the reply flow. TRUST it: a task shown as added IS on their list now, so never say it's "still pending" or "needs approval first" once you see it was resolved. you can complete / update / delete it from there.
 Never say a task was already created, updated, completed, or deleted before approval actually happens.
 When a tool returns an error, tell the user naturally — don't retry endlessly.
+If a tool result starts with CONNECTION_AUTH_ERROR, that service's credentials have EXPIRED — tell the user plainly which service needs to be reconnected (the connector= field names it) and that momo can't see that data until they re-auth. NEVER present an auth failure as "no data found", "nothing came back", or an empty result.
 
 The search_knowledge_graph tool searches across ALL of Momo's memory — meetings, emails, calendar events, tasks, chat history, and Granola notes. Use it for any "what happened", "what did we discuss", "who said what", "what was decided" type questions.
 {_MEMORY_SECTION}

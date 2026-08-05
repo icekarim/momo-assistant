@@ -138,3 +138,4 @@ echo "  5. Create Cloud Scheduler job for: ${URL}/meeting-prep (e.g. */10 9-18 *
 echo "  6. (One-time) Backfill knowledge graph: curl -X POST ${URL}/knowledge-backfill"
 echo "  7. Create Cloud Scheduler job for Google token keepalive: POST ${URL}/google-token-refresh (every ~4 hours)"
 echo "  8. Create Cloud Scheduler job for Granola token keepalive: POST ${URL}/granola-token-refresh (every 4 hours)"
+echo "  9. Create Cloud Scheduler job for connector health: POST ${URL}/connection-health (suggest hourly, e.g. 0 * * * *)"
