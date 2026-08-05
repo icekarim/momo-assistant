@@ -173,3 +173,134 @@ def format_jira_tickets_for_context(tickets_text: str) -> str:
     if not tickets_text:
         return "No active Jira tickets found."
     return tickets_text
+
+
+# ── Write operations ─────────────────────────────────────────
+# These mutate shared, team-visible Jira data. They are the raw REST layer and
+# MUST only be invoked from the approved-execution path (never directly by the
+# agent loop). The agent layer queues these behind explicit user approval.
+
+
+def _text_to_adf(text: str) -> dict:
+    """Build a minimal Atlassian Document Format doc from plain text.
+
+    Jira Cloud REST v3 requires rich-text fields (description, comment body) as
+    ADF JSON. Each non-empty line becomes a paragraph.
+    """
+    lines = (text or "").split("\n")
+    content = []
+    for line in lines:
+        para: dict = {"type": "paragraph", "content": []}
+        if line:
+            para["content"].append({"type": "text", "text": line})
+        content.append(para)
+    if not content:
+        content = [{"type": "paragraph", "content": []}]
+    return {"type": "doc", "version": 1, "content": content}
+
+
+def _issue_browse_url(key: str) -> str:
+    site = config.JIRA_SITE_URL.rstrip("/")
+    if not site.startswith("http"):
+        site = f"https://{site}"
+    return f"{site}/browse/{key}"
+
+
+def create_jira_ticket(project_key: str, summary: str, description: str = "",
+                       issue_type: str = "Task", priority: str | None = None) -> dict:
+    """Create a Jira issue. Returns {success, key, url} or {success: False, error}."""
+    fields: dict = {
+        "project": {"key": project_key},
+        "summary": summary,
+        "issuetype": {"name": issue_type},
+    }
+    if description:
+        fields["description"] = _text_to_adf(description)
+    if priority:
+        fields["priority"] = {"name": priority}
+
+    try:
+        resp = httpx.post(f"{_base_url()}/issue", headers=_get_auth_header(),
+                          json={"fields": fields}, timeout=_TIMEOUT)
+        resp.raise_for_status()
+        key = resp.json().get("key", "")
+        return {"success": True, "key": key, "url": _issue_browse_url(key)}
+    except Exception as exc:
+        detail = getattr(getattr(exc, "response", None), "text", "")
+        print(f"Jira: create_ticket failed — {exc} {detail[:300]}")
+        return {"success": False, "error": str(exc), "detail": detail[:300]}
+
+
+def add_jira_comment(issue_key: str, comment: str) -> dict:
+    """Add a comment to a Jira issue. Returns {success, key, url} or error."""
+    try:
+        resp = httpx.post(
+            f"{_base_url()}/issue/{issue_key}/comment",
+            headers=_get_auth_header(),
+            json={"body": _text_to_adf(comment)},
+            timeout=_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return {"success": True, "key": issue_key, "url": _issue_browse_url(issue_key)}
+    except Exception as exc:
+        detail = getattr(getattr(exc, "response", None), "text", "")
+        print(f"Jira: add_comment({issue_key}) failed — {exc} {detail[:300]}")
+        return {"success": False, "error": str(exc), "detail": detail[:300]}
+
+
+def list_jira_transitions(issue_key: str) -> list[dict]:
+    """List available status transitions for an issue as [{id, name, to_status}]."""
+    try:
+        resp = httpx.get(f"{_base_url()}/issue/{issue_key}/transitions",
+                         headers=_get_auth_header(), timeout=_TIMEOUT)
+        resp.raise_for_status()
+        out = []
+        for tr in resp.json().get("transitions", []):
+            out.append({
+                "id": tr.get("id", ""),
+                "name": tr.get("name", ""),
+                "to_status": (tr.get("to") or {}).get("name", ""),
+            })
+        return out
+    except Exception as exc:
+        print(f"Jira: list_transitions({issue_key}) failed — {exc}")
+        return []
+
+
+def transition_jira_ticket(issue_key: str, transition_name: str) -> dict:
+    """Move an issue to a new status by transition name (case-insensitive).
+
+    Resolves the transition name to its id against the issue's currently
+    available transitions, then applies it. Returns {success, ...} or an error
+    listing the valid transitions when the name does not match.
+    """
+    transitions = list_jira_transitions(issue_key)
+    if not transitions:
+        return {"success": False, "error": f"No transitions available for {issue_key}"}
+
+    target = (transition_name or "").strip().lower()
+    match = next(
+        (t for t in transitions
+         if t["name"].lower() == target or t["to_status"].lower() == target),
+        None,
+    )
+    if not match:
+        valid = ", ".join(f"{t['name']} -> {t['to_status']}" for t in transitions)
+        return {"success": False,
+                "error": f"No transition '{transition_name}' for {issue_key}",
+                "valid_transitions": valid}
+
+    try:
+        resp = httpx.post(
+            f"{_base_url()}/issue/{issue_key}/transitions",
+            headers=_get_auth_header(),
+            json={"transition": {"id": match["id"]}},
+            timeout=_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return {"success": True, "key": issue_key, "to_status": match["to_status"],
+                "url": _issue_browse_url(issue_key)}
+    except Exception as exc:
+        detail = getattr(getattr(exc, "response", None), "text", "")
+        print(f"Jira: transition({issue_key}) failed — {exc} {detail[:300]}")
+        return {"success": False, "error": str(exc), "detail": detail[:300]}

@@ -155,6 +155,11 @@ JIRA_JQL_FILTER = os.getenv(
     "(assignee = currentUser() OR reporter = currentUser() OR watcher = currentUser()) "
     "AND statusCategory != Done ORDER BY updated DESC",
 )
+# Master switch for Jira WRITE tools (create/comment/transition). Default false:
+# write tools are not even declared to the agent unless this is explicitly true.
+JIRA_WRITE_ENABLED = os.getenv("JIRA_WRITE_ENABLED", "false").lower() == "true"
+FIRESTORE_PENDING_JIRA_COLLECTION = "pending_jira_proposals"
+FIRESTORE_JIRA_AUDIT_COLLECTION = "jira_write_audit"
 
 # ── Owner ────────────────────────────────────────────────────
 OWNER_NAME = os.getenv("OWNER_NAME", "")

@@ -103,6 +103,7 @@ sys.modules["conversation_store"] = MagicMock(
     clear_conversation=MagicMock(),
     conversation_scope=MagicMock(),
     get_pending_task_actions=MagicMock(),
+    get_pending_jira_actions=MagicMock(return_value=None),
     clear_pending_task_actions=MagicMock(),
     store_pending_task_actions=MagicMock(),
     store_pending_task_actions_if_empty=MagicMock(),
