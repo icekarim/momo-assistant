@@ -20,9 +20,7 @@ _MODULES_TO_ISOLATE = [
     "google.generativeai",
     "claude_client",
     "anthropic",
-    "langsmith",
-    "langsmith.wrappers",
-    "langsmith_config",
+    "observability",
 ]
 _ORIGINAL_MODULES = {
     name: sys.modules.get(name, _SENTINEL)
@@ -34,9 +32,7 @@ for name in _MODULES_TO_ISOLATE:
 sys.modules["google"] = MagicMock()
 sys.modules["google.generativeai"] = MagicMock()
 sys.modules["anthropic"] = MagicMock()
-sys.modules["langsmith"] = MagicMock()
-sys.modules["langsmith.wrappers"] = MagicMock()
-sys.modules["langsmith_config"] = MagicMock()
+sys.modules["observability"] = MagicMock()
 sys.modules["claude_client"] = MagicMock()
 
 config_mock = MagicMock()

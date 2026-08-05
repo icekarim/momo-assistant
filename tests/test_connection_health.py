@@ -25,7 +25,7 @@ for _name in list(sys.modules):
     if isinstance(sys.modules.get(_name), MagicMock):
         sys.modules.pop(_name, None)
 for _name in ("connection_health", "connection_errors", "agent", "claude_client",
-              "langsmith_config", "jira_service", "mcp_client", "chat_service",
+              "observability", "jira_service", "mcp_client", "chat_service",
               "google_auth", "config"):
     sys.modules.pop(_name, None)
 

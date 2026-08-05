@@ -16,8 +16,8 @@ import json
 import sys
 
 # Pop in dependency order so each fresh import below binds fresh real deps
-# (agent -> claude_client/langsmith_config/config, jira_service -> config).
-for _name in ("agent", "claude_client", "langsmith_config", "jira_service", "config"):
+# (agent -> claude_client/observability/config, jira_service -> config).
+for _name in ("agent", "claude_client", "observability", "jira_service", "config"):
     sys.modules.pop(_name, None)
 
 import config  # noqa: E402

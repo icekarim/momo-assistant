@@ -1,6 +1,6 @@
 import config
 from claude_client import TaskComplexity, TASK_MODEL_MAP, generate, extract_text
-from langsmith_config import traceable, set_trace_metadata
+from observability import observe
 
 _OWNER_LINE = f"\nYou are {config.OWNER_NAME}'s personal AI assistant. Always address them by name when it fits naturally.\n" if config.OWNER_NAME else ""
 
@@ -217,7 +217,10 @@ Momo is the friend who fixes your resume at 2am, tells you your ex's rebound is 
 Keep responses scannable. Google Chat supports *bold* and basic formatting. Use section emojis (📅 ✅ 📧 🎫 🎯) and priority colors (🔴 🟡 🟢) to make messages easy to read at a glance. No other emojis."""
 
 
-@traceable(name="morning-briefing", tags=["briefing", "scheduled"])
+# Root observation for the scheduled briefing job. capture_input=False: the
+# args are full email/calendar/task context blocks (skill rule: explicit,
+# user-relevant input only — the auto-captured generation has the prompt).
+@observe(name="morning-briefing", capture_input=False)
 def generate_morning_briefing(emails_context, meetings_context, tasks_context,
                                granola_context="", jira_context="",
                                nudges_context=""):
@@ -267,14 +270,12 @@ Please create my morning briefing."""
     return extract_text(msg)
 
 
-@traceable(name="chat-response", tags=["chat", "user-initiated"])
+@observe(name="chat-response", capture_input=False)
 def chat_response(user_message, conversation_history, context_data, thread_id=None):
-    """Generate a conversational response with email/calendar/task context."""
+    """Generate a conversational response with email/calendar/task context.
+    (Legacy non-agentic path — only used when AGENTIC_MODE_ENABLED=false.)"""
     import time
     from datetime import datetime, timedelta
-
-    if thread_id:
-        set_trace_metadata(thread_id=thread_id)
 
     has_kg_context = bool(context_data.get("knowledge_graph"))
     complexity = TaskComplexity.DEEP if has_kg_context else TaskComplexity.STANDARD
@@ -349,19 +350,14 @@ def chat_response(user_message, conversation_history, context_data, thread_id=No
         print(f"Claude chat_response failed: {e}")
         return "sorry, hit a snag generating that — try again in a sec?"
     finally:
+        # Model/latency details are captured by the auto-instrumented
+        # Anthropic generation span; keep only the slow-path log here.
         elapsed = time.time() - start
-        set_trace_metadata(
-            model_used=model_name,
-            complexity_tier=complexity.value,
-            total_latency_s=round(elapsed, 3),
-            context_length_chars=len(context_block),
-            fallback_used=_fallback_used,
-        )
         if elapsed > 30:
             print(f"Slow chat_response: {elapsed:.1f}s (tier: {complexity.value})")
 
 
-@traceable(name="post-meeting-debrief", tags=["proactive", "scheduled"])
+@observe(name="post-meeting-debrief", capture_input=False)
 def generate_post_meeting_debrief(meeting_title, attendees, granola_notes, end_time="", open_tasks=None):
     """Generate a short post-meeting debrief (summary + action items)."""
     attendee_str = ", ".join(attendees) if attendees else "unknown attendees"

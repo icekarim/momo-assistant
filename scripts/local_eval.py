@@ -1,9 +1,11 @@
 """Local eval gate — reads the golden dataset from CSV, runs the live agent
 per example, scores with a Gemini judge, and writes eval_report_{provider}.json.
 
-This sidesteps the LangSmith dataset API (which has flapping auth in this env).
-The judge stays on gemini-2.0-flash for BOTH provider runs so the Gemini-vs-Claude
-comparison is apples-to-apples; any Gemini-favoring bias makes the gate conservative.
+This sidesteps the hosted dataset API entirely (fully offline against
+eval_dataset_golden.csv); the Langfuse-backed harness lives in
+scripts/run_langfuse_evals.py. The judge stays on Gemini Flash for BOTH
+provider runs so the Gemini-vs-Claude comparison is apples-to-apples; any
+Gemini-favoring bias makes the gate conservative.
 """
 
 import argparse
@@ -88,12 +90,18 @@ def run(provider: str, limit=None):
     if limit:
         examples = examples[:limit]
 
+    # Group this eval run's traces into one Langfuse session (Sessions view).
+    import time
+    session_id = f"local-eval-{int(time.time())}"
+
     results = []
     for i, ex in enumerate(examples, 1):
         user_message = ex["user_message"]
         criteria = ex.get("correctness_criteria", "")
         try:
-            response, _ = run_agent_loop(user_message, [])
+            response, _ = run_agent_loop(
+                user_message, [], thread_id=session_id, user_id="local-eval"
+            )
         except Exception as exc:
             response = f"[agent error: {exc}]"
         scores = _score_example(user_message, response, criteria)

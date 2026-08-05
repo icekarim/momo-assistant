@@ -28,23 +28,22 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 load_dotenv()
 
-from langsmith import Client
-
-client = Client()
+from langfuse import get_client
 
 DATASET_NAME = "momo-eval-golden"
 
 
 def add_regression(args):
-    """Add a regression eval example to the golden dataset."""
+    """Add a regression eval example to the golden dataset (Langfuse)."""
+    client = get_client()
 
     # Verify dataset exists
-    existing = list(client.list_datasets(dataset_name=DATASET_NAME))
-    if not existing:
-        print(f"Dataset '{DATASET_NAME}' not found. Run seed_eval_dataset.py first.")
+    try:
+        client.api.datasets.get(DATASET_NAME)
+    except Exception:
+        print(f"Dataset '{DATASET_NAME}' not found. Run seed_langfuse_dataset.py first.")
         raise SystemExit(1)
 
-    dataset = existing[0]
     required_tools = args.expected_tools or []
     forbidden_tools = args.forbidden_tools or []
     ideal_step_count = args.steps or len(required_tools)
@@ -73,15 +72,16 @@ def add_regression(args):
         "difficulty": args.difficulty or "medium",
         "added_date": datetime.now().strftime("%Y-%m-%d"),
         "bug_description": args.bug_description,
+        "split": args.category,
     }
 
-    client.create_example(
-        dataset_id=dataset.id,
-        inputs=example["inputs"],
-        outputs=example["outputs"],
+    client.create_dataset_item(
+        dataset_name=DATASET_NAME,
+        input=example["inputs"],
+        expected_output=example["outputs"],
         metadata=metadata,
-        split=args.category,
     )
+    client.flush()
 
     print(f"Added regression eval to '{DATASET_NAME}':")
     print(f"  Message:        {args.message}")

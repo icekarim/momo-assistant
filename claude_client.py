@@ -2,10 +2,15 @@ import json
 from enum import Enum
 
 import anthropic
-from langsmith.wrappers import wrap_anthropic
 
 import config
+import observability
 from connection_errors import ExternalAuthError, ExternalConnectionError
+
+# CRITICAL ordering: instrumentation (AnthropicInstrumentor) must patch the
+# SDK BEFORE the client object below is constructed. init_tracing is
+# idempotent and no-ops without Langfuse keys.
+observability.init_tracing()
 
 
 class TaskComplexity(Enum):
@@ -38,9 +43,9 @@ _MAX_FALLBACK_ATTEMPTS = 1
 # max_retries=1: the interactive agent path runs synchronously under Google
 # Chat's 30s deadline, so a third attempt (each up to the per-call timeout) would
 # blow the worst-case wall time. One retry still rides out a transient blip.
-_client = wrap_anthropic(
-    anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY, max_retries=1)
-)
+# Plain client — Langfuse's AnthropicInstrumentor (init_tracing above) captures
+# messages.create calls as generations; no per-client wrapper needed.
+_client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY, max_retries=1)
 
 
 def get_client():
