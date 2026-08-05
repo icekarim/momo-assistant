@@ -23,6 +23,7 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
 import config
+from connection_errors import ExternalAuthError, format_for_agent
 
 _FIRESTORE_MCP_COLLECTION = "mcp_auth"
 _TOOL_CACHE_TTL = 3600
@@ -240,16 +241,32 @@ class _BearerAuth(httpx.Auth):
         yield request
 
 
+_AUTH_STATUS_CODES = (401, 403)
+
+
 def _is_auth_error(exc: Exception) -> bool:
-    if hasattr(exc, "status_code") and exc.status_code == 401:
+    """True for 401 AND 403 failures, including wrapped ExceptionGroups."""
+    if isinstance(exc, ExternalAuthError):
         return True
-    if hasattr(exc, "response") and hasattr(exc.response, "status_code") and exc.response.status_code == 401:
+    if getattr(exc, "status_code", None) in _AUTH_STATUS_CODES:
+        return True
+    response = getattr(exc, "response", None)
+    if response is not None and getattr(response, "status_code", None) in _AUTH_STATUS_CODES:
         return True
     if hasattr(exc, "exceptions"):
         return any(_is_auth_error(sub) for sub in exc.exceptions)
-    if "401" in str(exc):
+    text = str(exc)
+    if "401" in text or "403" in text:
         return True
     return False
+
+
+def _auth_error(server_name: str, message: str) -> ExternalAuthError:
+    return ExternalAuthError(
+        f"mcp:{server_name}",
+        message,
+        reconnect_hint=f"run `python mcp_auth_setup.py {server_name}` to reconnect",
+    )
 
 
 def _run(coro, timeout: int = 60):
@@ -326,9 +343,11 @@ def list_server_tools(server_name: str) -> list[dict]:
     if srv.get("auth") == "oauth":
         token = _load_token(server_name)
         if not token:
-            print(f"MCP[{server_name}]: no token — skipping tool discovery")
-            _tool_discovery_cache[server_name] = {"tools": [], "expires_at": time.time() + 60}
-            return []
+            # Auth failure: do NOT cache an empty tool list — that would make
+            # the server's tools silently vanish for the cache TTL even after
+            # re-auth. Raise typed so callers/health checks can surface it.
+            print(f"MCP[{server_name}]: no token — tool discovery blocked by auth")
+            raise _auth_error(server_name, f"no auth token for MCP server '{server_name}'")
     else:
         token = srv.get("bearer_token", "")
 
@@ -338,6 +357,12 @@ def list_server_tools(server_name: str) -> list[dict]:
         raw_tools = _run(_async_list_tools(srv["url"], token), timeout=15)
     except Exception as exc:
         print(f"MCP[{server_name}]: tool discovery failed: {exc}")
+        if _is_auth_error(exc):
+            # Auth errors must not poison the discovery cache with [].
+            raise _auth_error(
+                server_name,
+                f"tool discovery auth failure for MCP server '{server_name}': {exc}",
+            ) from exc
         _tool_discovery_cache[server_name] = {"tools": [], "expires_at": time.time() + 60}
         return []
 
@@ -372,6 +397,10 @@ def list_all_mcp_tools() -> list[dict]:
             continue
         try:
             tools.extend(list_server_tools(name))
+        except ExternalAuthError as exc:
+            # Recorded (typed + logged) but non-fatal: the agent still runs
+            # with the remaining tools; /connection-health surfaces the state.
+            print(f"MCP: AUTH FAILURE for '{name}' — tools unavailable until re-auth: {exc}")
         except Exception as exc:
             print(f"MCP: failed to list tools for '{name}': {exc}")
     return tools
@@ -394,10 +423,9 @@ def call_mcp_tool(qualified_name: str, args: dict) -> str:
                 _token_cache[server_name] = None
             token = _load_token(server_name)
             if not token:
-                return (
-                    f"MCP[{server_name}]: no auth token — "
-                    f"run `python mcp_auth_setup.py {server_name}`"
-                )
+                return format_for_agent(_auth_error(
+                    server_name, f"no auth token for MCP server '{server_name}'",
+                ))
         else:
             token = srv.get("bearer_token", "")
 
@@ -408,9 +436,17 @@ def call_mcp_tool(qualified_name: str, args: dict) -> str:
             )
             return _extract_text(result) or ""
         except Exception as exc:
-            if attempt == 0 and _is_auth_error(exc):
-                print(f"MCP[{server_name}]: 401 received, forcing token refresh and retrying...")
-                continue
+            if _is_auth_error(exc):
+                if attempt == 0:
+                    print(f"MCP[{server_name}]: auth error received, forcing token refresh and retrying...")
+                    continue
+                # Final auth failure after the refresh retry — stable string
+                # so the model tells the user credentials expired, not "no data".
+                print(f"MCP[{server_name}]: tool call '{tool_name}' auth failure after retry: {exc}")
+                return format_for_agent(_auth_error(
+                    server_name,
+                    f"auth failure calling '{tool_name}' on MCP server '{server_name}'",
+                ))
             print(f"MCP[{server_name}]: tool call '{tool_name}' failed: {exc}")
             return f"MCP tool error ({server_name}/{tool_name}): {exc}"
 

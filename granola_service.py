@@ -20,6 +20,7 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
 import config
+from connection_errors import ExternalAuthError
 
 _TOKEN_FILE = os.getenv("GRANOLA_TOKEN_FILE", "granola_token.json")
 _GRANOLA_TOKEN_JSON_ENV = os.getenv("GRANOLA_TOKEN_JSON", "")
@@ -269,11 +270,25 @@ async def _call_tool(tool_name: str, arguments: dict | None = None):
                     result = await session.call_tool(tool_name, arguments=arguments or {})
                     return result
         except Exception as exc:
-            if attempt == 0 and _is_auth_error(exc):
-                print("Granola: 401 received, forcing token refresh and retrying...")
-                global _cached_token
-                _cached_token = None
-                continue
+            if _is_auth_error(exc):
+                if attempt == 0:
+                    print("Granola: 401 received, forcing token refresh and retrying...")
+                    global _cached_token
+                    _cached_token = None
+                    continue
+                # Final 401 after refresh retry: surface as a typed auth error
+                # and fire the (12h-throttled) reconnect alert.
+                print(f"Granola: auth failure after token refresh retry: {exc}")
+                try:
+                    send_reauth_alert()
+                except Exception as alert_exc:
+                    print(f"Granola: reauth alert failed: {alert_exc}")
+                raise ExternalAuthError(
+                    "granola",
+                    f"Granola MCP auth failure — {exc}",
+                    status=401,
+                    reconnect_hint="use the /granola-auth/start link to reconnect",
+                ) from exc
             raise
 
 
@@ -384,6 +399,10 @@ def fetch_yesterday_meeting_notes() -> str:
         notes_by_id = fetch_meeting_notes_batch(target_ids[:10])
         return "\n\n".join(notes_by_id.values()).strip()
 
+    except ExternalAuthError:
+        # Credentials expired — propagate so callers (briefing) can surface a
+        # re-auth notice instead of silently substituting "no notes".
+        raise
     except Exception as exc:
         print(f"Granola: error fetching yesterday's notes via list+batch: {exc}")
         return ""

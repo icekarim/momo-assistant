@@ -761,6 +761,24 @@ async def granola_token_refresh():
         return {"status": "error", "message": f"Granola token refresh failed: {str(e)}"}
 
 
+# ── Connection Health ────────────────────────────────────────
+
+@app.post("/connection-health")
+async def connection_health_check():
+    """Probe every external connector (Jira, Google Workspace/Chat, Granola,
+    MCP servers, Anthropic, Gemini, Firestore, LangSmith) and alert in Chat on
+    auth-state transitions. Called by Cloud Scheduler (e.g. hourly).
+
+    Protected by the MOMO_API_SECRET middleware like the neighboring
+    token-refresh endpoints (not in _OPEN_PATHS)."""
+    try:
+        from connection_health import run_connection_health_check
+        return await asyncio.to_thread(run_connection_health_check)
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "message": f"Connection health check failed: {str(e)}"}
+
+
 # ── Granola Self-Serve Re-Auth ───────────────────────────────
 
 

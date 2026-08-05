@@ -5,6 +5,7 @@ import anthropic
 from langsmith.wrappers import wrap_anthropic
 
 import config
+from connection_errors import ExternalAuthError, ExternalConnectionError
 
 
 class TaskComplexity(Enum):
@@ -79,6 +80,18 @@ def extract_json(text):
     return parsed
 
 
+def _classify_auth(exc: Exception) -> ExternalAuthError | None:
+    """Map Anthropic auth/permission failures to a typed error, else None."""
+    if isinstance(exc, (anthropic.AuthenticationError, anthropic.PermissionDeniedError)):
+        return ExternalAuthError(
+            "anthropic",
+            f"Anthropic API auth failure — {exc}",
+            status=getattr(exc, "status_code", None),
+            reconnect_hint="check/rotate ANTHROPIC_API_KEY",
+        )
+    return None
+
+
 def _is_downshiftable(exc: Exception) -> bool:
     # Transient/capacity failures justify a one-step tier downshift.
     # Auth/bad-request (4xx except 429) must NOT downshift — a cheaper
@@ -116,6 +129,9 @@ def generate(prompt=None, *, tier=TaskComplexity.STANDARD, system=None,
     try:
         return _client.messages.create(**kwargs)
     except Exception as exc:
+        auth_err = _classify_auth(exc)
+        if auth_err is not None:
+            raise auth_err from exc
         if (allow_fallback and tier == TaskComplexity.DEEP
                 and _is_downshiftable(exc)):
             return _fallback(messages, system, tools, max_tokens, temperature,
@@ -206,6 +222,9 @@ def _fallback(messages, system, tools, max_tokens, temperature=None, timeout=Non
         try:
             return _client.messages.create(**kwargs)
         except Exception as exc:
+            auth_err = _classify_auth(exc)
+            if auth_err is not None:
+                raise auth_err from exc
             last_exc = exc
             if not _is_downshiftable(exc):
                 raise
@@ -248,6 +267,10 @@ def rerank(query: str, candidates: list[str], top_k=None):
         if top_k is not None:
             cleaned = cleaned[:top_k]
         return cleaned
+    except ExternalConnectionError:
+        # Auth/connection failures must not be silently swallowed into
+        # "original order" — the caller needs to know credentials are dead.
+        raise
     except Exception as exc:
         print(f"claude_client.rerank failed, using original order — {exc}")
         return list(range(n))

@@ -15,6 +15,7 @@ from calendar_service import (
 from tasks_service import fetch_open_tasks, format_tasks_for_context
 from gemini_service import generate_morning_briefing, generate_post_meeting_debrief
 from chat_service import send_chat_message, format_for_google_chat
+from connection_errors import ExternalAuthError
 from conversation_store import (
     add_turn,
     conversation_scope,
@@ -75,6 +76,26 @@ def _build_merge_suggestions_block() -> str:
     return "\n".join(lines)
 
 
+_AUTH_NOTICE_NAMES = {
+    "emails": "Gmail",
+    "meetings": "Google Calendar",
+    "tasks": "Google Tasks",
+    "granola": "Granola",
+    "jira": "Jira",
+    "nudges": "proactive intelligence",
+}
+
+
+def _build_auth_failure_notice(auth_failures: dict) -> str:
+    """One visible line per source whose credentials are dead."""
+    if not auth_failures:
+        return ""
+    return "\n".join(
+        f"⚠️ {_AUTH_NOTICE_NAMES.get(key, key)} connection needs re-auth"
+        for key in sorted(auth_failures)
+    )
+
+
 def run_morning_briefing(space_id: str | None = None, bg_tasks=None):
     """Full morning briefing pipeline.
     Fetches emails, meetings, tasks, Granola notes, and nudges in parallel."""
@@ -105,6 +126,9 @@ def run_morning_briefing(space_id: str | None = None, bg_tasks=None):
             ctx = format_granola_notes_for_context(raw_notes)
             print(f"     Granola notes loaded ({len(ctx)} chars)")
             return "granola", ctx
+        except ExternalAuthError as e:
+            print(f"     Granola AUTH failure: {e}")
+            return "granola", e
         except Exception as e:
             print(f"     Granola fetch failed: {e}")
             return "granola", ""
@@ -116,6 +140,9 @@ def run_morning_briefing(space_id: str | None = None, bg_tasks=None):
             ctx = format_jira_tickets_for_context(raw)
             print(f"     Jira tickets loaded ({len(ctx)} chars)")
             return "jira", ctx
+        except ExternalAuthError as e:
+            print(f"     Jira AUTH failure: {e}")
+            return "jira", e
         except Exception as e:
             print(f"     Jira fetch failed: {e}")
             return "jira", ""
@@ -146,13 +173,26 @@ def run_morning_briefing(space_id: str | None = None, bg_tasks=None):
             futures["nudges"] = pool.submit(_fetch_nudges)
 
     data = {}
+    auth_failures: dict[str, ExternalAuthError] = {}
     for key, future in futures.items():
         try:
             label, value = future.result(timeout=120)
-            data[label] = value
+        except ExternalAuthError as e:
+            # Source credentials expired — substitute empty data for rendering
+            # but record the failure so the briefing SAYS so (never silent).
+            print(f"  {key} AUTH failure: {e}")
+            auth_failures[key] = e
+            data[key] = [] if key in ("emails", "meetings", "tasks") else ""
+            continue
         except Exception as e:
             print(f"  Error fetching {key}: {e}")
             data[key] = [] if key in ("emails", "meetings", "tasks") else ""
+            continue
+        if isinstance(value, ExternalAuthError):
+            auth_failures[label] = value
+            data[label] = [] if label in ("emails", "meetings", "tasks") else ""
+        else:
+            data[label] = value
 
     emails = data.get("emails", [])
     meetings = data.get("meetings", [])
@@ -165,7 +205,9 @@ def run_morning_briefing(space_id: str | None = None, bg_tasks=None):
     if merge_ctx:
         nudges_ctx = f"{nudges_ctx}\n\n{merge_ctx}" if nudges_ctx else merge_ctx
 
-    if not emails and not meetings and not tasks and not granola_ctx and not jira_ctx and not nudges_ctx:
+    auth_notice = _build_auth_failure_notice(auth_failures)
+
+    if not emails and not meetings and not tasks and not granola_ctx and not jira_ctx and not nudges_ctx and not auth_notice:
         print("  Nothing to report. Skipping.")
         return {"status": "skipped", "reason": "nothing to report"}
 
@@ -185,6 +227,11 @@ def run_morning_briefing(space_id: str | None = None, bg_tasks=None):
         meeting_title="Morning Briefing",
         scope_id=pending_scope,
     )
+
+    if auth_notice:
+        # A source failed with dead credentials — say so visibly instead of
+        # silently rendering the briefing from substituted-empty data.
+        summary = f"{auth_notice}\n\n{summary}"
 
     if target_space:
         print("  Sending to Google Chat...")

@@ -22,6 +22,7 @@ from google.cloud.firestore_v1.vector import Vector
 
 import config
 from claude_client import TaskComplexity, extract_json, extract_text, generate
+from connection_errors import ExternalAuthError
 from conversation_store import get_db
 
 _kg_cache = TTLCache(maxsize=128, ttl=300)
@@ -51,14 +52,44 @@ def _build_embedding_text(entry: dict, source_type: str = "") -> str:
     return " | ".join(p for p in parts if p)
 
 
+def _is_gemini_auth_error(exc: Exception) -> bool:
+    """Classify google.api_core / genai auth failures (expired or invalid API
+    key, revoked access, missing permission) without hard dependencies."""
+    try:
+        from google.api_core import exceptions as gac_exceptions
+        if isinstance(exc, (gac_exceptions.Unauthenticated, gac_exceptions.PermissionDenied)):
+            return True
+    except ImportError:
+        pass
+    code = getattr(exc, "code", None)
+    if code in (401, 403):
+        return True
+    text = str(exc)
+    return any(marker in text for marker in (
+        "API key not valid", "API_KEY_INVALID", "UNAUTHENTICATED", "PERMISSION_DENIED",
+    ))
+
+
 def _get_embedding(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list[float]:
-    """Generate an embedding vector for a text string using Gemini."""
-    result = genai.embed_content(
-        model=config.GEMINI_EMBEDDING_MODEL,
-        content=text,
-        task_type=task_type,
-        output_dimensionality=config.GEMINI_EMBEDDING_DIM,
-    )
+    """Generate an embedding vector for a text string using Gemini.
+
+    Auth failures raise ExternalAuthError("gemini") so callers can distinguish
+    "credentials expired" from a transient embedding failure."""
+    try:
+        result = genai.embed_content(
+            model=config.GEMINI_EMBEDDING_MODEL,
+            content=text,
+            task_type=task_type,
+            output_dimensionality=config.GEMINI_EMBEDDING_DIM,
+        )
+    except Exception as exc:
+        if _is_gemini_auth_error(exc):
+            raise ExternalAuthError(
+                "gemini",
+                f"Gemini embedding auth failure — {exc}",
+                reconnect_hint="check/rotate GEMINI_API_KEY",
+            ) from exc
+        raise
     return result["embedding"]
 
 
@@ -291,6 +322,9 @@ def _run_extraction(source_type: str, source_title: str, content: str,
             return []
 
         return [e for e in parsed if isinstance(e, dict)]
+    except ExternalAuthError:
+        # Anthropic credentials expired — never swallow into "no entities".
+        raise
     except Exception as exc:
         print(f"Knowledge graph extraction failed: {exc}")
         return []
@@ -352,6 +386,11 @@ def _store_entries(entries: list[dict], source_type: str, source_id: str,
             text = _build_embedding_text(entry, source_type=source_type)
             doc["embedding"] = Vector(_get_embedding(text))
             doc["embedding_model"] = config.GEMINI_EMBEDDING_MODEL
+        except ExternalAuthError as exc:
+            # Ingestion keeps storing without vectors, but the auth failure is
+            # logged distinctly so it's never mistaken for a transient blip.
+            print(f"  Knowledge graph: EMBEDDING AUTH FAILURE ({exc}) — "
+                  "storing without vector; gemini credentials need attention")
         except Exception as exc:
             print(f"  Knowledge graph: embedding generation failed ({exc}), storing without")
         collection.add(doc)
@@ -864,6 +903,10 @@ def semantic_search(query: str, limit: int | None = None,
 
     try:
         query_embedding = _get_embedding(query, task_type="RETRIEVAL_QUERY")
+    except ExternalAuthError:
+        # Credentials expired — propagate so callers can't mistake this for
+        # "no knowledge found".
+        raise
     except Exception as exc:
         print(f"Knowledge graph: query embedding failed ({exc})")
         return []

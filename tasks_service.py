@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 _ISO_DATE_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}")
 
 from googleapiclient.discovery import build
-from google_auth import get_credentials
+from google_auth import get_credentials, is_google_auth_error, raise_if_google_auth_error
 
 
 def get_tasks_service():
@@ -17,7 +17,13 @@ def fetch_open_tasks():
     """Fetch all incomplete tasks across all task lists (parallel per list)."""
     svc = get_tasks_service()
 
-    lists_resp = svc.tasklists().list(maxResults=100).execute()
+    try:
+        lists_resp = svc.tasklists().list(maxResults=100).execute()
+    except Exception as e:
+        # Top-level listing: 401/403 raises typed so dead credentials never
+        # read as "no open tasks"; other failures propagate as before.
+        raise_if_google_auth_error(e, source="tasks_list")
+        raise
     task_lists = lists_resp.get("items", [])
 
     def _fetch_list(tl):
@@ -61,7 +67,12 @@ def fetch_open_tasks():
             try:
                 all_tasks.extend(future.result())
             except Exception as e:
-                print(f"Error fetching task list '{futures[future]}': {e}")
+                # Per-list failures: classify-then-continue — log auth
+                # distinctly but don't abort the whole listing.
+                if is_google_auth_error(e):
+                    print(f"Tasks AUTH FAILURE fetching list '{futures[future]}': {e}")
+                else:
+                    print(f"Error fetching task list '{futures[future]}': {e}")
 
     all_tasks.sort(key=lambda t: (
         not t["is_overdue"],
