@@ -56,6 +56,10 @@ from conversation_store import (
     clear_pending_task_actions,
     store_pending_task_actions,
     store_pending_task_actions_if_empty,
+    get_pending_jira_actions,
+    clear_pending_jira_actions,
+    store_pending_jira_actions_if_empty,
+    record_jira_write_audit,
     store_task_batch,
     get_task_batch,
     update_task_batch,
@@ -1776,10 +1780,54 @@ async def handle_message(ev: dict, background_tasks: BackgroundTasks) -> dict:
                 add_turn(approval_conversation_id, "assistant", reply)
                 return _make_response(reply, is_addon)
         else:
-            # No pending tasks — if the message is a bare approval/decline word,
-            # don't fall through to the agent (prevents phantom approval loops
-            # where the LLM hallucinates having queued a task).
-            if _check_pending_task_intent(lower):
+            # No pending TASK approval. A pending JIRA approval is mutually
+            # exclusive with tasks, so check it next on its dedicated path.
+            jira_pending, jira_scope_id = _get_pending_jira_request(
+                user_id, space or config.CHAT_SPACE_ID,
+            )
+            if jira_pending:
+                jira_conv_id = conversation_scope(
+                    user_id=user_id, space=space or config.CHAT_SPACE_ID,
+                )
+                parsed_jira = _parse_pending_jira_reply(lower, jira_pending["actions"])
+                if parsed_jira["intent"] == "needs_explicit":
+                    msg = (
+                        "that writes to Jira (your team will see it). reply "
+                        "*confirm jira* to apply, include a ticket key like "
+                        "*yes OSD-123* for just one, or *no* to cancel."
+                    )
+                    add_turn(jira_conv_id, "user", text)
+                    add_turn(jira_conv_id, "assistant", msg)
+                    return _make_response(msg, is_addon)
+                if parsed_jira["intent"] == "confirm":
+                    selected = parsed_jira["selected_indices"]
+                    selected_actions = [a for i, a in enumerate(jira_pending["actions"]) if i in selected]
+                    remaining_actions = [a for i, a in enumerate(jira_pending["actions"]) if i not in selected]
+                    target_space = space or config.CHAT_SPACE_ID
+                    # Race guard: clear selected actions from pending BEFORE
+                    # dispatch so a Chat 30s-deadline retry of this confirmation
+                    # can't double-apply a Jira write.
+                    clear_pending_jira_actions(jira_scope_id)
+                    if remaining_actions:
+                        store_pending_jira_actions_if_empty(
+                            remaining_actions, scope_id=jira_scope_id,
+                            approval_message=_build_jira_approval_block(remaining_actions),
+                        )
+                    add_turn(jira_conv_id, "user", text)
+                    background_tasks.add_task(
+                        _apply_pending_jira_actions_background,
+                        selected_actions, remaining_actions, target_space,
+                        jira_scope_id, jira_conv_id, text,
+                    )
+                    return _make_response("", is_addon)
+                if parsed_jira["intent"] == "decline":
+                    clear_pending_jira_actions(jira_scope_id)
+                    reply = "okay — canceled that Jira request."
+                    add_turn(jira_conv_id, "user", text)
+                    add_turn(jira_conv_id, "assistant", reply)
+                    return _make_response(reply, is_addon)
+                # intent None — not an approval reply; fall through to the agent.
+            elif _check_pending_task_intent(lower) or _check_pending_jira_intent(lower):
                 # A bare "yes"/"no" may instead be answering the agent's own
                 # clarifying question (nothing queued because it asked rather
                 # than acted). If the last assistant turn ended with "?", fall
@@ -1935,6 +1983,219 @@ def _apply_pending_task_actions_background(
             print(f"Failed to send error message: {e}")
 
 
+# ── Dedicated Jira write-approval flow ────────────────────────────────────────
+# Separate from the Google Tasks approval flow so a task "yes" can never apply a
+# Jira write. Safety rules (Oracle-reviewed): (a) a Jira and a task approval are
+# never pending at the same time; (b) a Jira write requires an explicit
+# Jira-scoped confirmation — a bare "yes" never fires one.
+
+_JIRA_WRITE_ACTIONS = {"create_jira", "comment_jira", "transition_jira"}
+_JIRA_DECLINE_WORDS = {
+    "no", "nope", "no thanks", "decline", "cancel", "cancel it", "skip",
+    "don't", "dont", "don't do it", "dont do it", "stop",
+}
+_JIRA_APPROVE_WORDS = {
+    "yes", "approve", "approved", "confirm", "confirmed", "ok", "okay",
+    "apply", "post", "go", "send", "ship",
+}
+_JIRA_APPROVE_PHRASES = {"go ahead", "do it", "ship it", "post it", "apply it", "send it"}
+_JIRA_TICKET_KEY_RE = re.compile(r"[a-z][a-z0-9]+-\d+")
+
+
+def _user_jira_scope(user_id: str, space: str) -> str:
+    """Scope pending Jira write approvals to the user in the current space."""
+    return f"user:{space or 'direct'}:{user_id}"
+
+
+def _get_pending_jira_request(user_id: str, space: str) -> tuple[dict | None, str | None]:
+    scope = _user_jira_scope(user_id, space)
+    pending = get_pending_jira_actions(scope_id=scope)
+    if pending:
+        return pending, scope
+    return None, None
+
+
+def _format_pending_jira_action(action: dict) -> str:
+    op = action.get("action", "")
+    if op == "create_jira":
+        return f"create *{action.get('project', '?')}* ticket: \"{action.get('summary', '')}\" ({action.get('issue_type', 'Task')})"
+    if op == "comment_jira":
+        return f"comment on *{action.get('key', '?')}*: \"{(action.get('comment') or '')[:80]}\""
+    if op == "transition_jira":
+        return f"move *{action.get('key', '?')}* → {action.get('transition', '?')}"
+    return f"{op} request"
+
+
+def _build_jira_approval_block(actions: list[dict]) -> str:
+    lines = ["🎫 *Approve these Jira changes* — ⚠️ these write to Jira and are visible to your team"]
+    lines.extend(f"  {idx}. {_format_pending_jira_action(a)}" for idx, a in enumerate(actions, start=1))
+    lines.append("")
+    lines.append(
+        "_This is NOT done yet. Reply *confirm jira* to apply"
+        + (" all of these" if len(actions) > 1 else "")
+        + ", or include a ticket key (e.g. *yes OSD-123*) to apply just that one. Reply *no* to cancel. "
+        "A plain \"yes\" will not apply a Jira change._"
+    )
+    return "\n".join(lines)
+
+
+def _append_jira_approval_block(response: str, actions: list[dict]) -> str:
+    block = _build_jira_approval_block(actions)
+    if not response:
+        return block
+    return f"{response.rstrip()}\n\n{block}"
+
+
+def _build_jira_conflict_reply(pending: dict) -> str:
+    return (
+        "you already have a pending Jira approval, so i didn't queue this new one.\n\n"
+        "reply *confirm jira* to apply it or *no* to cancel, then resend.\n\n"
+        f"{_build_jira_approval_block(pending['actions'])}"
+    )
+
+
+def _check_pending_jira_intent(lower: str) -> bool:
+    """True if the message is shaped like a Jira approval/decline reply.
+
+    Used by the phantom-approval guard so a stray "confirm jira" with nothing
+    pending doesn't fall through to the agent and risk a hallucinated write.
+    """
+    normalized = re.sub(r"\s+", " ", lower).strip().rstrip(".,!?")
+    if normalized in _JIRA_DECLINE_WORDS:
+        return True
+    tokens = set(normalized.split())
+    has_approve = bool(_JIRA_APPROVE_WORDS & tokens) or normalized in _JIRA_APPROVE_PHRASES
+    has_jira = "jira" in tokens
+    has_key = bool(_JIRA_TICKET_KEY_RE.search(normalized))
+    return has_approve and (has_jira or has_key)
+
+
+def _parse_pending_jira_reply(lower: str, actions: list[dict]) -> dict:
+    """Classify a reply to a pending Jira approval.
+
+    Returns intent: "confirm" | "decline" | "needs_explicit" | None.
+    SAFETY (rule b): a bare "yes"/"approve" returns "needs_explicit" — it never
+    confirms. Confirmation requires the word "jira" or a matching ticket key.
+    """
+    normalized = re.sub(r"\s+", " ", lower).strip().rstrip(".,!?")
+    if normalized in _JIRA_DECLINE_WORDS:
+        return {"intent": "decline", "selected_indices": set(range(len(actions)))}
+
+    tokens = set(normalized.split())
+    has_approve = bool(_JIRA_APPROVE_WORDS & tokens) or normalized in _JIRA_APPROVE_PHRASES
+    has_jira = "jira" in tokens
+    keys = {k.lower() for k in _JIRA_TICKET_KEY_RE.findall(normalized)}
+    matched = {i for i, a in enumerate(actions) if (a.get("key") or "").lower() in keys}
+
+    if has_approve and matched:
+        return {"intent": "confirm", "selected_indices": matched}
+    if has_approve and has_jira:
+        return {"intent": "confirm", "selected_indices": set(range(len(actions)))}
+    if has_approve:
+        # Bare approval without a Jira-scoped token — refuse, keep pending.
+        return {"intent": "needs_explicit", "selected_indices": set()}
+    return {"intent": None, "selected_indices": set()}
+
+
+def _route_jira_pending(response: str, jira_actions: list[dict], user_id: str, space: str) -> str:
+    """Queue Jira write actions behind the dedicated approval flow.
+
+    Enforces mutual exclusion (rule a): if a task approval is already pending,
+    the Jira request is not queued.
+    """
+    task_scope = _user_task_scope(user_id, space)
+    if get_pending_task_actions(scope_id=task_scope):
+        return (
+            (response.rstrip() + "\n\n" if response else "")
+            + "heads up — you've got a pending Google Tasks approval. reply to that "
+            "first, then resend your Jira request."
+        )
+    jira_scope = _user_jira_scope(user_id, space)
+    approval = _append_jira_approval_block(response, jira_actions)
+    if store_pending_jira_actions_if_empty(jira_actions, scope_id=jira_scope, approval_message=approval):
+        return approval
+    existing = get_pending_jira_actions(scope_id=jira_scope)
+    if existing:
+        return _build_jira_conflict_reply(existing)
+    return "sorry, something went wrong queueing that Jira change — try again?"
+
+
+def _apply_pending_jira_actions_background(
+    pending_actions, remaining_actions, space, scope_id, conversation_id=None,
+    confirmation_text="",
+):
+    """Apply approved Jira write actions and report back.
+
+    Only invoked after explicit Jira-scoped approval. An allow-list assertion
+    rejects any non-Jira action that somehow reached here, and every executed
+    write is recorded to the audit log with the confirmation the user typed.
+    """
+    from jira_service import add_jira_comment, create_jira_ticket, transition_jira_ticket
+    try:
+        results, errors = [], []
+        for action in pending_actions:
+            op = action.get("action", "")
+            if op not in _JIRA_WRITE_ACTIONS:
+                errors.append(f"refused unknown action '{op}'")
+                continue
+            try:
+                if op == "create_jira":
+                    res = create_jira_ticket(
+                        project_key=action["project"],
+                        summary=action["summary"],
+                        description=action.get("description", ""),
+                        issue_type=action.get("issue_type", "Task"),
+                        priority=action.get("priority"),
+                    )
+                    label = f"{action['project']} ticket"
+                elif op == "comment_jira":
+                    res = add_jira_comment(action["key"], action["comment"])
+                    label = f"comment on {action['key']}"
+                else:
+                    res = transition_jira_ticket(action["key"], action["transition"])
+                    label = f"{action['key']} → {action['transition']}"
+
+                if res.get("success"):
+                    url = res.get("url", "")
+                    key = res.get("key", "")
+                    results.append(f"{label}" + (f" → <{url}|{key}>" if url else ""))
+                else:
+                    errors.append(f"{label}: {res.get('error', 'failed')}")
+                record_jira_write_audit({
+                    "action": op,
+                    "args": {k: v for k, v in action.items() if k != "action"},
+                    "result": res,
+                    "scope_id": scope_id,
+                    "confirmation_text": confirmation_text,
+                })
+            except Exception as e:
+                errors.append(f"{op}: {str(e)}")
+
+        lines = []
+        if results:
+            lines.append(f"✅ *{len(results)} Jira change(s) applied:*")
+            lines.extend(f"  • {r}" for r in results)
+        if errors:
+            lines.append(f"🔴 *{len(errors)} failed:*")
+            lines.extend(f"  • {e}" for e in errors)
+        if remaining_actions:
+            lines.append("")
+            lines.append(_build_jira_approval_block(remaining_actions))
+        reply = "\n".join(lines) if lines else "No Jira changes were applied."
+        send_chat_message(space, format_for_google_chat(reply))
+        if conversation_id:
+            add_turn(conversation_id, "assistant", reply)
+    except Exception as e:
+        traceback.print_exc()
+        try:
+            err = f"sorry, something went wrong applying that Jira request: {str(e)}"
+            send_chat_message(space, err)
+            if conversation_id:
+                add_turn(conversation_id, "assistant", err)
+        except Exception:
+            print(f"Failed to send Jira error message: {e}")
+
+
 def _transcribe_voice_message(audio_attachments, existing_text, space):
     """Voice transcription is currently unsupported (Claude has no audio
     input). If text accompanies the audio, process the text and drop the
@@ -1966,25 +2227,35 @@ def _process_message_background(text, user_id, space, audio_attachments=None):
 
         if config.AGENTIC_MODE_ENABLED:
             from agent import run_agent_loop
+            jira_sink: list[dict] = []
             response, pending_task_actions = run_agent_loop(
-                text, history, thread_id=conversation_id, user_id=user_id
+                text, history, thread_id=conversation_id, user_id=user_id,
+                jira_actions_sink=jira_sink,
             )
-            if pending_task_actions:
+            if jira_sink:
+                response = _route_jira_pending(
+                    _strip_llm_approval_block(response), jira_sink, user_id, space,
+                )
+            elif pending_task_actions:
                 response = _strip_llm_approval_block(response)
                 pending_scope_id = _user_task_scope(user_id, space)
-                approval_response = _append_task_approval_block(response, pending_task_actions)
-                if store_pending_task_actions_if_empty(
-                    pending_task_actions,
-                    scope_id=pending_scope_id,
-                    approval_message=approval_response,
-                ):
-                    response = approval_response
+                jira_block = get_pending_jira_actions(scope_id=_user_jira_scope(user_id, space))
+                if jira_block:
+                    response = _build_jira_conflict_reply(jira_block)
                 else:
-                    existing_pending = get_pending_task_actions(scope_id=pending_scope_id)
-                    if existing_pending:
-                        response = _build_pending_conflict_reply(existing_pending)
+                    approval_response = _append_task_approval_block(response, pending_task_actions)
+                    if store_pending_task_actions_if_empty(
+                        pending_task_actions,
+                        scope_id=pending_scope_id,
+                        approval_message=approval_response,
+                    ):
+                        response = approval_response
                     else:
-                        response = "sorry, something went wrong queueing that task change — try again?"
+                        existing_pending = get_pending_task_actions(scope_id=pending_scope_id)
+                        if existing_pending:
+                            response = _build_pending_conflict_reply(existing_pending)
+                        else:
+                            response = "sorry, something went wrong queueing that task change — try again?"
         else:
             context_data = _build_context(text)
             response = chat_response(text, history, context_data, thread_id=conversation_id)
@@ -2078,9 +2349,20 @@ def _process_message_sync(text, user_id, space, history, background_tasks, is_ad
         return _make_response(response, is_addon)
 
     from agent import run_agent_loop
+    jira_sink: list[dict] = []
     response, actions = run_agent_loop(
-        text, history, thread_id=conversation_id, user_id=user_id
+        text, history, thread_id=conversation_id, user_id=user_id,
+        jira_actions_sink=jira_sink,
     )
+
+    if jira_sink:
+        response = _route_jira_pending(
+            _strip_llm_approval_block(response), jira_sink, user_id, space,
+        )
+        add_turn(conversation_id, "user", text)
+        add_turn(conversation_id, "assistant", response)
+        _queue_kg(background_tasks, text, user_id)
+        return _make_response(response, is_addon)
 
     create_only = bool(actions) and all(a.get("action") == "create" for a in actions)
 
@@ -2100,17 +2382,21 @@ def _process_message_sync(text, user_id, space, history, background_tasks, is_ad
         # approval flow (only a pure-create turn becomes a card).
         response = _strip_llm_approval_block(response)
         pending_scope_id = _user_task_scope(user_id, space)
-        approval_response = _append_task_approval_block(response, actions)
-        if store_pending_task_actions_if_empty(
-            actions, scope_id=pending_scope_id, approval_message=approval_response
-        ):
-            response = approval_response
+        jira_block = get_pending_jira_actions(scope_id=_user_jira_scope(user_id, space))
+        if jira_block:
+            response = _build_jira_conflict_reply(jira_block)
         else:
-            existing_pending = get_pending_task_actions(scope_id=pending_scope_id)
-            if existing_pending:
-                response = _build_pending_conflict_reply(existing_pending)
+            approval_response = _append_task_approval_block(response, actions)
+            if store_pending_task_actions_if_empty(
+                actions, scope_id=pending_scope_id, approval_message=approval_response
+            ):
+                response = approval_response
             else:
-                response = "sorry, something went wrong queueing that task change — try again?"
+                existing_pending = get_pending_task_actions(scope_id=pending_scope_id)
+                if existing_pending:
+                    response = _build_pending_conflict_reply(existing_pending)
+                else:
+                    response = "sorry, something went wrong queueing that task change — try again?"
         add_turn(conversation_id, "user", text)
         add_turn(conversation_id, "assistant", response)
         _queue_kg(background_tasks, text, user_id)
