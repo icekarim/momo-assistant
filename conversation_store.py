@@ -293,6 +293,90 @@ def clear_pending_task_actions(scope_id="latest"):
     ).delete()
 
 
+# ── Pending Jira write actions (dedicated, separate from tasks) ────────────────
+# Jira writes mutate shared team data, so they get their own pending store and a
+# separate confirmation path. Kept apart from pending_task_proposals so a task
+# "yes" can never approve a Jira write and vice versa.
+
+_JIRA_WRITE_ACTIONS = {"create_jira", "comment_jira", "transition_jira"}
+
+
+def _pending_jira_doc_id(scope_id: str = "latest") -> str:
+    if not scope_id or scope_id == "latest":
+        return "latest"
+    return _safe_doc_id(scope_id)
+
+
+def store_pending_jira_actions_if_empty(actions, scope_id="latest", approval_message=""):
+    """Create a pending Jira request only if the scope has no live Jira request."""
+    db = get_db()
+    doc_ref = db.collection(config.FIRESTORE_PENDING_JIRA_COLLECTION).document(
+        _pending_jira_doc_id(scope_id)
+    )
+    payload = {
+        "actions": actions,
+        "approval_message": approval_message,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        doc_ref.create(payload)
+        return True
+    except Exception:
+        if get_pending_jira_actions(scope_id=scope_id):
+            return False
+        doc_ref.set(payload)
+        return True
+
+
+def get_pending_jira_actions(scope_id="latest"):
+    """Retrieve pending Jira actions for a scope, or None if none/expired (24h)."""
+    db = get_db()
+    doc = db.collection(config.FIRESTORE_PENDING_JIRA_COLLECTION).document(
+        _pending_jira_doc_id(scope_id)
+    ).get()
+    if not doc.exists:
+        return None
+    data = doc.to_dict()
+    created = data.get("created_at", "")
+    if created:
+        try:
+            created_dt = datetime.fromisoformat(created)
+            age_hours = (datetime.now(timezone.utc) - created_dt).total_seconds() / 3600
+            if age_hours > 24:
+                clear_pending_jira_actions(scope_id)
+                return None
+        except (ValueError, TypeError):
+            pass
+
+    actions = [
+        a for a in (data.get("actions") or [])
+        if isinstance(a, dict) and a.get("action") in _JIRA_WRITE_ACTIONS
+    ]
+    if not actions:
+        return None
+    return {"actions": actions, "approval_message": data.get("approval_message", "")}
+
+
+def clear_pending_jira_actions(scope_id="latest"):
+    """Remove pending Jira actions after they've been approved or canceled."""
+    db = get_db()
+    db.collection(config.FIRESTORE_PENDING_JIRA_COLLECTION).document(
+        _pending_jira_doc_id(scope_id)
+    ).delete()
+
+
+def record_jira_write_audit(entry: dict) -> None:
+    """Append an immutable audit record of an executed (approved) Jira write."""
+    try:
+        db = get_db()
+        db.collection(config.FIRESTORE_JIRA_AUDIT_COLLECTION).add({
+            **entry,
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as exc:
+        print(f"Jira audit log write failed: {exc}")
+
+
 # ── Inbound-message idempotency guard ─────────────────────────────────────────
 # Google Chat retries the webhook when the synchronous agent loop exceeds its 30s
 # deadline; the retry would otherwise re-run the whole loop and duplicate its

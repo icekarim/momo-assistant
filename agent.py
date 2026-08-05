@@ -231,6 +231,57 @@ def _build_optional_tools() -> list:
             }),
         ))
 
+        if config.JIRA_WRITE_ENABLED:
+            extra_decls.append(_tool(
+                name="create_jira_ticket",
+                description=(
+                    "Propose creating a new Jira ticket. This does NOT create the "
+                    "ticket — it queues it for the user's explicit approval. The user "
+                    "must confirm before anything is written to Jira."
+                ),
+                parameters=_schema({
+                    "type": "object",
+                    "properties": {
+                        "project": {"type": "string", "description": "Jira project key, e.g. OSD"},
+                        "summary": {"type": "string", "description": "Ticket title/summary"},
+                        "description": {"type": "string", "description": "Ticket description (optional)"},
+                        "issue_type": {"type": "string", "description": "Issue type, e.g. Task, Bug, Story (default Task)"},
+                        "priority": {"type": "string", "description": "Priority name (optional)"},
+                    },
+                    "required": ["project", "summary"],
+                }),
+            ))
+            extra_decls.append(_tool(
+                name="comment_jira_ticket",
+                description=(
+                    "Propose adding a comment to a Jira ticket. This does NOT post the "
+                    "comment — it queues it for the user's explicit approval."
+                ),
+                parameters=_schema({
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string", "description": "Jira issue key, e.g. OSD-123"},
+                        "comment": {"type": "string", "description": "Comment text"},
+                    },
+                    "required": ["key", "comment"],
+                }),
+            ))
+            extra_decls.append(_tool(
+                name="transition_jira_ticket",
+                description=(
+                    "Propose changing a Jira ticket's status. This does NOT change the "
+                    "status — it queues it for the user's explicit approval."
+                ),
+                parameters=_schema({
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string", "description": "Jira issue key, e.g. OSD-123"},
+                        "transition": {"type": "string", "description": "Target status or transition name, e.g. 'In Progress', 'Done'"},
+                    },
+                    "required": ["key", "transition"],
+                }),
+            ))
+
     if config.USER_MEMORY_ENABLED:
         extra_decls.append(_tool(
             name="remember_this",
@@ -314,7 +365,8 @@ def _get_all_tools() -> list:
 
 @traceable(run_type="tool", name="agent-tool")
 def execute_tool(name: str, args: dict, pending_task_actions: list[dict] | None = None,
-                 user_id: str | None = None, user_message: str | None = None) -> str:
+                 user_id: str | None = None, user_message: str | None = None,
+                 pending_jira_actions: list[dict] | None = None) -> str:
     """Dispatch a tool call to the appropriate service function.
 
     Returns a string result for the agent to consume, or an error message.
@@ -322,7 +374,8 @@ def execute_tool(name: str, args: dict, pending_task_actions: list[dict] | None 
     t0 = time.time()
     try:
         result = _dispatch(name, args, pending_task_actions=pending_task_actions,
-                           user_id=user_id, user_message=user_message)
+                           user_id=user_id, user_message=user_message,
+                           pending_jira_actions=pending_jira_actions)
         elapsed = time.time() - t0
         print(f"[agent] tool '{name}': {elapsed:.2f}s ({len(result)} chars)")
         return result
@@ -333,7 +386,8 @@ def execute_tool(name: str, args: dict, pending_task_actions: list[dict] | None 
 
 
 def _dispatch(name: str, args: dict, pending_task_actions: list[dict] | None = None,
-              user_id: str | None = None, user_message: str | None = None) -> str:
+              user_id: str | None = None, user_message: str | None = None,
+              pending_jira_actions: list[dict] | None = None) -> str:
     """Route a tool call to the correct service function."""
 
     if name == "get_todays_calendar":
@@ -414,6 +468,29 @@ def _dispatch(name: str, args: dict, pending_task_actions: list[dict] | None = N
     if name == "search_jira_tickets":
         from jira_service import search_jira_tickets
         return search_jira_tickets(args["query"]) or "No matching Jira tickets found."
+
+    if name == "create_jira_ticket":
+        action = {"action": "create_jira", "project": args["project"], "summary": args["summary"]}
+        if args.get("description"):
+            action["description"] = args["description"]
+        action["issue_type"] = args.get("issue_type") or "Task"
+        if args.get("priority"):
+            action["priority"] = args["priority"]
+        if pending_jira_actions is not None:
+            pending_jira_actions.append(action)
+        return json.dumps({"status": "pending_approval", "action": action})
+
+    if name == "comment_jira_ticket":
+        action = {"action": "comment_jira", "key": args["key"], "comment": args["comment"]}
+        if pending_jira_actions is not None:
+            pending_jira_actions.append(action)
+        return json.dumps({"status": "pending_approval", "action": action})
+
+    if name == "transition_jira_ticket":
+        action = {"action": "transition_jira", "key": args["key"], "transition": args["transition"]}
+        if pending_jira_actions is not None:
+            pending_jira_actions.append(action)
+        return json.dumps({"status": "pending_approval", "action": action})
 
     if name == "remember_this":
         from user_memory import add_memory
@@ -751,14 +828,17 @@ def _flush_trace_metrics(metrics: dict, t0: float):
 def run_agent_loop(user_message: str, conversation_history: list[dict],
                    max_iterations: int = 6,
                    thread_id: str | None = None,
-                   user_id: str | None = None) -> tuple[str, list[dict]]:
+                   user_id: str | None = None,
+                   jira_actions_sink: list[dict] | None = None) -> tuple[str, list[dict]]:
     """Run the agentic tool-use loop.
 
     Sends the user message to Claude with tool declarations.  If Claude
     responds with tool calls, executes them and sends results back.
     Repeats until Claude produces a text response or max_iterations is hit.
 
-    Returns the final text response and any queued task actions.
+    Returns the final text response and any queued TASK actions. Queued JIRA
+    write actions are appended to jira_actions_sink (if provided) and kept on a
+    SEPARATE list so a task approval can never apply a Jira write.
     """
     if thread_id:
         set_trace_metadata(thread_id=thread_id)
@@ -789,6 +869,7 @@ def run_agent_loop(user_message: str, conversation_history: list[dict],
     }
 
     pending_task_actions: list[dict] = []
+    pending_jira_actions: list[dict] = jira_actions_sink if jira_actions_sink is not None else []
     parent_run_tree = _get_run_tree()
 
     def _dispatch_tool(name, tool_input):
@@ -802,7 +883,8 @@ def run_agent_loop(user_message: str, conversation_history: list[dict],
                 except (ImportError, AttributeError):
                     pass
             return execute_tool(name, tool_input, pending_task_actions,
-                                user_id=user_id, user_message=user_message)
+                                user_id=user_id, user_message=user_message,
+                                pending_jira_actions=pending_jira_actions)
 
         _tool_t0 = time.time()
         try:
