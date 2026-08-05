@@ -49,4 +49,7 @@ export CHAT_SPACE_ID="spaces/XXXXXXXXX"
   <Step title="Granola token keepalive">
     Create a Cloud Scheduler job: `POST https://<url>/granola-token-refresh` — every 4 hours
   </Step>
+  <Step title="Nightly evals (optional)">
+    If Langfuse is configured, create a Cloud Scheduler job: `POST https://<url>/run-evals` — daily. Runs the LLM-as-judge suite against the golden dataset and records results as a Langfuse experiment.
+  </Step>
 </Steps>
