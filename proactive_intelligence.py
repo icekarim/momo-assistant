@@ -12,6 +12,7 @@ Coordinator functions:
 """
 
 import hashlib
+import re
 import traceback
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -116,9 +117,86 @@ Write a short pre-meeting prep (3-6 bullet points max). Include:
 - Relevant decisions or blockers from previous meetings
 - Anything the user should be prepared to discuss
 
+Relevance rules:
+- Only include context clearly connected to the non-owner attendees or this meeting's stated topic.
+- Ignore context connected only to the user themselves — their own unrelated projects and history do not belong in this prep.
+- Prefer recent information, and always show the date for anything older than ~3 months.
+- For intro meetings, or attendees with no history, say plainly that there's no prior context — never pad the brief with unrelated projects.
+
 If there's very little context, just say so briefly — don't pad it out.
 Format for Google Chat: use *bold* for names and topics, bullet points for items.
 Do NOT write a header or title line — output only the bullet points (and an optional short closing line)."""
+
+
+def _name_tokens(name: str) -> set[str]:
+    """Lowercase alphanumeric tokens of a name. For emails only the local part
+    is tokenized (domains like 'gmail.com' would cause false owner matches)."""
+    local = name.split("@", 1)[0] if "@" in name else name
+    return {t for t in re.findall(r"[a-z0-9]+", local.lower()) if len(t) >= 2}
+
+
+def _owner_identity_tokens() -> set[str]:
+    """Token set identifying the owner: OWNER_NAME plus any canonical aliases
+    identity resolution knows about. Empty set when OWNER_NAME is unset."""
+    owner = (config.OWNER_NAME or "").strip()
+    if not owner:
+        return set()
+    names = [owner]
+    try:
+        names.extend(get_canonical_aliases(owner))
+    except Exception as exc:
+        print(f"    Owner alias lookup failed: {exc}")
+    tokens: set[str] = set()
+    for candidate in names:
+        tokens.update(_name_tokens(candidate))
+    return tokens
+
+
+def _matches_owner(name: str, owner_tokens: set[str]) -> bool:
+    """Case-insensitive token overlap with the owner's identity
+    (e.g. 'Karim' matches owner 'Karim X')."""
+    return bool(owner_tokens) and bool(_name_tokens(name) & owner_tokens)
+
+
+def _entry_within_cutoff(entry: dict, cutoff: datetime) -> bool:
+    """True if the entry's source_date is on/after the cutoff. Entries with a
+    missing or unparseable source_date are KEPT (don't over-filter)."""
+    from knowledge_graph import _parse_source_date
+    entry_dt = _parse_source_date(entry.get("source_date"))
+    if entry_dt is None:
+        return True
+    return entry_dt >= cutoff
+
+
+def _rerank_prep_entries(entries: list[dict], title: str,
+                         attendee_names: list[str]) -> list[dict]:
+    """Rerank the merged KG context (person + semantic + project fan-out)
+    against THIS meeting — title plus non-owner attendees. The reranker drops
+    entries it judges irrelevant; on any failure the unreranked list is
+    returned (graceful fallback, mirrors semantic_search)."""
+    if not config.RERANK_ENABLED or len(entries) <= 1:
+        return entries
+
+    query = (
+        f"Upcoming meeting: {title}. Attendees: {', '.join(attendee_names)}. "
+        "Keep only entries plausibly relevant to THIS meeting and its "
+        "non-owner attendees; drop entries about unrelated people or projects."
+    )
+    texts = []
+    for e in entries:
+        people = ", ".join(e.get("related_people", []))
+        projects = ", ".join(e.get("related_projects", []))
+        texts.append(
+            f"[{e.get('source_date', '?')}] {e.get('name', '')}: {e.get('content', '')}"
+            f" (people: {people}; projects: {projects})"
+        )
+    try:
+        from claude_client import rerank as _rerank
+        order = _rerank(query, texts)
+        return [entries[i] for i in order]
+    except Exception as exc:
+        print(f"    KG context rerank failed, using unreranked list: {exc}")
+        return entries
 
 
 def _build_meeting_prep(meeting: dict) -> str | None:
@@ -131,41 +209,72 @@ def _build_meeting_prep(meeting: dict) -> str | None:
     seen_ids = set()
     title = meeting.get("title", "")
 
+    # Recency window: KG entries older than this are stale for meeting prep.
+    cutoff_dt = (
+        datetime.now() - timedelta(days=config.MEETING_PREP_CONTEXT_MAX_AGE_DAYS)
+    ).replace(hour=0, minute=0, second=0, microsecond=0)
+    cutoff_str = cutoff_dt.strftime("%Y-%m-%d")
+
+    # The prep is FOR the owner — their own KG trail is noise here. Drop any
+    # attendee (or alias below) whose name overlaps the owner's identity.
+    owner_tokens = _owner_identity_tokens()
+    non_owner_attendees: list[str] = []
+    for attendee in attendee_names:
+        if _matches_owner(attendee, owner_tokens):
+            print(f"    Meeting prep: dropping owner attendee '{attendee}' from KG retrieval")
+        else:
+            non_owner_attendees.append(attendee)
+
     # Expand each attendee with their canonical aliases. get_canonical_aliases
     # returns [] when KG_RESOLUTION_ENABLED is off, so query_names equals the
     # attendee set then — a no-op. Deduped by normalized form.
     query_names: list[str] = []
+    query_attendee: dict[str, str] = {}  # query name -> base attendee
     seen_query: set[str] = set()
-    for attendee in attendee_names:
+    for attendee in non_owner_attendees:
         for candidate in [attendee, *get_canonical_aliases(attendee)]:
             normalized = candidate.strip().lower()
-            if normalized and normalized not in seen_query:
-                seen_query.add(normalized)
-                query_names.append(candidate)
+            if not normalized or normalized in seen_query:
+                continue
+            if _matches_owner(candidate, owner_tokens):
+                print(f"    Meeting prep: dropping owner alias '{candidate}' from KG retrieval")
+                continue
+            seen_query.add(normalized)
+            query_names.append(candidate)
+            query_attendee[candidate] = attendee
 
     # Query KG in parallel: by each attendee AND by meeting title (semantic search)
+    attendees_with_context: set[str] = set()
     from knowledge_graph import semantic_search as _semantic_search
     workers = max(len(query_names) + 1, 4)
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        person_futures = {
-            pool.submit(query_by_person, name, None, 8): f"person:{name}"
+        futures: dict = {
+            pool.submit(query_by_person, name, cutoff_str, 8): ("person", name)
             for name in query_names
         }
         # Also search by meeting title to catch topic-based KG entries.
-        # rerank=True: async/background path, so the ~3s reranking latency is
-        # an acceptable trade for better precision (live chat leaves it off).
-        title_future = pool.submit(lambda: _semantic_search(title, limit=10, rerank=True))
-        person_futures[title_future] = f"title:{title}"
+        # rerank=False: the merged set (person + semantic + project fan-out)
+        # is reranked ONCE below against title + attendees — reranking here
+        # too would double the latency for no precision gain.
+        title_future = pool.submit(lambda: _semantic_search(title, limit=10, rerank=False))
+        futures[title_future] = ("title", title)
 
-        for future in as_completed(person_futures):
-            label = person_futures[future]
+        for future in as_completed(futures):
+            kind, name = futures[future]
             try:
                 for entry in future.result():
+                    # semantic_search has no date awareness (embeddings omit
+                    # source_date) — post-filter stale entries; undated kept.
+                    if kind == "title" and not _entry_within_cutoff(entry, cutoff_dt):
+                        continue
+                    if kind == "person":
+                        base_attendee = query_attendee.get(name)
+                        attendees_with_context.add(base_attendee if base_attendee else name)
                     if entry["id"] not in seen_ids:
                         seen_ids.add(entry["id"])
                         all_entries.append(entry)
             except Exception as exc:
-                print(f"    KG query failed ({label}): {exc}")
+                print(f"    KG query failed ({kind}:{name}): {exc}")
 
     # Also query by projects found in existing results
     projects = set()
@@ -176,7 +285,7 @@ def _build_meeting_prep(meeting: dict) -> str | None:
     if project_list:
         with ThreadPoolExecutor(max_workers=len(project_list)) as pool:
             proj_futures = {
-                pool.submit(query_by_project, proj, None, 5): proj
+                pool.submit(query_by_project, proj, cutoff_str, 5): proj
                 for proj in project_list
             }
             for future in as_completed(proj_futures):
@@ -188,13 +297,29 @@ def _build_meeting_prep(meeting: dict) -> str | None:
                 except Exception as exc:
                     print(f"    KG project query failed: {exc}")
 
+    # Rerank the merged, deduped set against THIS meeting so context that is
+    # merely owner-adjacent (old unrelated projects) gets dropped.
+    all_entries = _rerank_prep_entries(
+        all_entries, title, non_owner_attendees or attendee_names
+    )
+
     attendees_str = ", ".join(attendee_names)
+
+    # Per-attendee gaps must be explicit — otherwise sparse attendees get
+    # silently padded with other attendees' (or the owner's) context.
+    missing_context_notes = [
+        f"(No prior context found for {attendee}.)"
+        for attendee in non_owner_attendees
+        if attendee not in attendees_with_context
+    ]
 
     if not all_entries:
         # No KG context — generate a minimal prep with just attendee + time info
         knowledge_context = "(No prior context found for these attendees or topics.)"
     else:
         knowledge_context = format_knowledge_for_context(all_entries[:20])
+        if missing_context_notes:
+            knowledge_context += "\n" + "\n".join(missing_context_notes)
 
     prompt = _PREP_PROMPT.format(
         title=meeting["title"],
