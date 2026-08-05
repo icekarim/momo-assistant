@@ -8,12 +8,12 @@ set -e
 #   export CHAT_SPACE_ID="spaces/XXXXXXXXX"
 PROJECT_ID="${PROJECT_ID:?PROJECT_ID env var is required}"
 GEMINI_API_KEY="${GEMINI_API_KEY:?GEMINI_API_KEY env var is required}"
-ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-$(grep '^ANTHROPIC_API_KEY=' .env 2>/dev/null | cut -d= -f2)}"
+ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-$(grep '^ANTHROPIC_API_KEY=' .env 2>/dev/null | cut -d= -f2-)}"
 if [ -z "$ANTHROPIC_API_KEY" ]; then
   echo "ERROR: ANTHROPIC_API_KEY is required (all LLM generation runs on Claude)." >&2
   exit 1
 fi
-CHAT_SPACE_ID="${CHAT_SPACE_ID:-$(grep '^CHAT_SPACE_ID=' .env 2>/dev/null | cut -d= -f2)}"
+CHAT_SPACE_ID="${CHAT_SPACE_ID:-$(grep '^CHAT_SPACE_ID=' .env 2>/dev/null | cut -d= -f2-)}"
 if [ -z "$CHAT_SPACE_ID" ]; then
   echo "WARNING: CHAT_SPACE_ID is not set. Briefings will print to console only."
 fi
@@ -85,13 +85,13 @@ GOOGLE_TOKEN_JSON="${GOOGLE_TOKEN_JSON:-$(cat token.json 2>/dev/null || echo "")
 GRANOLA_TOKEN_JSON=$(cat granola_token.json 2>/dev/null || echo "")
 
 # Build and deploy in one step
-JIRA_ENABLED="${JIRA_ENABLED:-$(grep '^JIRA_ENABLED=' .env 2>/dev/null | cut -d= -f2)}"
-JIRA_SITE_URL="${JIRA_SITE_URL:-$(grep '^JIRA_SITE_URL=' .env 2>/dev/null | cut -d= -f2)}"
-JIRA_USER_EMAIL="${JIRA_USER_EMAIL:-$(grep '^JIRA_USER_EMAIL=' .env 2>/dev/null | cut -d= -f2)}"
-JIRA_API_TOKEN="${JIRA_API_TOKEN:-$(grep '^JIRA_API_TOKEN=' .env 2>/dev/null | cut -d= -f2)}"
-JIRA_WRITE_ENABLED="${JIRA_WRITE_ENABLED:-$(grep '^JIRA_WRITE_ENABLED=' .env 2>/dev/null | cut -d= -f2)}"
-LANGSMITH_API_KEY="${LANGSMITH_API_KEY:-$(grep '^LANGSMITH_API_KEY=' .env 2>/dev/null | cut -d= -f2)}"
-MOMO_API_SECRET="${MOMO_API_SECRET:-$(grep '^MOMO_API_SECRET=' .env 2>/dev/null | cut -d= -f2)}"
+JIRA_ENABLED="${JIRA_ENABLED:-$(grep '^JIRA_ENABLED=' .env 2>/dev/null | cut -d= -f2-)}"
+JIRA_SITE_URL="${JIRA_SITE_URL:-$(grep '^JIRA_SITE_URL=' .env 2>/dev/null | cut -d= -f2-)}"
+JIRA_USER_EMAIL="${JIRA_USER_EMAIL:-$(grep '^JIRA_USER_EMAIL=' .env 2>/dev/null | cut -d= -f2-)}"
+JIRA_API_TOKEN="${JIRA_API_TOKEN:-$(grep '^JIRA_API_TOKEN=' .env 2>/dev/null | cut -d= -f2-)}"
+JIRA_WRITE_ENABLED="${JIRA_WRITE_ENABLED:-$(grep '^JIRA_WRITE_ENABLED=' .env 2>/dev/null | cut -d= -f2-)}"
+LANGSMITH_API_KEY="${LANGSMITH_API_KEY:-$(grep '^LANGSMITH_API_KEY=' .env 2>/dev/null | cut -d= -f2-)}"
+MOMO_API_SECRET="${MOMO_API_SECRET:-$(grep '^MOMO_API_SECRET=' .env 2>/dev/null | cut -d= -f2-)}"
 
 # Get existing URL for MOMO_SERVICE_URL (pre-deploy for first-time, updated post-deploy)
 EXISTING_URL=$(gcloud run services describe $SERVICE_NAME --region=$REGION --format='value(status.url)' 2>/dev/null || echo "")
