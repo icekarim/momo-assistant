@@ -1827,7 +1827,9 @@ async def handle_message(ev: dict, background_tasks: BackgroundTasks) -> dict:
                     add_turn(jira_conv_id, "assistant", reply)
                     return _make_response(reply, is_addon)
                 # intent None — not an approval reply; fall through to the agent.
-            elif _check_pending_task_intent(lower) or _check_pending_jira_intent(lower):
+            elif _check_pending_task_intent(lower) or (
+                config.JIRA_WRITE_ENABLED and _check_pending_jira_intent(lower)
+            ):
                 # A bare "yes"/"no" may instead be answering the agent's own
                 # clarifying question (nothing queued because it asked rather
                 # than acted). If the last assistant turn ended with "?", fall
@@ -1992,11 +1994,10 @@ def _apply_pending_task_actions_background(
 _JIRA_WRITE_ACTIONS = {"create_jira", "comment_jira", "transition_jira"}
 _JIRA_DECLINE_WORDS = {
     "no", "nope", "no thanks", "decline", "cancel", "cancel it", "skip",
-    "don't", "dont", "don't do it", "dont do it", "stop",
+    "don't do it", "dont do it",
 }
 _JIRA_APPROVE_WORDS = {
-    "yes", "approve", "approved", "confirm", "confirmed", "ok", "okay",
-    "apply", "post", "go", "send", "ship",
+    "yes", "approve", "approved", "confirm", "confirmed",
 }
 _JIRA_APPROVE_PHRASES = {"go ahead", "do it", "ship it", "post it", "apply it", "send it"}
 _JIRA_TICKET_KEY_RE = re.compile(r"[a-z][a-z0-9]+-\d+")
@@ -2008,6 +2009,11 @@ def _user_jira_scope(user_id: str, space: str) -> str:
 
 
 def _get_pending_jira_request(user_id: str, space: str) -> tuple[dict | None, str | None]:
+    # Dark-launch guard: with the write feature disabled nothing can ever be
+    # pending, so skip the Firestore read entirely — a disabled feature must
+    # cost zero reads on the synchronous Chat path.
+    if not config.JIRA_WRITE_ENABLED:
+        return None, None
     scope = _user_jira_scope(user_id, space)
     pending = get_pending_jira_actions(scope_id=scope)
     if pending:
@@ -2059,15 +2065,16 @@ def _check_pending_jira_intent(lower: str) -> bool:
 
     Used by the phantom-approval guard so a stray "confirm jira" with nothing
     pending doesn't fall through to the agent and risk a hallucinated write.
+    Deliberately strict: approval requires an explicit approve token AND the
+    literal word "jira" — a ticket key alone (e.g. "go check OSD-123") is a
+    normal conversational message and must never be swallowed by the guard.
     """
     normalized = re.sub(r"\s+", " ", lower).strip().rstrip(".,!?")
     if normalized in _JIRA_DECLINE_WORDS:
         return True
     tokens = set(normalized.split())
     has_approve = bool(_JIRA_APPROVE_WORDS & tokens) or normalized in _JIRA_APPROVE_PHRASES
-    has_jira = "jira" in tokens
-    has_key = bool(_JIRA_TICKET_KEY_RE.search(normalized))
-    return has_approve and (has_jira or has_key)
+    return has_approve and "jira" in tokens
 
 
 def _parse_pending_jira_reply(lower: str, actions: list[dict]) -> dict:
@@ -2239,7 +2246,10 @@ def _process_message_background(text, user_id, space, audio_attachments=None):
             elif pending_task_actions:
                 response = _strip_llm_approval_block(response)
                 pending_scope_id = _user_task_scope(user_id, space)
-                jira_block = get_pending_jira_actions(scope_id=_user_jira_scope(user_id, space))
+                jira_block = (
+                    get_pending_jira_actions(scope_id=_user_jira_scope(user_id, space))
+                    if config.JIRA_WRITE_ENABLED else None
+                )
                 if jira_block:
                     response = _build_jira_conflict_reply(jira_block)
                 else:
@@ -2382,7 +2392,10 @@ def _process_message_sync(text, user_id, space, history, background_tasks, is_ad
         # approval flow (only a pure-create turn becomes a card).
         response = _strip_llm_approval_block(response)
         pending_scope_id = _user_task_scope(user_id, space)
-        jira_block = get_pending_jira_actions(scope_id=_user_jira_scope(user_id, space))
+        jira_block = (
+            get_pending_jira_actions(scope_id=_user_jira_scope(user_id, space))
+            if config.JIRA_WRITE_ENABLED else None
+        )
         if jira_block:
             response = _build_jira_conflict_reply(jira_block)
         else:

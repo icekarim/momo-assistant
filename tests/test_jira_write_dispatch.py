@@ -1,14 +1,28 @@
 """Safety tests: Jira write tools QUEUE for approval and never execute in-loop.
 
-These import the real agent module (no heavy stubbing needed) and assert the
-dispatch layer can never reach the REST write functions.
+These need the REAL agent/config/jira_service modules and assert the dispatch
+layer can never reach the REST write functions.
+
+Co-run-safe isolation (HANDOFF_addon_cards.md §8): sibling test files
+(test_jira_approval_safety.py, test_handle_card_click.py,
+test_conversational_create_card.py, ...) stub app modules into sys.modules at
+import time (``sys.modules["agent"] = MagicMock()`` etc.). Drop any cached or
+stubbed instance of the modules this file needs — plus their app-level
+imports — and re-import fresh, so this file passes alone AND in any co-run
+order with the stub-based files.
 """
 
 import json
+import sys
 
-import config
-import agent
-import jira_service
+# Pop in dependency order so each fresh import below binds fresh real deps
+# (agent -> claude_client/langsmith_config/config, jira_service -> config).
+for _name in ("agent", "claude_client", "langsmith_config", "jira_service", "config"):
+    sys.modules.pop(_name, None)
+
+import config  # noqa: E402
+import jira_service  # noqa: E402
+import agent  # noqa: E402
 
 
 def _boom(*_a, **_k):
