@@ -950,6 +950,7 @@ def _run_agent_loop_inner(user_message: str, conversation_history: list[dict],
             dispatch=_dispatch_tool,
             max_iterations=max_iterations,
             tier=TaskComplexity.STANDARD,
+            max_tokens=config.CLAUDE_MAX_TOKENS_AGENT,
         )
     except Exception as exc:
         print(f"[agent] loop failed: {exc}")
