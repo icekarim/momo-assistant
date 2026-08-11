@@ -16,6 +16,8 @@ from email.utils import parsedate_to_datetime
 
 import google.generativeai as genai
 from cachetools import TTLCache
+from google.api_core import exceptions as gapi_exceptions
+from google.api_core import retry as gapi_retry
 from google.cloud.firestore_v1.base_query import FieldFilter
 from google.cloud.firestore_v1.base_vector_query import DistanceMeasure
 from google.cloud.firestore_v1.vector import Vector
@@ -233,6 +235,43 @@ def _project_matches(query: str, candidate: str) -> bool:
     return q in c or c in q
 
 
+# Write-schema fields (see _store_entries) minus the heavy `embedding` vector.
+# The full-collection scan below once fetched every doc's 2048-dim float array
+# (~100MB across ~5.7k docs), intermittently tripping Firestore's 503 "Query
+# timed out". Projecting the scan down to these fields keeps it cheap. Firestore
+# projection semantics: docs MISSING a selected field are still returned (the
+# field is simply absent from the snapshot), so pre-embedding entries and
+# entries stored without vectors are unaffected. No consumer of these results
+# reads `embedding` (drift engine / query_all_entries / query_open_commitments
+# only touch scalar + list metadata fields).
+_ENTRY_FIELDS = [
+    "entity_type", "name", "content", "status", "owner",
+    "related_people", "related_projects", "tags",
+    "_search_people", "_search_projects",
+    "source_type", "source_id", "source_title", "source_date",
+    "extracted_at", "embedding_model",
+]
+
+# Explicit Retry: the firestore client's DEFAULT mid-stream retry path is
+# broken in all 2.x releases (googleapis/python-firestore#596 — accesses
+# `_retry` on the raw gRPC `_UnaryStreamMultiCallable` → AttributeError),
+# turning a transient 503 "Query timed out" into the hard failure
+# "'_UnaryStreamMultiCallable' object has no attribute '_retry'". An explicit
+# Retry bypasses that lookup entirely and resumes the stream after the last
+# seen snapshot on mid-stream failures.
+_KG_STREAM_RETRY = gapi_retry.Retry(
+    initial=0.1,
+    maximum=60.0,
+    multiplier=1.3,
+    predicate=gapi_retry.if_exception_type(
+        gapi_exceptions.DeadlineExceeded,
+        gapi_exceptions.InternalServerError,
+        gapi_exceptions.ServiceUnavailable,
+    ),
+    timeout=300.0,
+)
+
+
 def _load_all_entries() -> list[dict]:
     cache_key = ("all_entries",)
     with _kg_cache_lock:
@@ -241,7 +280,12 @@ def _load_all_entries() -> list[dict]:
         return cached
 
     db = get_db()
-    entries = [_doc_to_dict(doc) for doc in db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION).stream()]
+    entries = [
+        _doc_to_dict(doc)
+        for doc in db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
+        .select(_ENTRY_FIELDS)
+        .stream(retry=_KG_STREAM_RETRY, timeout=120.0)
+    ]
     with _kg_cache_lock:
         _kg_cache[cache_key] = entries
     return entries
