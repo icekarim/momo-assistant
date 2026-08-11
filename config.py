@@ -28,6 +28,10 @@ CLAUDE_MAX_TOKENS_DEEP = int(os.getenv("CLAUDE_MAX_TOKENS_DEEP", "4096"))
 # which once made the briefing silently deliver an empty message. Keep this
 # comfortably above the tier default.
 CLAUDE_MAX_TOKENS_BRIEFING = int(os.getenv("CLAUDE_MAX_TOKENS_BRIEFING", "8192"))
+# Interactive agent-loop ceiling — same failure mode: a reasoning model can
+# burn the whole 2048-token STANDARD budget on a thinking block and hand the
+# user an empty reply (or a raw truncation placeholder).
+CLAUDE_MAX_TOKENS_AGENT = int(os.getenv("CLAUDE_MAX_TOKENS_AGENT", "8192"))
 # Sampling temperature. Claude's valid range is 0..1 (default 1.0); 1.0 is the
 # loosest/warmest. Clamped so a bad env value can never 400 the generation call.
 CLAUDE_TEMPERATURE = max(0.0, min(1.0, float(os.getenv("CLAUDE_TEMPERATURE", "1.0"))))
