@@ -64,6 +64,11 @@ def send_chat_message(space_id, text=None, cards=None) -> bool:
     Returns True only if every chunk was actually accepted (2xx). Auth
     failures (401/403) are logged distinctly and reported as failure — they
     never crash scheduled jobs."""
+    if cards is None and (text is None or not text.strip()):
+        # The Chat API 400s on empty messages ("Message cannot be empty") —
+        # refuse locally so callers get a clean failure signal.
+        print("send_chat_message: refusing to send empty message")
+        return False
     session = _get_chat_session()
     url = f"https://chat.googleapis.com/v1/{space_id}/messages"
 

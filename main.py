@@ -549,7 +549,16 @@ async def trigger_briefing(background_tasks: BackgroundTasks):
     """Called by Cloud Scheduler at 8 AM daily."""
     try:
         result = run_morning_briefing(bg_tasks=background_tasks)
+        if isinstance(result, dict) and result.get("status") == "failed":
+            # Delivery failed — return non-2xx so Cloud Scheduler records a
+            # failed attempt instead of a silent success.
+            raise HTTPException(
+                status_code=500,
+                detail=result.get("reason", "briefing failed"),
+            )
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Internal server error")

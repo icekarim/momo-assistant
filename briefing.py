@@ -216,11 +216,26 @@ def run_morning_briefing(space_id: str | None = None, bg_tasks=None):
     tasks_ctx = format_tasks_for_context(tasks)
 
     print("  Generating briefing with Claude...")
-    summary = generate_morning_briefing(
-        emails_ctx, meetings_ctx, tasks_ctx,
-        granola_context=granola_ctx, jira_context=jira_ctx,
-        nudges_context=nudges_ctx,
-    )
+    try:
+        summary = generate_morning_briefing(
+            emails_ctx, meetings_ctx, tasks_ctx,
+            granola_context=granola_ctx, jira_context=jira_ctx,
+            nudges_context=nudges_ctx,
+        )
+    except Exception as e:
+        # Never fail silently: tell the user in Chat (best-effort), then
+        # propagate so the /briefing endpoint returns non-2xx and Cloud
+        # Scheduler records a failed attempt.
+        print(f"  Morning briefing generation FAILED: {e}")
+        if target_space:
+            try:
+                send_chat_message(
+                    target_space,
+                    "⚠️ Morning briefing generation failed — check Cloud Run logs.",
+                )
+            except Exception as notify_exc:
+                print(f"  Failure-notice send also failed: {notify_exc}")
+        raise
     pending_scope = conversation_scope(space=target_space) if target_space else "latest"
     summary = _process_debrief_tasks(
         summary,
@@ -236,7 +251,19 @@ def run_morning_briefing(space_id: str | None = None, bg_tasks=None):
     if target_space:
         print("  Sending to Google Chat...")
         formatted = format_for_google_chat(summary)
-        send_chat_message(target_space, formatted)
+        sent = send_chat_message(target_space, formatted)
+        if not sent:
+            # The Chat API rejected the send — this run FAILED. Propagate a
+            # failure status so /briefing returns non-2xx and Cloud Scheduler
+            # doesn't record a silent success.
+            print("Morning briefing delivery FAILED (Chat send error)")
+            return {
+                "status": "failed",
+                "reason": "chat delivery failed",
+                "emails": len(emails),
+                "meetings": len(meetings),
+                "tasks": len(tasks),
+            }
         _store_proactive_message(summary, target_space)
     else:
         print("  No CHAT_SPACE_ID configured. Printing to console:")
