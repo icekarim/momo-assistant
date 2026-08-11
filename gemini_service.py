@@ -266,8 +266,20 @@ def generate_morning_briefing(emails_context, meetings_context, tasks_context,
 {granola_section}{jira_section}{nudges_section}
 Please create my morning briefing."""
 
-    msg = generate(prompt=prompt, tier=TaskComplexity.STANDARD, system=SYSTEM_PROMPT)
-    return extract_text(msg)
+    msg = generate(prompt=prompt, tier=TaskComplexity.STANDARD, system=SYSTEM_PROMPT,
+                   max_tokens=config.CLAUDE_MAX_TOKENS_BRIEFING)
+    text = extract_text(msg)
+    if not text:
+        # Reasoning models can spend the entire budget on a thinking block
+        # (zero text blocks). Retry once with double the budget — never
+        # silently return "" (an empty Chat send 400s downstream).
+        print(f"morning briefing returned no text (stop_reason={msg.stop_reason}); retrying with larger budget")
+        msg = generate(prompt=prompt, tier=TaskComplexity.STANDARD, system=SYSTEM_PROMPT,
+                       max_tokens=config.CLAUDE_MAX_TOKENS_BRIEFING * 2)
+        text = extract_text(msg)
+    if not text:
+        raise RuntimeError(f"briefing generation returned no text (stop_reason={msg.stop_reason})")
+    return text
 
 
 @observe(name="chat-response", capture_input=False)
