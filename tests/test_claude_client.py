@@ -241,6 +241,128 @@ def test_tool_loop_max_tokens_truncation(monkeypatch):
     assert stop == "max_tokens" and "partial" in final
 
 
+# ── run_tool_loop: agent budget + empty-truncation retry ─────
+# Regression for the interactive-chat incident where a reasoning model burned
+# the whole 2048-token STANDARD budget on a thinking block (stop_reason
+# "max_tokens", zero text blocks) and the user received the literal
+# "[response truncated: max_tokens reached]" placeholder.
+
+
+def test_tool_loop_forwards_max_tokens(monkeypatch):
+    seen = {}
+    text_block = type("B", (), {"type": "text", "text": "ok"})()
+    def advance(**kw):
+        seen.update(kw)
+        return _msg([text_block], "end_turn")
+    monkeypatch.setattr(cc._client, "messages", type("M", (), {"create": staticmethod(advance)})())
+    cc.run_tool_loop(messages=[{"role": "user", "content": "x"}], tools=[], system=None,
+                     dispatch=lambda n, i: "x", max_tokens=8192)
+    assert seen["max_tokens"] == 8192
+
+
+def test_tool_loop_empty_truncation_retries_once_with_double_budget(monkeypatch):
+    budgets = []
+    text_block = type("B", (), {"type": "text", "text": "recovered answer"})()
+    def advance(**kw):
+        budgets.append(kw["max_tokens"])
+        if len(budgets) == 1:
+            return _msg([], "max_tokens")  # all-reasoning: zero text blocks
+        return _msg([text_block], "end_turn")
+    monkeypatch.setattr(cc._client, "messages", type("M", (), {"create": staticmethod(advance)})())
+    final, stop = cc.run_tool_loop(messages=[{"role": "user", "content": "x"}], tools=[], system=None,
+                                   dispatch=lambda n, i: "x", max_tokens=8192)
+    assert (final, stop) == ("recovered answer", "end_turn")
+    assert budgets == [8192, 16384]
+
+
+def test_tool_loop_empty_truncation_retry_doubles_tier_default(monkeypatch):
+    """Without an explicit max_tokens the retry doubles the tier budget."""
+    budgets = []
+    text_block = type("B", (), {"type": "text", "text": "ok"})()
+    def advance(**kw):
+        budgets.append(kw["max_tokens"])
+        if len(budgets) == 1:
+            return _msg([], "max_tokens")
+        return _msg([text_block], "end_turn")
+    monkeypatch.setattr(cc._client, "messages", type("M", (), {"create": staticmethod(advance)})())
+    cc.run_tool_loop(messages=[{"role": "user", "content": "x"}], tools=[], system=None,
+                     dispatch=lambda n, i: "x")
+    # generate() resolves the first call to the STANDARD tier default; the
+    # retry passes an explicit doubled budget.
+    assert budgets == [cc.TASK_MAX_TOKENS[T.STANDARD], cc.TASK_MAX_TOKENS[T.STANDARD] * 2]
+
+
+def test_tool_loop_empty_truncation_retry_flows_through_tool_dispatch(monkeypatch):
+    """A retried response holding tool_use blocks must dispatch normally."""
+    text_block = type("B", (), {"type": "text", "text": "the answer is 3"})()
+    seq = [
+        _msg([], "max_tokens"),  # empty truncation → retry
+        _msg([_tool_use_block("t1", "add", {"a": 1, "b": 2})], "tool_use"),
+        _msg([text_block], "end_turn"),
+    ]
+    i = {"n": 0}
+    def advance(**kw):
+        m = seq[i["n"]]; i["n"] += 1; return m
+    monkeypatch.setattr(cc._client, "messages", type("M", (), {"create": staticmethod(advance)})())
+    dispatched = []
+    def dispatch(name, inp):
+        dispatched.append((name, inp))
+        return "3"
+    final, stop = cc.run_tool_loop(messages=[{"role": "user", "content": "x"}],
+                                   tools=[{"name": "add", "input_schema": {}}],
+                                   system=None, dispatch=dispatch)
+    assert dispatched == [("add", {"a": 1, "b": 2})]
+    assert (final, stop) == ("the answer is 3", "end_turn")
+
+
+def test_tool_loop_double_empty_truncation_returns_friendly_message(monkeypatch):
+    calls = {"n": 0}
+    def advance(**kw):
+        calls["n"] += 1
+        return _msg([], "max_tokens")  # empty every time
+    monkeypatch.setattr(cc._client, "messages", type("M", (), {"create": staticmethod(advance)})())
+    final, stop = cc.run_tool_loop(messages=[{"role": "user", "content": "x"}], tools=[], system=None,
+                                   dispatch=lambda n, i: "x", max_tokens=8192)
+    assert calls["n"] == 2  # exactly one retry
+    assert stop == "max_tokens"
+    assert "[response truncated" not in final  # raw placeholder must never surface
+    assert final == ("sorry — that answer blew past my response limit "
+                     "twice. mind narrowing it down or asking again?")
+
+
+def test_tool_loop_retry_guard_once_per_run(monkeypatch):
+    """Only ONE doubled-budget retry per loop run (interactive deadline)."""
+    seq = [
+        _msg([], "max_tokens"),                                         # → retry
+        _msg([_tool_use_block("t1", "add", {"a": 1, "b": 2})], "tool_use"),
+        _msg([], "max_tokens"),                                         # no 2nd retry
+    ]
+    i = {"n": 0}
+    def advance(**kw):
+        m = seq[i["n"]]; i["n"] += 1; return m
+    monkeypatch.setattr(cc._client, "messages", type("M", (), {"create": staticmethod(advance)})())
+    final, stop = cc.run_tool_loop(messages=[{"role": "user", "content": "x"}],
+                                   tools=[{"name": "add", "input_schema": {}}],
+                                   system=None, dispatch=lambda n, inp: "3")
+    assert i["n"] == 3  # first + retry + post-tool call, nothing more
+    assert stop == "max_tokens" and "narrowing it down" in final
+
+
+def test_tool_loop_nonempty_truncation_no_retry(monkeypatch):
+    """Truncated-but-non-empty text keeps existing behavior: returned as-is,
+    no retry burned."""
+    calls = {"n": 0}
+    text_block = type("B", (), {"type": "text", "text": "partial"})()
+    def advance(**kw):
+        calls["n"] += 1
+        return _msg([text_block], "max_tokens")
+    monkeypatch.setattr(cc._client, "messages", type("M", (), {"create": staticmethod(advance)})())
+    final, stop = cc.run_tool_loop(messages=[{"role": "user", "content": "x"}], tools=[], system=None,
+                                   dispatch=lambda n, i: "x", max_tokens=8192)
+    assert (final, stop) == ("partial", "max_tokens")
+    assert calls["n"] == 1
+
+
 def test_tool_loop_max_iteration_guard(monkeypatch):
     def advance(**kw):
         return _msg([_tool_use_block("t", "loop", {})], "tool_use")  # always wants another tool

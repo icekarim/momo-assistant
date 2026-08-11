@@ -154,7 +154,7 @@ def gemini_tool_to_claude(decl: dict) -> dict:
 
 
 def run_tool_loop(*, messages, tools, system, dispatch, max_iterations=6,
-                  tier=TaskComplexity.STANDARD, on_tool=None):
+                  tier=TaskComplexity.STANDARD, on_tool=None, max_tokens=None):
     """Drive a Claude tool-use conversation to a final text answer.
 
     dispatch(name, input_dict) -> str. Returns (final_text, stop_reason).
@@ -163,13 +163,31 @@ def run_tool_loop(*, messages, tools, system, dispatch, max_iterations=6,
     """
     convo = list(messages)
     last_stop = None
+    retried_empty_truncation = False
     for _ in range(max_iterations):
-        msg = generate(messages=convo, tools=tools, system=system, tier=tier)
+        msg = generate(messages=convo, tools=tools, system=system, tier=tier,
+                       max_tokens=max_tokens)
         last_stop = msg.stop_reason
+
+        if (msg.stop_reason == "max_tokens" and not extract_text(msg)
+                and not retried_empty_truncation):
+            # Reasoning models can burn the whole budget on a thinking block
+            # (zero text blocks) — the user would get a raw truncation
+            # placeholder. Retry ONCE with double budget (safe: the failed
+            # msg produced no text, dispatched no tools, and was never
+            # appended to convo), then let the retried msg flow through the
+            # normal handling below (it may contain tool_use blocks). One
+            # retry per loop run to respect the interactive ~30s deadline.
+            retried_empty_truncation = True
+            print("run_tool_loop: empty max_tokens response (all reasoning); retrying with larger budget")
+            msg = generate(messages=convo, tools=tools, system=system, tier=tier,
+                           max_tokens=(max_tokens or TASK_MAX_TOKENS[tier]) * 2)
+            last_stop = msg.stop_reason
 
         if msg.stop_reason == "max_tokens":
             text = extract_text(msg)
-            return (text or "[response truncated: max_tokens reached]"), "max_tokens"
+            return (text or "sorry — that answer blew past my response limit "
+                            "twice. mind narrowing it down or asking again?"), "max_tokens"
 
         tool_uses = [b for b in msg.content if getattr(b, "type", None) == "tool_use"]
         if not tool_uses:
