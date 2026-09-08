@@ -112,6 +112,8 @@ If Granola is disabled, all meeting-note features are silently skipped.
 | `CLAUDE_MAX_TOKENS_LIGHT` | No | `1024` | Max output tokens for light-tier calls |
 | `CLAUDE_MAX_TOKENS_STANDARD` | No | `2048` | Max output tokens for standard-tier calls |
 | `CLAUDE_MAX_TOKENS_DEEP` | No | `4096` | Max output tokens for deep-tier calls |
+| `CLAUDE_MAX_TOKENS_BRIEFING` | No | `8192` | Max output tokens for the morning briefing. Reasoning models can spend the standard-tier budget on internal thinking and return no text. Keep this above the standard budget so the briefing always has room for output. |
+| `CLAUDE_MAX_TOKENS_AGENT` | No | `8192` | Max output tokens for the interactive agent loop that replies in Google Chat. Same reasoning-burn risk as the briefing budget. If an agent turn returns no text, Momo retries once with double this budget before falling back to an in-voice apology. |
 | `CLAUDE_TEMPERATURE` | No | `1.0` | Sampling temperature (clamped to 0.0–1.0) |
 | **Email** | | | |
 | `EMAIL_ALERTS_ENABLED` | No | `true` | Toggle proactive email alerts |

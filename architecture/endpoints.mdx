@@ -49,6 +49,8 @@ Cloud Scheduler ──► POST /connection-health        (hourly — connector a
 5. Posts the result to the configured Google Chat space
 6. Feeds calendar events, tasks, and Granola notes into the knowledge graph (background)
 
+Failure surfacing: `/briefing` returns `500` when generation or Chat delivery fails so Cloud Scheduler records the failure and retries or alerts. If Claude returns an empty response, the generator retries once with double the token budget before raising. If generation still fails, Momo posts a best-effort ⚠️ notice to the Chat space so you know the briefing didn't arrive. Chat itself refuses to send empty messages, so a silent no-op delivery is no longer possible.
+
 **`/email-alerts`** — also in `briefing.py`:
 
 1. Fetches recent inbox emails matching the configured query
