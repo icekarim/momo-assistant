@@ -835,6 +835,71 @@ async def mcp_token_refresh():
         return {"status": "error", "message": f"MCP token refresh failed: {str(e)}"}
 
 
+def _oauth_callback_uri(callback_path: str) -> str:
+    """Build callbacks from the configured origin, never proxy/request headers."""
+    from ipaddress import ip_address
+    from urllib.parse import urlsplit
+
+    service_url = getattr(config, "MOMO_SERVICE_URL", "")
+    error = (
+        "MOMO_SERVICE_URL must be an absolute HTTPS origin "
+        "(HTTP is allowed only for localhost development)."
+    )
+    # Reject characters urlsplit may discard or browsers may reinterpret.
+    if (
+        not isinstance(service_url, str)
+        or not service_url
+        or any(ord(char) <= 32 or ord(char) >= 127 for char in service_url)
+        or any(char in service_url for char in "\\%?#")
+    ):
+        raise ValueError(error)
+
+    try:
+        origin = urlsplit(service_url)
+        host = origin.hostname or ""
+        port = origin.port
+        try:
+            ip_address(host)
+        except ValueError:
+            if len(host) > 253 or not all(
+                re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                for label in host.split(".")
+            ):
+                raise ValueError(error)
+
+        authority = f"[{host}]" if ":" in host else host
+        if port is not None:
+            authority += f":{port}"
+        if (
+            origin.netloc.lower() != authority
+            or origin.username is not None
+            or origin.password is not None
+            or origin.path not in ("", "/")
+            or port == 0
+            or not (
+                origin.scheme == "https"
+                or (origin.scheme == "http" and host in {"localhost", "127.0.0.1", "::1"})
+            )
+        ):
+            raise ValueError(error)
+    except ValueError:
+        raise ValueError(error) from None
+
+    return f"{service_url.rstrip('/')}{callback_path}"
+
+
+def _notify_oauth_completion(message: str) -> None:
+    """Remember delivered auth notices without letting Chat/history break OAuth."""
+    space = config.CHAT_SPACE_ID
+    if not space:
+        return
+    try:
+        if send_chat_message(space, message):
+            add_turn(conversation_scope(space=space), "assistant", message)
+    except Exception:
+        pass
+
+
 @app.get("/granola-auth/start")
 async def granola_auth_start(request: Request):
     """Browser-based Granola re-authentication.
@@ -844,10 +909,8 @@ async def granola_auth_start(request: Request):
     """
     from granola_service import start_web_reauth
 
-    base_url = str(request.base_url).rstrip("/")
-    redirect_uri = f"{base_url}/granola-auth/callback"
-
     try:
+        redirect_uri = _oauth_callback_uri("/granola-auth/callback")
         auth_url = await start_web_reauth(redirect_uri)
     except Exception as e:
         traceback.print_exc()
@@ -899,20 +962,16 @@ async def granola_auth_callback(code: str = "", state: str = "", error: str = ""
             status_code=400,
         )
 
-    if config.CHAT_SPACE_ID:
-        try:
-            from chat_service import send_chat_message
-            send_chat_message(
-                config.CHAT_SPACE_ID,
-                "✅ *Granola reconnected!* meeting notes and debriefs are back online.",
-            )
-        except Exception:
-            pass
+    _notify_oauth_completion(
+        "✅ *Granola authorization updated.* "
+        "Momo will try fetching meeting notes on the next check."
+    )
 
     return HTMLResponse(
         "<html><body style='font-family: system-ui; text-align: center; padding: 60px;'>"
-        "<h1>&#10004; Granola reconnected</h1>"
-        "<p>Momo will resume pulling meeting notes automatically. You can close this tab.</p>"
+        "<h1>&#10004; Granola authorization updated</h1>"
+        "<p>Your authorization has been saved. Momo will try fetching meeting notes "
+        "on its next check. You can close this tab.</p>"
         "</body></html>"
     )
 
@@ -924,9 +983,6 @@ async def google_auth_start(request: Request, t: str = ""):
     """Browser-based Google OAuth re-authentication."""
     from google_auth import start_web_reauth
 
-    base_url = str(request.base_url).rstrip("/")
-    redirect_uri = f"{base_url}/google-auth/callback"
-
     if not t:
         return HTMLResponse(
             "<html><body><h2>Missing or invalid re-auth link</h2>"
@@ -935,6 +991,7 @@ async def google_auth_start(request: Request, t: str = ""):
         )
 
     try:
+        redirect_uri = _oauth_callback_uri("/google-auth/callback")
         auth_url = await start_web_reauth(redirect_uri, t)
     except Exception as e:
         traceback.print_exc()
@@ -958,7 +1015,9 @@ async def google_auth_callback(code: str = "", state: str = "", error: str = "")
     """OAuth callback from Google after user authenticates."""
     if error:
         return HTMLResponse(
-            f"<html><body><h2>Google auth failed</h2><p>{html.escape(error)}</p></body></html>",
+            "<html><body><h2>Google auth failed</h2>"
+            "<p>Google sign-in was not completed. Please request a fresh reconnect link "
+            "and allow all required permissions.</p></body></html>",
             status_code=400,
         )
 
@@ -968,14 +1027,27 @@ async def google_auth_callback(code: str = "", state: str = "", error: str = "")
             status_code=400,
         )
 
-    from google_auth import complete_web_reauth
+    from google_auth import complete_web_reauth, GoogleReauthError
 
     try:
         success = await complete_web_reauth(code, state)
-    except Exception as e:
-        traceback.print_exc()
+    except GoogleReauthError as e:
+        status_code = {
+            "insufficient_scope": 400,
+            "exchange_failed": 502,
+            "config_unavailable": 503,
+            "persistence_failed": 500,
+        }.get(e.reason, 500)
         return HTMLResponse(
-            f"<html><body><h2>Token exchange failed</h2><p>{html.escape(str(e))}</p></body></html>",
+            f"<html><body><h2>Google re-auth failed</h2><p>{html.escape(str(e))}</p></body></html>",
+            status_code=status_code,
+        )
+    except Exception as e:
+        print(f"Google auth callback: unexpected failure ({type(e).__name__})")
+        return HTMLResponse(
+            "<html><body><h2>Google re-auth failed</h2>"
+            "<p>Google sign-in could not be completed. Please request a fresh reconnect link "
+            "and try again.</p></body></html>",
             status_code=500,
         )
 
@@ -986,19 +1058,16 @@ async def google_auth_callback(code: str = "", state: str = "", error: str = "")
             status_code=400,
         )
 
-    if config.CHAT_SPACE_ID:
-        try:
-            send_chat_message(
-                config.CHAT_SPACE_ID,
-                "✅ *Google reconnected!* gmail, calendar, and tasks are back online.",
-            )
-        except Exception:
-            pass
+    _notify_oauth_completion(
+        "✅ *Google authorization updated.* "
+        "Momo will try accessing Gmail, Calendar, and Tasks on the next check."
+    )
 
     return HTMLResponse(
         "<html><body style='font-family: system-ui; text-align: center; padding: 60px;'>"
-        "<h1>&#10004; Google reconnected</h1>"
-        "<p>Momo will resume syncing workspace data automatically. You can close this tab.</p>"
+        "<h1>&#10004; Google authorization updated</h1>"
+        "<p>Your authorization has been saved. Momo will try accessing workspace data "
+        "on its next check. You can close this tab.</p>"
         "</body></html>"
     )
 

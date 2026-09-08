@@ -3,6 +3,7 @@ import os
 import secrets
 import threading
 import time
+from urllib.parse import urlencode
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -13,10 +14,12 @@ except Exception:  # pragma: no cover - fallback for older library variants / mo
 
 import config
 from connection_errors import ExternalAuthError
+from reauth_service import ReauthLinkError, get_service_url, send_auth_notification
 
 _cached_creds = None
 _creds_lock = threading.RLock()
 _reauth_required = False
+_reauth_alert_lock = threading.Lock()
 
 _FIRESTORE_GOOGLE_AUTH_COLLECTION = "google_auth"
 _FIRESTORE_GOOGLE_AUTH_DOC = "token"
@@ -31,6 +34,30 @@ _DEFAULT_GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
 
 class ReauthRequiredError(RuntimeError):
     pass
+
+
+class GoogleReauthError(RuntimeError):
+    """A callback failure with a static, safe message, distinct from bad state."""
+
+    _MESSAGES = {
+        "insufficient_scope": (
+            "Google did not grant all required permissions. Please request a fresh "
+            "reconnect link and allow all required permissions."
+        ),
+        "exchange_failed": (
+            "Google could not complete the token exchange. Please request a fresh "
+            "reconnect link and try again."
+        ),
+        "config_unavailable": "Google sign-in configuration is unavailable. Please try again later.",
+        "persistence_failed": (
+            "Google authorization could not be saved. Please request a fresh "
+            "reconnect link and try again."
+        ),
+    }
+
+    def __init__(self, reason: str):
+        self.reason = reason if reason in self._MESSAGES else "exchange_failed"
+        super().__init__(self._MESSAGES[self.reason])
 
 
 def _get_db():
@@ -94,7 +121,7 @@ def _load_web_client_config_from_sources():
             serialized = json.dumps(serialized)
         return _web_client_config_from_serialized(serialized)
     except Exception as exc:
-        print(f"Google auth reauth: failed to read derived web client config: {exc}")
+        print(f"Google auth reauth: config_unavailable ({type(exc).__name__})")
         return None
 
 
@@ -119,7 +146,7 @@ def _read_credentials_from_firestore():
         return None
 
 
-def _write_credentials_to_firestore(credentials_json: str):
+def _write_credentials_to_firestore(credentials_json: str) -> bool:
     try:
         db = _get_db()
         db.collection(_FIRESTORE_GOOGLE_AUTH_COLLECTION).document(
@@ -128,8 +155,10 @@ def _write_credentials_to_firestore(credentials_json: str):
             "credentials_json": credentials_json,
             "updated_at": time.time(),
         })
+        return True
     except Exception as exc:
-        print(f"Google auth: Firestore credential write failed: {exc}")
+        print(f"Google auth: persistence_failed ({type(exc).__name__})")
+        return False
 
 
 def _create_reauth_ticket() -> str:
@@ -143,8 +172,12 @@ def _create_reauth_ticket() -> str:
                 "expires_at": time.time() + _REAUTH_PENDING_TTL_SECONDS,
             }
         )
-    except Exception as exc:
-        print(f"Google auth: failed to store reauth ticket: {exc}")
+    except Exception:
+        # A ticket that wasn't persisted can never pass the single-use gate.
+        # Storage errors may contain the ticket document ID; don't log them.
+        raise ReauthLinkError(
+            "ticket_unavailable", "Could not create a Google reconnect link. Please request a fresh link later."
+        ) from None
     return ticket
 
 
@@ -182,8 +215,23 @@ def _write_credentials_to_file(credentials_json: str):
         pass
 
 
-def _persist_credentials(creds):
+def _persist_credentials(creds, *, require_durable: bool = False):
     credentials_json = creds.to_json()
+    if require_durable:
+        # google-auth's to_json omits granted_scopes. Retain actual grants
+        # separately without expanding the requested scopes used on refresh.
+        data = json.loads(credentials_json)
+        granted = getattr(creds, "granted_scopes", None)
+        data["granted_scopes"] = sorted(_scope_set(
+            config.GOOGLE_SCOPES if granted is None else granted
+        ))
+        credentials_json = json.dumps(data)
+        if _write_credentials_to_firestore(credentials_json) is not True:
+            raise GoogleReauthError("persistence_failed")
+        _write_credentials_to_file(credentials_json)
+        return
+
+    # Refresh/legacy callers retain their best-effort persistence behavior.
     _write_credentials_to_file(credentials_json)
     _write_credentials_to_firestore(credentials_json)
 
@@ -219,7 +267,7 @@ def _clear_reauth_required():
             }
         )
     except Exception as exc:
-        print(f"Google auth: failed to clear reauth required: {exc}")
+        print(f"Google auth: reauth status cleanup failed ({type(exc).__name__})")
 
 
 def is_reauth_required() -> bool:
@@ -241,16 +289,31 @@ def is_reauth_required() -> bool:
         return _reauth_required
 
 
+def _reauth_url(service_url: str, ticket: str) -> str:
+    base_url = get_service_url(service_url)
+    if not ticket:
+        raise ReauthLinkError("ticket_unavailable", "Please request a fresh Google reconnect link.")
+    return f"{base_url}/google-auth/start?{urlencode({'t': ticket})}"
+
+
+def create_reauth_link(service_url: str = "") -> str:
+    """Create a fresh, ten-minute, single-use link without sending an alert.
+
+    Explicit requests never consult or update the automatic alert cooldown.
+    Validate configuration before issuing a ticket.
+    """
+    base_url = get_service_url(service_url)
+    return _reauth_url(base_url, _create_reauth_ticket())
+
+
 def _build_reauth_alert_message(service_url, ticket):
-    base_url = (service_url or config.MOMO_SERVICE_URL or "").rstrip("/")
-    reauth_url = (
-        f"{base_url}/google-auth/start?t={ticket}" if base_url else f"/google-auth/start?t={ticket}"
-    )
+    reauth_url = _reauth_url(service_url, ticket)
     return (
         "🔴 *Google sign-in needs attention*\n\n"
         "momo needs you to reconnect google access.\n\n"
         f"👉 <{reauth_url}|*reconnect google access*>\n\n"
-        "once you finish, i'll resume syncing workspace data automatically."
+        "this link is single-use and expires in 10 minutes. if it expires or you've already opened it, "
+        "ask me for a fresh google reconnect link. after sign-in, i can check access again."
     )
 
 
@@ -258,9 +321,9 @@ def _should_send_throttled_reauth_alert(service_url=""):
     if not config.CHAT_SPACE_ID:
         return False
 
-    url = service_url or config.MOMO_SERVICE_URL
-    if not url:
-        print("Google auth: no MOMO_SERVICE_URL configured, can't send reauth link")
+    try:
+        get_service_url(service_url)
+    except ReauthLinkError:
         return False
 
     try:
@@ -279,6 +342,17 @@ def _should_send_throttled_reauth_alert(service_url=""):
         return False
 
 
+def _clear_reauth_alert_cooldown() -> None:
+    """Allow a new failure to alert after successful reauth or confirmed recovery."""
+    try:
+        with _reauth_alert_lock:
+            _get_db().collection(_FIRESTORE_REAUTH_COLLECTION).document(
+                _FIRESTORE_REAUTH_ALERT_DOC
+            ).delete()
+    except Exception:
+        print("Google auth: could not clear reauth alert cooldown")
+
+
 def _record_reauth_alert_sent():
     try:
         db = _get_db()
@@ -290,27 +364,27 @@ def _record_reauth_alert_sent():
 
 
 def _send_throttled_reauth_alert(service_url=""):
+    with _reauth_alert_lock:
+        return _send_reauth_alert_unlocked(service_url)
+
+
+def _send_reauth_alert_unlocked(service_url=""):
     if not config.CHAT_SPACE_ID:
         return False
 
-    url = service_url or config.MOMO_SERVICE_URL
-    if not url:
-        print("Google auth: no MOMO_SERVICE_URL configured, can't send reauth link")
-        return False
-
     try:
+        url = get_service_url(service_url)
         if not _should_send_throttled_reauth_alert(service_url=url):
             return False
 
-        from chat_service import send_chat_message
-
         ticket = _create_reauth_ticket()
         message = _build_reauth_alert_message(service_url=url, ticket=ticket)
-        send_chat_message(config.CHAT_SPACE_ID, message)
+        if not send_auth_notification(message):
+            return False
         _record_reauth_alert_sent()
         return True
-    except Exception as exc:
-        print(f"Google auth: failed to send reauth alert: {exc}")
+    except Exception:
+        print("Google auth: could not deliver reauth alert")
         return False
 
 
@@ -375,7 +449,7 @@ def _refresh_loaded_credentials(creds):
                 _send_throttled_reauth_alert(service_url=config.MOMO_SERVICE_URL)
                 _cached_creds = None
                 raise ReauthRequiredError(
-                    "Google credentials require re-authentication. Reconnect via /google-auth/start."
+                    "Google credentials require re-authentication. Ask momo for a fresh Google reconnect link."
                 )
             raise
 
@@ -444,7 +518,6 @@ async def start_web_reauth(redirect_uri: str, ticket: str) -> str | None:
             )
         auth_url, _ = flow.authorization_url(
             access_type="offline",
-            include_granted_scopes="true",
             prompt="consent",
             state=state,
         )
@@ -468,10 +541,67 @@ async def start_web_reauth(redirect_uri: str, ticket: str) -> str | None:
     return auth_url
 
 
+def _scope_set(scopes) -> set[str]:
+    if isinstance(scopes, str):
+        return set(scopes.split())
+    if scopes is None:
+        return set()
+    if not isinstance(scopes, (list, tuple, set, frozenset)) or not all(
+        isinstance(scope, str) and not any(char.isspace() for char in scope)
+        for scope in scopes
+    ):
+        raise ValueError("Invalid scope metadata")
+    return {scope for scope in scopes if scope}
+
+
+def _validate_reauth_token_scopes(token, required_scopes: set[str]) -> None:
+    if not isinstance(token, dict) or not token.get("access_token") or "error" in token:
+        raise GoogleReauthError("exchange_failed")
+    # RFC 6749: an omitted scope means the requested scopes are unchanged.
+    # An explicitly empty/null scope is NOT omission and must be rejected.
+    granted = _scope_set(token["scope"]) if "scope" in token else required_scopes
+    if not required_scopes.issubset(granted):
+        raise GoogleReauthError("insufficient_scope")
+
+
+def _fetch_reauth_credentials(flow, code: str, required_scopes: set[str]):
+    from oauthlib.oauth2.rfc6749.tokens import OAuth2Token
+
+    try:
+        flow.fetch_token(code=code)
+    except Warning as warning:
+        token = getattr(warning, "token", None)
+        # Only oauthlib's post-validation scope-change Warning is recoverable.
+        # Provider errors/missing tokens are rejected by the parser before it.
+        if not (
+            type(warning) is Warning
+            and isinstance(token, OAuth2Token)
+            and warning.args
+            and isinstance(warning.args[0], str)
+            and warning.args[0].startswith("Scope has changed from ")
+            and token.scope_changed
+            and "scope" in token
+            and getattr(warning, "old_scope", None) == token.old_scopes
+            and getattr(warning, "new_scope", None) == token.scopes
+            and _scope_set(token.old_scopes) == required_scopes
+        ):
+            raise
+        _validate_reauth_token_scopes(token, required_scopes)
+        # The fetch stopped before requests-oauthlib populated its client.
+        # Use the public setter, preserving all returned token/scope metadata.
+        flow.oauth2session.token = token
+
+    _validate_reauth_token_scopes(flow.oauth2session.token, required_scopes)
+    return flow.credentials
+
+
 async def complete_web_reauth(code: str, state: str) -> bool:
-    """Complete the browser OAuth reauth flow and persist credentials."""
+    """Return False only for invalid state; raise safe errors for other failures."""
     global _cached_creds
 
+    if not state:
+        return False
+    failure_reason = "persistence_failed"
     try:
         db = _get_db()
         doc_ref = db.collection(_FIRESTORE_REAUTH_COLLECTION).document(state)
@@ -481,12 +611,28 @@ async def complete_web_reauth(code: str, state: str) -> bool:
             return False
 
         data = doc.to_dict() or {}
-        if time.time() > float(data.get("expires_at", 0)):
-            doc_ref.delete()
+        try:
+            expires_at = float(data.get("expires_at", 0))
+            redirect_uri = data.get("redirect_uri")
+            if not isinstance(redirect_uri, str) or not redirect_uri or not (0 < expires_at < float("inf")):
+                return False
+        except (AttributeError, TypeError, ValueError):
+            return False
+        if time.time() > expires_at:
+            try:
+                doc_ref.delete()
+            except Exception as exc:
+                print(f"Google auth reauth: expired state cleanup failed ({type(exc).__name__})")
             print("Google auth reauth: state expired")
             return False
 
-        redirect_uri = data.get("redirect_uri", "")
+        if not code:
+            raise GoogleReauthError("exchange_failed")
+
+        failure_reason = "config_unavailable"
+        required_scopes = _scope_set(config.GOOGLE_SCOPES)
+        if not required_scopes:
+            raise GoogleReauthError("config_unavailable")
         if os.path.exists(config.GOOGLE_CLIENT_SECRET_FILE):
             flow = OAuthFlow.from_client_secrets_file(
                 config.GOOGLE_CLIENT_SECRET_FILE,
@@ -496,24 +642,28 @@ async def complete_web_reauth(code: str, state: str) -> bool:
         else:
             client_config = _load_web_client_config_from_sources()
             if not client_config:
-                print(f"Google auth reauth: missing {config.GOOGLE_CLIENT_SECRET_FILE}")
-                return False
+                raise GoogleReauthError("config_unavailable")
             flow = OAuthFlow.from_client_config(
                 client_config,
                 scopes=config.GOOGLE_SCOPES,
                 redirect_uri=redirect_uri,
             )
-        flow.fetch_token(code=code)
-        creds = flow.credentials
-        _persist_credentials(creds)
+        failure_reason = "exchange_failed"
+        creds = _fetch_reauth_credentials(flow, code, required_scopes)
+        failure_reason = "persistence_failed"
+        _persist_credentials(creds, require_durable=True)
+        doc_ref.delete()
         _clear_reauth_required()
         _cached_creds = creds
-        doc_ref.delete()
+        _clear_reauth_alert_cooldown()
         print("Google auth reauth: token acquired and stored successfully")
         return True
+    except GoogleReauthError as exc:
+        print(f"Google auth reauth: {exc.reason}")
+        raise exc from None
     except Exception as exc:
-        print(f"Google auth reauth: token exchange failed: {exc}")
-        return False
+        print(f"Google auth reauth: {failure_reason} ({type(exc).__name__})")
+        raise GoogleReauthError(failure_reason) from None
 
 
 def _http_error_status(exc: Exception) -> int | None:
@@ -558,7 +708,7 @@ def classify_google_auth_error(exc: Exception, source: str = "google_workspace")
         "google_workspace",
         f"Google Workspace API auth failure ({source}) — {exc}",
         status=status,
-        reconnect_hint="reconnect via the /google-auth/start link in Chat",
+        reconnect_hint="ask momo for a fresh Google Workspace reconnect link",
     )
 
 

@@ -1,4 +1,5 @@
 import asyncio
+import importlib.util
 import os
 import shutil
 import sys
@@ -11,26 +12,6 @@ class _FakeRefreshError(Exception):
     pass
 
 
-_SENTINEL = object()
-_MODULES_TO_ISOLATE = [
-    "config",
-    "google",
-    "google.auth",
-    "google.auth.transport",
-    "google.auth.transport.requests",
-    "google.cloud",
-    "google.cloud.firestore",
-    "google.oauth2",
-    "google.oauth2.credentials",
-    "google_auth_oauthlib",
-    "google_auth_oauthlib.flow",
-    "chat_service",
-    "google_auth",
-]
-_ORIGINAL_MODULES = {name: sys.modules.get(name, _SENTINEL) for name in _MODULES_TO_ISOLATE}
-for name in _MODULES_TO_ISOLATE:
-    sys.modules.pop(name, None)
-
 config_mock = MagicMock()
 config_mock.GOOGLE_SCOPES = ["scope-a", "scope-b"]
 _TEST_TOKEN_DIR = tempfile.mkdtemp(prefix="momo-test-google-auth-")
@@ -38,7 +19,6 @@ config_mock.GOOGLE_TOKEN_FILE = os.path.join(_TEST_TOKEN_DIR, "token.json")
 config_mock.CHAT_SPACE_ID = "spaces/test"
 config_mock.MOMO_SERVICE_URL = "https://momo.example"
 config_mock.FIRESTORE_DATABASE = "testing"
-sys.modules["config"] = config_mock
 
 google_module = MagicMock()
 google_auth_module = MagicMock()
@@ -67,33 +47,45 @@ google_oauth2_credentials_module.Credentials = MagicMock(name="Credentials")
 google_auth_oauthlib_flow_module.InstalledAppFlow = MagicMock(name="InstalledAppFlow")
 google_cloud_firestore_module.Client = MagicMock(name="Client")
 
-sys.modules["google"] = google_module
-sys.modules["google.auth"] = google_auth_module
-sys.modules["google.auth.transport"] = google_auth_transport_module
-sys.modules["google.auth.transport.requests"] = google_auth_transport_requests_module
-sys.modules["google.cloud"] = google_cloud_module
-sys.modules["google.cloud.firestore"] = google_cloud_firestore_module
-sys.modules["google.oauth2"] = google_oauth2_module
-sys.modules["google.oauth2.credentials"] = google_oauth2_credentials_module
-sys.modules["google_auth_oauthlib"] = google_auth_oauthlib_module
-sys.modules["google_auth_oauthlib.flow"] = google_auth_oauthlib_flow_module
-sys.modules["chat_service"] = chat_service_module
+_TEST_MODULES = {
+    "config": config_mock,
+    "google": google_module,
+    "google.auth": google_auth_module,
+    "google.auth.transport": google_auth_transport_module,
+    "google.auth.transport.requests": google_auth_transport_requests_module,
+    "google.cloud": google_cloud_module,
+    "google.cloud.firestore": google_cloud_firestore_module,
+    "google.oauth2": google_oauth2_module,
+    "google.oauth2.credentials": google_oauth2_credentials_module,
+    "google_auth_oauthlib": google_auth_oauthlib_module,
+    "google_auth_oauthlib.flow": google_auth_oauthlib_flow_module,
+    "chat_service": chat_service_module,
+    "conversation_store": MagicMock(),
+}
 
-import google_auth
 
-sys.modules.pop("google_auth", None)
-sys.modules["google_auth"] = google_auth
+def _load_isolated(name):
+    path = os.path.join(os.path.dirname(os.path.dirname(__file__)), f"{name}.py")
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# Use real implementations with fake dependencies, without leaving collection-
+# time stubs in sys.modules for sibling tests to accidentally import.
+with patch.dict(sys.modules, _TEST_MODULES):
+    connection_errors = _load_isolated("connection_errors")
+    reauth_service = _load_isolated("reauth_service")
+    with patch.dict(sys.modules, {"reauth_service": reauth_service, "connection_errors": connection_errors}):
+        google_auth = _load_isolated("google_auth")
+_TEST_MODULES.update(google_auth=google_auth, reauth_service=reauth_service, connection_errors=connection_errors)
 
 
 def tearDownModule():
     google_auth._cached_creds = None
     shutil.rmtree(_TEST_TOKEN_DIR, ignore_errors=True)
-    for name in _MODULES_TO_ISOLATE:
-        original = _ORIGINAL_MODULES[name]
-        if original is _SENTINEL:
-            sys.modules.pop(name, None)
-        else:
-            sys.modules[name] = original
 
 
 def _make_creds(*, valid=True, expired=False, refresh_token="refresh-token", json_text="{}"): 
@@ -107,7 +99,18 @@ def _make_creds(*, valid=True, expired=False, refresh_token="refresh-token", jso
 
 class TestGoogleAuthSelfHealing(unittest.TestCase):
     def setUp(self):
+        modules_patch = patch.dict(sys.modules, _TEST_MODULES)
+        modules_patch.start()
+        self.addCleanup(modules_patch.stop)
+        db = MagicMock()
+        db.collection.return_value.document.return_value.get.return_value.exists = False
+        db_patch = patch.object(google_auth, "_get_db", return_value=db)
+        db_patch.start()
+        self.addCleanup(db_patch.stop)
         google_auth._cached_creds = None
+        google_auth._reauth_required = False
+        chat_service_module.send_chat_message.reset_mock(return_value=True, side_effect=True)
+        chat_service_module.send_chat_message.return_value = True
         google_auth.Credentials.from_authorized_user_info.reset_mock()
         google_auth.Credentials.from_authorized_user_file.reset_mock()
         google_auth.Request.reset_mock()
@@ -245,7 +248,7 @@ class TestGoogleAuthSelfHealing(unittest.TestCase):
         ), patch.object(
             google_auth,
             "_mark_reauth_required",
-            create=True,
+            wraps=google_auth._mark_reauth_required,
         ) as mock_mark_reauth, patch.object(
             google_auth,
             "_send_throttled_reauth_alert",
@@ -284,7 +287,7 @@ class TestGoogleAuthSelfHealing(unittest.TestCase):
         ), patch.object(
             google_auth,
             "_mark_reauth_required",
-            create=True,
+            wraps=google_auth._mark_reauth_required,
         ) as mock_mark_reauth, patch.object(
             google_auth,
             "_send_throttled_reauth_alert",
@@ -334,7 +337,7 @@ class TestGoogleAuthSelfHealing(unittest.TestCase):
             google_auth,
             "_record_reauth_alert_sent",
             create=True,
-        ), patch("chat_service.send_chat_message") as mock_send_chat:
+        ), patch("chat_service.send_chat_message", return_value=True) as mock_send_chat:
             result = google_auth._send_throttled_reauth_alert(service_url="https://momo.example")
 
         self.assertTrue(result)
@@ -347,6 +350,49 @@ class TestGoogleAuthSelfHealing(unittest.TestCase):
             config_mock.CHAT_SPACE_ID,
             "https://momo.example/google-auth/start?t=ticket-abc123",
         )
+
+    def test_create_reauth_link_validates_before_issuing_ticket(self):
+        with patch.object(config_mock, "MOMO_SERVICE_URL", ""), patch.object(
+            google_auth, "_create_reauth_ticket"
+        ) as create_ticket:
+            with self.assertRaises(reauth_service.ReauthLinkError):
+                google_auth.create_reauth_link()
+        create_ticket.assert_not_called()
+
+    def test_ticket_storage_failure_does_not_return_unusable_link_or_log_ticket(self):
+        db = MagicMock()
+        db.collection.return_value.document.return_value.set.side_effect = RuntimeError("secret-ticket")
+        with patch.object(google_auth, "_get_db", return_value=db), patch("builtins.print") as log:
+            with self.assertRaisesRegex(reauth_service.ReauthLinkError, "Could not create"):
+                google_auth.create_reauth_link()
+        self.assertNotIn("secret-ticket", str(log.call_args_list))
+
+    def test_tickets_remain_ten_minute_and_single_use(self):
+        db = MagicMock()
+        doc = db.collection.return_value.document.return_value
+        stored = {}
+        doc.set.side_effect = lambda data: stored.update(data)
+        doc.get.return_value.exists = True
+        doc.get.return_value.to_dict.side_effect = lambda: dict(stored)
+        with patch.object(google_auth, "_get_db", return_value=db), patch.object(
+            google_auth.time, "time", return_value=1000
+        ):
+            ticket = google_auth._create_reauth_ticket()
+            self.assertEqual(stored["expires_at"], 1600)
+            self.assertTrue(google_auth._consume_reauth_ticket(ticket))
+            self.assertFalse(google_auth._consume_reauth_ticket(ticket))
+            expired_ticket = google_auth._create_reauth_ticket()
+        with patch.object(google_auth, "_get_db", return_value=db), patch.object(
+            google_auth.time, "time", return_value=1601
+        ):
+            self.assertFalse(google_auth._consume_reauth_ticket(expired_ticket))
+
+    def test_failed_delivery_does_not_record_cooldown(self):
+        with patch.object(google_auth, "_should_send_throttled_reauth_alert", return_value=True), patch.object(
+            google_auth, "_record_reauth_alert_sent"
+        ) as record, patch.object(google_auth, "send_auth_notification", return_value=False):
+            self.assertFalse(google_auth._send_throttled_reauth_alert())
+        record.assert_not_called()
 
     def test_start_web_reauth_rejects_invalid_ticket_without_building_flow_or_pending_state(self):
         pending_state_db = MagicMock(name="pending_state_db")

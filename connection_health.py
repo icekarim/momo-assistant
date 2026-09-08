@@ -10,9 +10,10 @@ does the cheapest possible authenticated round-trip and classifies the result:
 
 State is persisted per connector in the `connection_health` Firestore
 collection so Chat alerts fire ONLY on transitions (→ auth_failed and the
-recovery back to ok), plus a reminder at most every 12h while still failing
-(mirrors the google_auth reauth-alert cooldown pattern). If Firestore itself
-is down, persistence is skipped and failures alert best-effort directly.
+recovery back to ok), plus a reminder at most every 12h while still failing.
+Google/Granola failure delivery uses the providers' shared cooldowns, including
+alerts sent inside probes. If Firestore is down, state persistence is skipped;
+failed provider delivery falls back to a notice asking for a fresh link.
 
 All heavyweight imports happen inside the probes so importing this module is
 cheap and probes stay independently mockable.
@@ -37,15 +38,10 @@ def get_db():
     return _get_db()
 
 
-def _send_alert(text: str) -> None:
+def _send_alert(text: str) -> bool:
     """Best-effort Chat alert; never raises into the health check."""
-    if not config.CHAT_SPACE_ID:
-        return
-    try:
-        from chat_service import send_chat_message
-        send_chat_message(config.CHAT_SPACE_ID, text)
-    except Exception as exc:
-        print(f"connection_health: alert send failed: {exc}")
+    from reauth_service import send_auth_notification
+    return send_auth_notification(text)
 
 
 def _result(connector: str, enabled: bool, status: str, *,
@@ -112,7 +108,7 @@ def probe_google_workspace() -> dict:
             return _result(
                 "google_workspace", True, "auth_failed",
                 error_kind="auth", error_message=str(exc),
-                user_message="Google Workspace needs re-auth — use the /google-auth/start link",
+                user_message="Google Workspace needs re-auth — ask momo for a fresh reconnect link",
             )
         except Exception as exc:
             from google_auth import classify_google_auth_error
@@ -169,7 +165,7 @@ def probe_granola() -> dict:
             return _result(
                 "granola", True, "auth_failed",
                 error_kind="auth", error_message="no Granola token available",
-                user_message="Granola needs re-auth — use the /granola-auth/start link",
+                user_message="Granola needs re-auth — ask momo for a fresh reconnect link",
             )
 
         async def _initialize_and_list():
@@ -188,7 +184,7 @@ def probe_granola() -> dict:
                 return _result(
                     "granola", True, "auth_failed",
                     error_kind="auth", error_message=str(exc),
-                    user_message="Granola needs re-auth — use the /granola-auth/start link",
+                    user_message="Granola needs re-auth — ask momo for a fresh reconnect link",
                 )
         except Exception:
             pass
@@ -345,7 +341,32 @@ def _alert_text(result: dict, kind: str) -> str:
             f"🔴 *{connector} still needs re-auth* (reminder)\n\n"
             f"{result.get('user_message') or ''}"
         ).strip()
-    return f"🟢 *{connector} connection restored* — back to normal."
+    return f"🟢 *{connector} connection restored* — the latest connection check passed."
+
+
+def _send_failure_alert(result: dict, kind: str) -> bool:
+    """One automatic failure/reminder delivery path per reauth provider."""
+    if result["connector"] == "google_workspace":
+        from google_auth import _send_throttled_reauth_alert
+        return _send_throttled_reauth_alert()
+    if result["connector"] == "granola":
+        from granola_service import send_reauth_alert
+        return send_reauth_alert()
+    return _send_alert(_alert_text(result, kind))
+
+
+def _clear_provider_alert_cooldown(connector: str) -> None:
+    """A confirmed recovery ends the provider's previous failure episode."""
+    try:
+        if connector == "google_workspace":
+            from google_auth import _clear_reauth_alert_cooldown
+        elif connector == "granola":
+            from granola_service import _clear_reauth_alert_cooldown
+        else:
+            return
+        _clear_reauth_alert_cooldown()
+    except Exception:
+        print(f"connection_health: could not clear reauth cooldown for '{connector}'")
 
 
 def _persist_and_alert(result: dict) -> None:
@@ -366,7 +387,14 @@ def _persist_and_alert(result: dict) -> None:
         print(f"connection_health: Firestore unavailable for '{connector}' ({exc}) — "
               "skipping persistence, best-effort alerting")
         if status == "auth_failed":
-            _send_alert(_alert_text(result, "failure"))
+            try:
+                delivered = _send_failure_alert(result, "failure")
+            except Exception:
+                delivered = False
+            if not delivered and connector in ("google_workspace", "granola"):
+                # Without state storage the provider may be unable to check its
+                # cooldown or mint a usable ticket. Send a link-free notice.
+                _send_alert(_alert_text(result, "failure"))
         return
 
     prev = prev or {}
@@ -376,15 +404,19 @@ def _persist_and_alert(result: dict) -> None:
 
     alerted_at = last_alerted_at
     if status == "auth_failed":
-        if prev_status != "auth_failed":
-            _send_alert(_alert_text(result, "failure"))
-            alerted_at = now
-        elif now - last_alerted_at >= _REMINDER_COOLDOWN_SECONDS:
-            _send_alert(_alert_text(result, "reminder"))
-            alerted_at = now
+        # Provider senders own the cooldown, not this independent health doc.
+        # In particular, a probe may already have delivered the alert.
+        if (connector in ("google_workspace", "granola")
+                or prev_status != "auth_failed"
+                or not last_alerted_at
+                or now - last_alerted_at >= _REMINDER_COOLDOWN_SECONDS):
+            kind = "reminder" if prev_status == "auth_failed" else "failure"
+            if _send_failure_alert(result, kind):
+                alerted_at = now
     elif status == "ok" and prev_status == "auth_failed":
-        _send_alert(_alert_text(result, "recovery"))
-        alerted_at = now
+        _clear_provider_alert_cooldown(connector)
+        if _send_alert(_alert_text(result, "recovery")):
+            alerted_at = now
 
     doc = {
         "status": status,
