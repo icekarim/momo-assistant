@@ -247,6 +247,9 @@ Cloud Scheduler ──► POST /meeting-prep
 | `/meeting-prep` | POST | Cloud Scheduler (every 10 min) | Pre-meeting prep briefs with KG context |
 | `/knowledge-backfill` | POST | One-time | Bootstrap knowledge graph from meetings, emails, calendar, tasks |
 | `/knowledge-embed-backfill` | POST | One-time | Add vector embeddings to existing KG entities |
+| `/google-token-refresh` | POST | Cloud Scheduler (every ~4h) | Keep Google OAuth token alive and surface reauth |
+| `/google-auth/start` | GET | Chat reauth link | Browser-based Google reauth (requires one-time ticket `?t=`) |
+| `/google-auth/callback` | GET | Google OAuth redirect | Completes Google reauth and stores credentials |
 | `/granola-token-refresh` | POST | Cloud Scheduler (every 4h) | Keep Granola OAuth token alive |
 
 ### Scheduled jobs (Cloud Scheduler)
@@ -258,6 +261,7 @@ Cloud Scheduler ──► POST /meeting-debrief         (every 10 minutes, work 
 Cloud Scheduler ──► POST /meeting-prep            (every 10 minutes, work hours)
 One-time         ──► POST /knowledge-backfill      (bootstrap knowledge graph)
 One-time         ──► POST /knowledge-embed-backfill (add embeddings to existing entities)
+Cloud Scheduler ──► POST /google-token-refresh     (every 4 hours - keeps Google token alive)
 Cloud Scheduler ──► POST /granola-token-refresh    (every 4 hours — keeps token alive)
 ```
 
@@ -329,7 +333,7 @@ momo/
 ├── conversation_store.py      # Firestore: conversation history, email/debrief/prep/nudge dedup
 ├── granola_service.py         # Granola MCP client: meeting notes, transcripts, token lifecycle
 ├── granola_auth_setup.py      # One-time local OAuth2 + PKCE flow for Granola authentication
-├── google_auth.py             # Thread-safe OAuth credential loading with auto-refresh
+├── google_auth.py             # Thread-safe OAuth credential loading, Firestore persistence, and self-healing reauth
 ├── auth_setup.py              # One-time local script to generate token.json via browser OAuth flow
 ├── config.py                  # All configuration loaded from environment variables
 ├── Dockerfile                 # python:3.12-slim, uvicorn entrypoint
@@ -403,9 +407,9 @@ The agent calls task tools directly during the tool-use loop — no regex parsin
 | Google Calendar API | Read events, upcoming and recently ended meetings | OAuth 2.0 (`calendar.readonly`) |
 | Google Tasks API | Read + write tasks (create, update, complete, delete) | OAuth 2.0 (`tasks`) |
 | Google Chat API | Receive webhook events, send messages | Application Default Credentials (service account) |
-| Cloud Firestore | Conversations, dedup (alerts/debriefs/preps/nudges), knowledge graph, Granola token | ADC / service account |
+| Cloud Firestore | Conversations, dedup (alerts/debriefs/preps/nudges), knowledge graph, `google_auth`, `google_auth_pending`, Granola token | ADC / service account |
 | Cloud Run | Hosts the FastAPI server | N/A |
-| Cloud Scheduler | Triggers `/briefing`, `/email-alerts`, `/meeting-debrief`, `/meeting-prep` | N/A |
+| Cloud Scheduler | Triggers `/briefing`, `/email-alerts`, `/meeting-debrief`, `/meeting-prep`, `/google-token-refresh`, `/granola-token-refresh` | N/A |
 | Granola MCP | Fetch meeting notes, transcripts, action items | OAuth 2.0 (PKCE, auto-refresh) |
 | Gemini Flash | Agentic chat (tool-use loop), briefings, debriefs, meeting prep, entity extraction, email triage | API key |
 | Gemini gemini-embedding-001 | Vector embeddings for knowledge graph semantic search (numpy-accelerated) | API key |
@@ -441,18 +445,31 @@ In the [Google Cloud Console](https://console.cloud.google.com/):
 
 1. Go to **APIs & Services > Credentials**
 2. Create an **OAuth 2.0 Client ID** (Application type: Web application)
-3. Add `http://localhost:8080/` to Authorized redirect URIs
+3. Add `http://localhost:8080/` to Authorized redirect URIs. In production, you MUST also add `https://<cloud-run-url>/google-auth/callback` and any custom-domain equivalent to the OAuth client's Authorized redirect URIs.
 4. Download the JSON and save it as `client_secret.json` in the project root
 
-### 3. Generate token.json (one-time local auth)
+Keep this as user OAuth for Gmail, Calendar, and Tasks. For production, the OAuth consent screen should not stay in External or Testing mode, because Google refresh tokens can expire after 7 days in that state. The self-serve reauth link is ticket-gated and only arrives via the Chat reauth alert, so the callback URI needs to be registered ahead of time.
+
+### 3. Generate token.json (local bootstrap)
 
 ```bash
 python auth_setup.py
 ```
 
-This opens a browser OAuth flow and writes `token.json`. Both files are gitignored and never committed. The token is thread-safe cached in memory and auto-refreshed when expired.
+This opens a browser OAuth flow and writes `token.json` locally. It is the bootstrap token for personal development, not the durable source of truth. `client_secret.json` and `token.json` are gitignored and never committed.
 
-### 4. Environment variables
+### 4. Google OAuth self-healing
+
+Momo keeps Google user OAuth alive with Firestore-backed token storage and a browser reauth flow.
+
+1. Local bootstrap writes `token.json` with `python auth_setup.py`
+2. `deploy.sh` seeds Firestore from that file, then passes `GOOGLE_TOKEN_JSON` to Cloud Run as a seed, or break-glass fallback
+3. At runtime, Google creds resolve in this order: in-memory cache -> Firestore `google_auth/token` -> `GOOGLE_TOKEN_JSON` -> local `token.json`
+4. If refresh fails, Momo marks `google_auth_pending/reauth_required`, then surfaces a self-serve link at `${MOMO_SERVICE_URL}/google-auth/start`
+5. The OAuth callback lands at `${MOMO_SERVICE_URL}/google-auth/callback`
+6. Cloud Scheduler calls `POST /google-token-refresh` every ~4 hours so refresh tokens stay warm and reauth gets surfaced early
+
+### 5. Environment variables
 
 Copy the example and fill in your values:
 
@@ -468,6 +485,13 @@ GCP_PROJECT_ID=your-gcp-project-id
 GOOGLE_CLIENT_SECRET_FILE=client_secret.json
 GOOGLE_TOKEN_FILE=token.json
 
+# Public Cloud Run base URL used for self-serve Google reauth links
+MOMO_SERVICE_URL=https://your-cloud-run-url
+
+# Cloud Run seed / break-glass fallback for Google OAuth token JSON
+# Firestore is the durable source of truth
+GOOGLE_TOKEN_JSON=
+
 # Google Chat space to post briefings to
 # Format: spaces/XXXXXXXXX — you'll see this logged on the first message Momo receives
 CHAT_SPACE_ID=
@@ -481,7 +505,7 @@ CLIENT_EMAIL_KEYWORDS=client,customer
 CLIENT_DOMAINS=
 ```
 
-### 5. Granola integration (optional)
+### 6. Granola integration (optional)
 
 Momo can pull meeting notes, decisions, and action items from [Granola](https://granola.ai).
 
@@ -501,7 +525,7 @@ GRANOLA_ENABLED=true
 
 If Granola is disabled, all meeting-note features are silently skipped.
 
-### 6. Run locally
+### 7. Run locally
 
 ```bash
 uvicorn main:app --host 0.0.0.0 --port 8080 --reload
@@ -524,10 +548,11 @@ export CHAT_SPACE_ID="spaces/XXXXXXXXX"
 ```
 
 The deploy script:
-- Reads `token.json` and `granola_token.json` into environment variables so no credential files are bundled in the image
+- Seeds Firestore from local `token.json`, then passes `GOOGLE_TOKEN_JSON` only as a Cloud Run seed, or break-glass fallback
+- Resolves Google creds at runtime from in-memory cache -> Firestore -> `GOOGLE_TOKEN_JSON` -> local file fallback
 - Syncs the Granola token to Firestore (if present)
 - Falls back to reading `CHAT_SPACE_ID` from `.env` if not in the environment, and warns if still unset
-- Deploys to Cloud Run with 1Gi memory, 300s timeout, 0-3 instances, unauthenticated access
+- Deploys to Cloud Run with 2Gi memory, 300s timeout, 0-3 instances, unauthenticated access
 
 After deploying:
 1. Copy the Cloud Run URL
@@ -539,7 +564,8 @@ After deploying:
    - `POST https://<url>/meeting-prep` — every 10 minutes during work hours
 4. (One-time) Bootstrap the knowledge graph: `curl -X POST https://<url>/knowledge-backfill`
 5. (One-time) Add embeddings to existing entities: `curl -X POST https://<url>/knowledge-embed-backfill`
-6. Create Cloud Scheduler job for Granola token keepalive: `POST https://<url>/granola-token-refresh` — every 4 hours
+6. Create Cloud Scheduler job for Google token keepalive: `POST https://<url>/google-token-refresh` — every ~4 hours
+7. Create Cloud Scheduler job for Granola token keepalive: `POST https://<url>/granola-token-refresh` — every 4 hours
 
 ---
 
@@ -553,6 +579,8 @@ After deploying:
 | `meeting_prep_sent` | Google Calendar event ID | Tracks which meetings have had prep briefs sent |
 | `proactive_nudges_sent` | hashed nudge key (MD5) | Deduplicates nudges with configurable cooldown window |
 | `knowledge_graph` | auto-generated | Extracted entities with provenance, vector embeddings, and metadata (source type/ID/title/date, related people/projects, tags) |
+| `google_auth` | `token` | Stores the Google OAuth token JSON and derived web client config used by Cloud Run |
+| `google_auth_pending` | `reauth_required` / `last_reauth_alert` | Tracks Google reauth state and throttled reauth alerts |
 | `granola_auth` | `token` | Stores the Granola OAuth token for Cloud Run (auto-refreshed) |
 
 ---
@@ -568,8 +596,9 @@ After deploying:
 | `PORT` | No | `8080` | Server port |
 | **Google Auth** | | | |
 | `GOOGLE_CLIENT_SECRET_FILE` | Local only | `client_secret.json` | Path to OAuth client secret |
-| `GOOGLE_TOKEN_FILE` | Local only | `token.json` | Path to OAuth token |
-| `GOOGLE_TOKEN_JSON` | Cloud Run | — | Full token JSON as a string (replaces token file) |
+| `GOOGLE_TOKEN_FILE` | Local only | `token.json` | Local bootstrap token written by `auth_setup.py`, and final file fallback if Firestore and env are unavailable |
+| `MOMO_SERVICE_URL` | Cloud Run | — | Public Cloud Run base URL used for self-serve Google reauth links, for example `${MOMO_SERVICE_URL}/google-auth/start` |
+| `GOOGLE_TOKEN_JSON` | Cloud Run | — | Seed or break-glass fallback for Google OAuth token JSON, not the durable source of truth |
 | **Gemini Models** | | | |
 | `GEMINI_MODEL_FLASH` | No | `gemini-3-flash-preview` | Model for standard/light tasks |
 | `GEMINI_MODEL_PRO` | No | `gemini-3.1-pro-preview` | Model for deep reasoning (auto-fallback to Flash) |

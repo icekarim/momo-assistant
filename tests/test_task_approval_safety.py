@@ -22,7 +22,7 @@ sys.modules["cachetools"] = MagicMock(TTLCache=DummyCache)
 sys.modules["fastapi"] = MagicMock()
 sys.modules["fastapi.responses"] = MagicMock()
 
-langsmith_mock = MagicMock()
+observability_mock = MagicMock()
 
 
 def traceable_mock(*args, **kwargs):
@@ -31,10 +31,8 @@ def traceable_mock(*args, **kwargs):
     return decorator
 
 
-langsmith_mock.traceable = traceable_mock
-langsmith_mock.traced_chat_send = MagicMock()
-langsmith_mock.traced_generate_content = MagicMock()
-sys.modules["langsmith_config"] = langsmith_mock
+observability_mock.observe = traceable_mock
+sys.modules["observability"] = observability_mock
 
 config_mock = MagicMock()
 config_mock.CHAT_SPACE_ID = "spaces/test_space"
@@ -60,6 +58,7 @@ sys.modules["conversation_store"] = MagicMock(
     clear_conversation=MagicMock(),
     conversation_scope=MagicMock(),
     get_pending_task_actions=MagicMock(),
+    get_pending_jira_actions=MagicMock(return_value=None),
     clear_pending_task_actions=MagicMock(),
     store_pending_task_actions=MagicMock(),
     store_pending_task_actions_if_empty=MagicMock(),
@@ -96,9 +95,11 @@ class TestTaskApprovalSafety(unittest.TestCase):
             "meeting_title": "",
             "approval_message": "",
         }
+        # Creates now emit a tray card and bypass this single-slot pending flow,
+        # so the anti-overwrite guard only applies to update/complete/delete.
         agent.run_agent_loop.return_value = (
             "done. i've queued that update.",
-            [{"action": "create", "title": "Follow up on project sync, credential rotation, and partner stats"}],
+            [{"action": "update", "find": "Follow up on project sync", "due": "2026-04-01"}],
         )
 
         main._process_message_background("move the report task to friday", "users/456", "spaces/123")

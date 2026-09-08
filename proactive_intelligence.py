@@ -12,15 +12,15 @@ Coordinator functions:
 """
 
 import hashlib
+import re
 import traceback
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
-import google.generativeai as genai
-
 import config
-from langsmith_config import traceable, traced_generate_content
+from observability import observe
+from claude_client import generate, extract_text, TaskComplexity
 from calendar_service import fetch_upcoming_meetings
 from chat_service import format_for_google_chat, send_chat_message
 from conversation_store import (
@@ -32,15 +32,17 @@ from conversation_store import (
     mark_prep_sent,
 )
 from knowledge_graph import (
+    get_canonical_aliases,
     query_all_entries,
     query_by_person,
     query_by_project,
     query_open_by_age,
     query_recent,
+    resolve_canonical,
+    stable_key,
     update_entity_status,
 )
 
-genai.configure(api_key=config.GEMINI_API_KEY)
 
 
 def _store_proactive_message(message: str, space_id: str) -> None:
@@ -110,7 +112,6 @@ Do NOT mention a person, task, project, blocker, departure, deadline, or decisio
 Do NOT combine facts across evidence items unless they share the same person or project explicitly.
 If evidence is weak or empty, say no strong prep context.
 Keep 3-6 bullets max.
-Start with: 📋 *meeting prep — {title}*
 
 Evidence:
 
@@ -122,11 +123,90 @@ Write a short pre-meeting prep. Include:
 - Relevant decisions or blockers from previous meetings
 - Anything the user should be prepared to discuss
 
-Format for Google Chat: use *bold* for names and topics, bullet points for items."""
+Relevance rules:
+- Only include context clearly connected to the non-owner attendees or this meeting's stated topic.
+- Ignore context connected only to the user themselves — their own unrelated projects and history do not belong in this prep.
+- Prefer recent information, and always show the date for anything older than ~3 months.
+- For intro meetings, or attendees with no history, say plainly that there's no prior context — never pad the brief with unrelated projects.
+
+If there's very little context, just say so briefly — don't pad it out.
+Format for Google Chat: use *bold* for names and topics, bullet points for items.
+Do NOT write a header or title line — output only the bullet points (and an optional short closing line)."""
+
+
+def _name_tokens(name: str) -> set[str]:
+    """Lowercase alphanumeric tokens of a name. For emails only the local part
+    is tokenized (domains like 'gmail.com' would cause false owner matches)."""
+    local = name.split("@", 1)[0] if "@" in name else name
+    return {t for t in re.findall(r"[a-z0-9]+", local.lower()) if len(t) >= 2}
+
+
+def _owner_identity_tokens() -> set[str]:
+    """Token set identifying the owner: OWNER_NAME plus any canonical aliases
+    identity resolution knows about. Empty set when OWNER_NAME is unset."""
+    owner = (config.OWNER_NAME or "").strip()
+    if not owner:
+        return set()
+    names = [owner]
+    try:
+        names.extend(get_canonical_aliases(owner))
+    except Exception as exc:
+        print(f"    Owner alias lookup failed: {exc}")
+    tokens: set[str] = set()
+    for candidate in names:
+        tokens.update(_name_tokens(candidate))
+    return tokens
+
+
+def _matches_owner(name: str, owner_tokens: set[str]) -> bool:
+    """Case-insensitive token overlap with the owner's identity
+    (e.g. 'Karim' matches owner 'Karim X')."""
+    return bool(owner_tokens) and bool(_name_tokens(name) & owner_tokens)
+
+
+def _entry_within_cutoff(entry: dict, cutoff: datetime) -> bool:
+    """True if the entry's source_date is on/after the cutoff. Entries with a
+    missing or unparseable source_date are KEPT (don't over-filter)."""
+    from knowledge_graph import _parse_source_date
+    entry_dt = _parse_source_date(entry.get("source_date"))
+    if entry_dt is None:
+        return True
+    return entry_dt >= cutoff
+
+
+def _rerank_prep_entries(entries: list[dict], title: str,
+                         attendee_names: list[str]) -> list[dict]:
+    """Rerank the merged KG context (person + semantic + project fan-out)
+    against THIS meeting — title plus non-owner attendees. The reranker drops
+    entries it judges irrelevant; on any failure the unreranked list is
+    returned (graceful fallback, mirrors semantic_search)."""
+    if not config.RERANK_ENABLED or len(entries) <= 1:
+        return entries
+
+    query = (
+        f"Upcoming meeting: {title}. Attendees: {', '.join(attendee_names)}. "
+        "Keep only entries plausibly relevant to THIS meeting and its "
+        "non-owner attendees; drop entries about unrelated people or projects."
+    )
+    texts = []
+    for e in entries:
+        people = ", ".join(e.get("related_people", []))
+        projects = ", ".join(e.get("related_projects", []))
+        texts.append(
+            f"[{e.get('source_date', '?')}] {e.get('name', '')}: {e.get('content', '')}"
+            f" (people: {people}; projects: {projects})"
+        )
+    try:
+        from claude_client import rerank as _rerank
+        order = _rerank(query, texts)
+        return [entries[i] for i in order]
+    except Exception as exc:
+        print(f"    KG context rerank failed, using unreranked list: {exc}")
+        return entries
 
 
 def _build_meeting_prep(meeting: dict) -> str | None:
-    """Gather KG context for a meeting and generate a prep brief via Gemini."""
+    """Gather bounded, relevant KG evidence and generate a prep via Claude."""
     attendee_names = [a["name"] for a in meeting.get("attendees", [])]
     if not attendee_names:
         return None
@@ -134,6 +214,7 @@ def _build_meeting_prep(meeting: dict) -> str | None:
     entries_by_id = {}
     title = meeting.get("title", "")
     from meeting_prep_accuracy import (
+        MEETING_PREP_MAX_PERSON_QUERIES,
         build_prep_diagnostics,
         finalize_evidence_gated_prep,
         format_prep_evidence_context,
@@ -163,19 +244,62 @@ def _build_meeting_prep(meeting: dict) -> str | None:
         existing["_query_labels"] = sorted_labels
         existing["_query_label"] = sorted_labels[0]
 
-    # Query KG in parallel: by planned people and, when specific enough, title.
+    # Recency window: KG entries older than this are stale for meeting prep.
+    cutoff_dt = (
+        datetime.now() - timedelta(days=config.MEETING_PREP_CONTEXT_MAX_AGE_DAYS)
+    ).replace(hour=0, minute=0, second=0, microsecond=0)
+    cutoff_str = cutoff_dt.strftime("%Y-%m-%d")
+
+    # The prep is FOR the owner — their own KG trail is noise here. Drop any
+    # attendee (or alias below) whose name overlaps the owner's identity.
+    owner_tokens = _owner_identity_tokens()
+    non_owner_attendees: list[str] = []
+    for attendee in attendee_names:
+        if _matches_owner(attendee, owner_tokens):
+            print(f"    Meeting prep: dropping owner attendee '{attendee}' from KG retrieval")
+        else:
+            non_owner_attendees.append(attendee)
+
+    # Expand only planned non-owner people. Base names take priority over
+    # aliases, and aliases share the planner's total person-query budget.
+    planned_people = [
+        person for person in query_plan["people"]
+        if not _matches_owner(person, owner_tokens)
+    ]
+    query_names: list[str] = []
+    query_attendee: dict[str, str] = {}  # query name -> base attendee
+    seen_query: set[str] = set()
+    for expand_aliases in (False, True):
+        for attendee in planned_people:
+            if len(query_names) >= MEETING_PREP_MAX_PERSON_QUERIES:
+                break
+            candidates = get_canonical_aliases(attendee) if expand_aliases else [attendee]
+            for candidate in candidates:
+                normalized = candidate.strip().lower()
+                if not normalized or normalized in seen_query:
+                    continue
+                if _matches_owner(candidate, owner_tokens):
+                    print(f"    Meeting prep: dropping owner alias '{candidate}' from KG retrieval")
+                    continue
+                seen_query.add(normalized)
+                query_names.append(candidate)
+                query_attendee[candidate] = attendee
+                if len(query_names) >= MEETING_PREP_MAX_PERSON_QUERIES:
+                    break
+
+    # Query KG in parallel, suppressing generic title searches per the planner.
     from knowledge_graph import semantic_search as _semantic_search
-    planned_people = query_plan["people"]
-    query_count = len(planned_people) + int(query_plan["include_title_semantic_search"])
+    successfully_queried_attendees: set[str] = set()
+    query_count = len(query_names) + int(query_plan["include_title_semantic_search"])
     if query_count:
-        workers = max(query_count, 4)
-        with ThreadPoolExecutor(max_workers=workers) as pool:
+        with ThreadPoolExecutor(max_workers=max(query_count, 4)) as pool:
             kg_futures = {
-                pool.submit(query_by_person, person, None, 8): f"person:{person}"
-                for person in planned_people
+                pool.submit(query_by_person, name, cutoff_str, 8): f"person:{name}"
+                for name in query_names
             }
             if query_plan["include_title_semantic_search"]:
-                title_future = pool.submit(_semantic_search, title, 10)
+                # Rerank the merged set once below, not each retrieval leg.
+                title_future = pool.submit(_semantic_search, title, limit=10, rerank=False)
                 kg_futures[title_future] = f"title:{title}"
             query_labels.extend(kg_futures.values())
 
@@ -183,7 +307,12 @@ def _build_meeting_prep(meeting: dict) -> str | None:
                 label = kg_futures[future]
                 try:
                     for entry in future.result():
+                        # Semantic retrieval has no date awareness; keep undated hits.
+                        if label.startswith("title:") and not _entry_within_cutoff(entry, cutoff_dt):
+                            continue
                         _add_labeled_entry(entry, label)
+                    if label.startswith("person:"):
+                        successfully_queried_attendees.add(query_attendee[label.removeprefix("person:")])
                 except Exception as exc:
                     print(f"    KG query failed ({label}): {exc}")
     else:
@@ -198,7 +327,7 @@ def _build_meeting_prep(meeting: dict) -> str | None:
     if project_list:
         with ThreadPoolExecutor(max_workers=len(project_list)) as pool:
             proj_futures = {
-                pool.submit(query_by_project, proj, None, 5): proj
+                pool.submit(query_by_project, proj, cutoff_str, 5): proj
                 for proj in project_list
             }
             query_labels.extend(f"project:{proj}" for proj in proj_futures.values())
@@ -210,12 +339,31 @@ def _build_meeting_prep(meeting: dict) -> str | None:
                 except Exception as exc:
                     print(f"    KG project query failed: {exc}")
 
-    all_entries = list(entries_by_id.values())
+    # Rerank the merged, deduped set against THIS meeting so context that is
+    # merely owner-adjacent (old unrelated projects) gets dropped.
+    all_entries = _rerank_prep_entries(
+        list(entries_by_id.values()), title, non_owner_attendees
+    )
     included_evidence, excluded_evidence = select_prep_evidence(meeting, all_entries)
     print(build_prep_diagnostics(meeting, included_evidence, excluded_evidence, query_labels))
 
     attendees_str = ", ".join(attendee_names)
     knowledge_context = format_prep_evidence_context(included_evidence)
+
+    # Report gaps only for successfully queried attendees, never for people
+    # skipped by the planner or whose queries failed.
+    # Only evidence surviving both filters counts as usable prior context.
+    attendees_with_context = {
+        query_attendee[label.removeprefix("person:")]
+        for item in included_evidence
+        for label in item.entry.get("_query_labels", [])
+        if label.startswith("person:") and label.removeprefix("person:") in query_attendee
+    }
+    missing_context_notes = [
+        f"(No relevant prior context found for {attendee}.)"
+        for attendee in non_owner_attendees
+        if attendee in successfully_queried_attendees and attendee not in attendees_with_context
+    ]
 
     prompt = _PREP_PROMPT.format(
         title=meeting["title"],
@@ -224,10 +372,12 @@ def _build_meeting_prep(meeting: dict) -> str | None:
         knowledge_context=knowledge_context,
     )
 
-    model = genai.GenerativeModel(model_name=config.GEMINI_MODEL_FLASH)
     try:
-        resp = traced_generate_content(model, prompt, model_name=config.GEMINI_MODEL_FLASH)
-        return finalize_evidence_gated_prep(title, resp.text.strip(), included_evidence)
+        msg = generate(prompt=prompt, tier=TaskComplexity.LIGHT)
+        return finalize_evidence_gated_prep(
+            title, extract_text(msg).strip(), included_evidence,
+            missing_context_notes=missing_context_notes,
+        )
     except Exception as exc:
         print(f"  Meeting prep generation failed: {exc}")
         return None
@@ -236,9 +386,11 @@ def _build_meeting_prep(meeting: dict) -> str | None:
 def run_meeting_prep() -> dict:
     """Check for upcoming meetings and send prep briefs for unsent ones.
 
-    Only creates a LangSmith trace when there are actual meetings to prep,
+    Only creates a Langfuse trace when there are actual meetings to prep,
     so idle polling runs don't flood the trace dashboard.
     """
+    from connection_errors import ExternalAuthError
+
     if not config.PROACTIVE_INTELLIGENCE_ENABLED or not config.MEETING_PREP_ENABLED:
         return {"status": "skipped", "reason": "meeting prep disabled"}
     if not config.KNOWLEDGE_GRAPH_ENABLED:
@@ -246,7 +398,16 @@ def run_meeting_prep() -> dict:
     if not config.CHAT_SPACE_ID:
         return {"status": "skipped", "reason": "CHAT_SPACE_ID not configured"}
 
-    upcoming = fetch_upcoming_meetings(hours=config.MEETING_PREP_LOOKAHEAD_HOURS)
+    try:
+        upcoming = fetch_upcoming_meetings(hours=config.MEETING_PREP_LOOKAHEAD_HOURS)
+    except ExternalAuthError as exc:
+        print(f"  Meeting prep calendar AUTH failure: {exc}")
+        return {
+            "status": "auth_failed",
+            "source": "calendar_events",
+            "reason": "Google Calendar connection needs re-auth",
+            "preps_sent": 0,
+        }
     if not upcoming:
         return {"status": "no_meetings", "preps_sent": 0}
 
@@ -267,7 +428,7 @@ def run_meeting_prep() -> dict:
     return _run_meeting_prep_traced(meetings_to_prep)
 
 
-@traceable(name="meeting-prep", tags=["proactive", "scheduled"])
+@observe(name="meeting-prep", capture_input=False)
 def _run_meeting_prep_traced(meetings: list) -> dict:
     """Traced inner function — only called when there are meetings to prep."""
     sent_count = 0
@@ -318,7 +479,6 @@ def _check_commitment_evidence(commitment: dict) -> str | None:
         from gmail_service import search_emails
         emails = search_emails(search_terms, days_back=30, max_results=3)
         if emails:
-            model = genai.GenerativeModel(model_name=config.GEMINI_MODEL_FLASH)
             commitment_desc = f"{name}: {content}"
             for email in emails:
                 prompt = _EVIDENCE_PROMPT.format(
@@ -328,8 +488,8 @@ def _check_commitment_evidence(commitment: dict) -> str | None:
                     body=(email.get("body", "") or "")[:500],
                 )
                 try:
-                    resp = traced_generate_content(model, prompt, model_name=config.GEMINI_MODEL_FLASH)
-                    if resp.text.strip().lower().startswith("yes"):
+                    msg = generate(prompt=prompt, tier=TaskComplexity.LIGHT)
+                    if extract_text(msg).lower().startswith("yes"):
                         return f"Found matching email: {email.get('subject', '?')}"
                 except Exception:
                     pass
@@ -355,8 +515,11 @@ def _run_commitment_engine() -> list[dict]:
 
     nudges = []
     for entry in overdue:
-        nudge_id = _nudge_key("commitment", entry.get("id", entry.get("name", "")))
-        if has_nudge_been_sent(nudge_id):
+        # Dual-read transition: legacy dedup docs use the old Firestore-id key;
+        # read both so the cooldown keeps suppressing. Only new_key is written.
+        new_key = _nudge_key("commitment", stable_key(entry))
+        old_key = _nudge_key("commitment", entry.get("id", entry.get("name", "")))
+        if has_nudge_been_sent(new_key) or has_nudge_been_sent(old_key):
             continue
 
         evidence = _check_commitment_evidence(entry)
@@ -388,7 +551,7 @@ def _run_commitment_engine() -> list[dict]:
             ),
             "related_entity_ids": [entry.get("id", "")],
             "delivery": "both" if priority == "high" else "briefing",
-            "_nudge_key": nudge_id,
+            "_nudge_key": new_key,
         })
 
     return nudges
@@ -423,12 +586,23 @@ def _run_pattern_engine() -> list[dict]:
     tag_counter: Counter = Counter()
     project_types: dict[str, list[str]] = defaultdict(list)
 
+    # Canonicalize counter keys so split variants ("Sarah" / "Sarah Chen") merge.
+    # resolve_canonical returns an identity map when KG_RESOLUTION_ENABLED is off,
+    # so counting is unchanged in that case.
+    person_canonical = resolve_canonical(
+        list({p for e in entries for p in e.get("related_people", [])})
+    )
+    project_canonical = resolve_canonical(
+        list({p for e in entries for p in e.get("related_projects", [])})
+    )
+
     for e in entries:
         for person in e.get("related_people", []):
-            people_counter[person] += 1
+            people_counter[person_canonical.get(person, person)] += 1
         for project in e.get("related_projects", []):
-            project_counter[project] += 1
-            project_types[project].append(e.get("entity_type", "topic"))
+            canonical_project = project_canonical.get(project, project)
+            project_counter[canonical_project] += 1
+            project_types[canonical_project].append(e.get("entity_type", "topic"))
         for tag in e.get("tags", []):
             tag_counter[tag] += 1
 
@@ -461,11 +635,10 @@ def _run_pattern_engine() -> list[dict]:
     if has_nudge_been_sent(nudge_id):
         return []
 
-    model = genai.GenerativeModel(model_name=config.GEMINI_MODEL_FLASH)
     try:
         prompt = _PATTERN_PROMPT.format(patterns="\n".join(pattern_lines))
-        resp = traced_generate_content(model, prompt, model_name=config.GEMINI_MODEL_FLASH)
-        text = resp.text.strip()
+        msg = generate(prompt=prompt, tier=TaskComplexity.LIGHT)
+        text = extract_text(msg).strip()
     except Exception as exc:
         print(f"  Pattern insight generation failed: {exc}")
         return []
@@ -581,7 +754,7 @@ def _run_drift_engine() -> list[dict]:
 # ── Coordinators ─────────────────────────────────────────────
 
 
-@traceable(name="daily-nudges", tags=["proactive", "scheduled"])
+@observe(name="daily-nudges", capture_input=False)
 def generate_daily_nudges() -> str:
     """Run commitment, pattern, and drift engines. Returns formatted text
     for inclusion in the morning briefing, or empty string if nothing to report."""

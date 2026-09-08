@@ -1,7 +1,7 @@
 """Momo briefing + proactive email alert orchestrator."""
 
 import json
-import google.generativeai as genai
+from claude_client import generate, extract_text, extract_json, TaskComplexity
 from gmail_service import (
     fetch_unread_client_emails,
     format_emails_for_context,
@@ -15,6 +15,7 @@ from calendar_service import (
 from tasks_service import fetch_open_tasks, format_tasks_for_context
 from gemini_service import generate_morning_briefing, generate_post_meeting_debrief
 from chat_service import send_chat_message, format_for_google_chat
+from connection_errors import ExternalAuthError
 from conversation_store import (
     add_turn,
     conversation_scope,
@@ -38,6 +39,61 @@ def _store_proactive_message(message: str, space_id: str) -> None:
         add_turn(conversation_scope(space=space_id), "assistant", message)
     except Exception as exc:
         print(f"  Failed to store proactive message in conversation history: {exc}")
+
+
+def get_pending_merge_suggestions(limit: int = 3):
+    """Thin re-export so the briefing's merge block reads the pending queue
+    through one monkeypatchable seam. Returns [] when KG_RESOLUTION_ENABLED is
+    off (the underlying resolution helper enforces the flag)."""
+    from knowledge_resolution import get_pending_merge_suggestions as _impl
+    return _impl(limit=limit)
+
+
+def _build_merge_suggestions_block() -> str:
+    """Compact pending-merge approval block for the morning briefing.
+
+    Returns "" when KG_RESOLUTION_ENABLED is off or there are no pending merges,
+    leaving the briefing unchanged in those cases. One line per suggestion:
+        'A' ↔ 'B' (0.82)
+    """
+    if not config.KG_RESOLUTION_ENABLED:
+        return ""
+    try:
+        pending = get_pending_merge_suggestions(limit=3)
+    except Exception as exc:
+        print(f"  Merge suggestions fetch failed: {exc}")
+        return ""
+    if not pending:
+        return ""
+
+    lines = ["MERGE SUGGESTIONS (reply to approve/reject):"]
+    for item in pending[:3]:
+        pair = list(item.get("pair", []))
+        a = pair[0] if len(pair) > 0 else "?"
+        b = pair[1] if len(pair) > 1 else "?"
+        confidence = item.get("confidence", 0.0)
+        lines.append(f"  '{a}' ↔ '{b}' ({confidence:.2f})")
+    return "\n".join(lines)
+
+
+_AUTH_NOTICE_NAMES = {
+    "emails": "Gmail",
+    "meetings": "Google Calendar",
+    "tasks": "Google Tasks",
+    "granola": "Granola",
+    "jira": "Jira",
+    "nudges": "proactive intelligence",
+}
+
+
+def _build_auth_failure_notice(auth_failures: dict) -> str:
+    """One visible line per source whose credentials are dead."""
+    if not auth_failures:
+        return ""
+    return "\n".join(
+        f"⚠️ {_AUTH_NOTICE_NAMES.get(key, key)} connection needs re-auth"
+        for key in sorted(auth_failures)
+    )
 
 
 def run_morning_briefing(space_id: str | None = None, bg_tasks=None):
@@ -70,6 +126,9 @@ def run_morning_briefing(space_id: str | None = None, bg_tasks=None):
             ctx = format_granola_notes_for_context(raw_notes)
             print(f"     Granola notes loaded ({len(ctx)} chars)")
             return "granola", ctx
+        except ExternalAuthError as e:
+            print(f"     Granola AUTH failure: {e}")
+            return "granola", e
         except Exception as e:
             print(f"     Granola fetch failed: {e}")
             return "granola", ""
@@ -81,6 +140,9 @@ def run_morning_briefing(space_id: str | None = None, bg_tasks=None):
             ctx = format_jira_tickets_for_context(raw)
             print(f"     Jira tickets loaded ({len(ctx)} chars)")
             return "jira", ctx
+        except ExternalAuthError as e:
+            print(f"     Jira AUTH failure: {e}")
+            return "jira", e
         except Exception as e:
             print(f"     Jira fetch failed: {e}")
             return "jira", ""
@@ -111,13 +173,26 @@ def run_morning_briefing(space_id: str | None = None, bg_tasks=None):
             futures["nudges"] = pool.submit(_fetch_nudges)
 
     data = {}
+    auth_failures: dict[str, ExternalAuthError] = {}
     for key, future in futures.items():
         try:
             label, value = future.result(timeout=120)
-            data[label] = value
+        except ExternalAuthError as e:
+            # Source credentials expired — substitute empty data for rendering
+            # but record the failure so the briefing SAYS so (never silent).
+            print(f"  {key} AUTH failure: {e}")
+            auth_failures[key] = e
+            data[key] = [] if key in ("emails", "meetings", "tasks") else ""
+            continue
         except Exception as e:
             print(f"  Error fetching {key}: {e}")
             data[key] = [] if key in ("emails", "meetings", "tasks") else ""
+            continue
+        if isinstance(value, ExternalAuthError):
+            auth_failures[label] = value
+            data[label] = [] if label in ("emails", "meetings", "tasks") else ""
+        else:
+            data[label] = value
 
     emails = data.get("emails", [])
     meetings = data.get("meetings", [])
@@ -126,7 +201,13 @@ def run_morning_briefing(space_id: str | None = None, bg_tasks=None):
     jira_ctx = data.get("jira", "")
     nudges_ctx = data.get("nudges", "")
 
-    if not emails and not meetings and not tasks and not granola_ctx and not jira_ctx and not nudges_ctx:
+    merge_ctx = _build_merge_suggestions_block()
+    if merge_ctx:
+        nudges_ctx = f"{nudges_ctx}\n\n{merge_ctx}" if nudges_ctx else merge_ctx
+
+    auth_notice = _build_auth_failure_notice(auth_failures)
+
+    if not emails and not meetings and not tasks and not granola_ctx and not jira_ctx and not nudges_ctx and not auth_notice:
         print("  Nothing to report. Skipping.")
         return {"status": "skipped", "reason": "nothing to report"}
 
@@ -134,12 +215,27 @@ def run_morning_briefing(space_id: str | None = None, bg_tasks=None):
     meetings_ctx = format_meetings_for_context(meetings)
     tasks_ctx = format_tasks_for_context(tasks)
 
-    print("  Generating briefing with Gemini...")
-    summary = generate_morning_briefing(
-        emails_ctx, meetings_ctx, tasks_ctx,
-        granola_context=granola_ctx, jira_context=jira_ctx,
-        nudges_context=nudges_ctx,
-    )
+    print("  Generating briefing with Claude...")
+    try:
+        summary = generate_morning_briefing(
+            emails_ctx, meetings_ctx, tasks_ctx,
+            granola_context=granola_ctx, jira_context=jira_ctx,
+            nudges_context=nudges_ctx,
+        )
+    except Exception as e:
+        # Never fail silently: tell the user in Chat (best-effort), then
+        # propagate so the /briefing endpoint returns non-2xx and Cloud
+        # Scheduler records a failed attempt.
+        print(f"  Morning briefing generation FAILED: {e}")
+        if target_space:
+            try:
+                send_chat_message(
+                    target_space,
+                    "⚠️ Morning briefing generation failed — check Cloud Run logs.",
+                )
+            except Exception as notify_exc:
+                print(f"  Failure-notice send also failed: {notify_exc}")
+        raise
     pending_scope = conversation_scope(space=target_space) if target_space else "latest"
     summary = _process_debrief_tasks(
         summary,
@@ -147,10 +243,27 @@ def run_morning_briefing(space_id: str | None = None, bg_tasks=None):
         scope_id=pending_scope,
     )
 
+    if auth_notice:
+        # A source failed with dead credentials — say so visibly instead of
+        # silently rendering the briefing from substituted-empty data.
+        summary = f"{auth_notice}\n\n{summary}"
+
     if target_space:
         print("  Sending to Google Chat...")
         formatted = format_for_google_chat(summary)
-        send_chat_message(target_space, formatted)
+        sent = send_chat_message(target_space, formatted)
+        if not sent:
+            # The Chat API rejected the send — this run FAILED. Propagate a
+            # failure status so /briefing returns non-2xx and Cloud Scheduler
+            # doesn't record a silent success.
+            print("Morning briefing delivery FAILED (Chat send error)")
+            return {
+                "status": "failed",
+                "reason": "chat delivery failed",
+                "emails": len(emails),
+                "meetings": len(meetings),
+                "tasks": len(tasks),
+            }
         _store_proactive_message(summary, target_space)
     else:
         print("  No CHAT_SPACE_ID configured. Printing to console:")
@@ -194,13 +307,20 @@ def _extract_briefing_sources_to_kg(meetings, tasks, granola_ctx, bg_tasks=None)
         if granola_ctx:
             print("  KG: extracting from Granola notes...")
             extract_from_granola_notes(granola_ctx, bg_tasks=bg_tasks)
+        if config.JIRA_ENABLED:
+            from jira_service import fetch_active_jira_tickets_data
+            from knowledge_graph import extract_from_jira_tickets
+            jira_tickets = fetch_active_jira_tickets_data()
+            if jira_tickets:
+                print("  KG: extracting from Jira tickets...")
+                extract_from_jira_tickets(jira_tickets, bg_tasks=bg_tasks)
     except Exception as e:
         print(f"  KG extraction from briefing sources failed: {e}")
 
 
 def run_proactive_email_alerts(bg_tasks=None):
     """Notify user when a new client/important email arrives.
-    Uses Gemini to triage emails the same way Momo would in conversation.
+    Uses Claude to triage emails the same way Momo would in conversation.
 
     When invoked from a FastAPI handler, pass `bg_tasks` so KG extraction
     runs via BackgroundTasks (survives cpu-throttling=true); otherwise
@@ -216,7 +336,7 @@ def run_proactive_email_alerts(bg_tasks=None):
     if not unseen:
         return {"status": "no_alerts", "alerts_sent": 0, "checked": len(emails)}
 
-    # Batch up to 10 unseen emails for a single Gemini triage call
+    # Batch up to 10 unseen emails for a single Claude triage call
     batch = unseen[: config.EMAIL_ALERTS_MAX_PER_RUN * 2]
     triage_results = _gemini_triage_emails(batch)
     sent_count = 0
@@ -283,9 +403,7 @@ EMAILS:
 
 
 def _gemini_triage_emails(emails):
-    """Use Gemini to decide which emails deserve a proactive alert."""
-    genai.configure(api_key=config.GEMINI_API_KEY)
-
+    """Use Claude to decide which emails deserve a proactive alert."""
     email_block = ""
     for i, e in enumerate(emails):
         body_preview = (e.get("body", "") or "")[:800]
@@ -300,19 +418,13 @@ def _gemini_triage_emails(emails):
 
     prompt = _TRIAGE_PROMPT + email_block
 
-    model = genai.GenerativeModel(model_name=config.GEMINI_MODEL)
-
     try:
-        resp = model.generate_content(prompt)
-        text = resp.text.strip()
-        # Strip markdown code fences if present
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-        if text.endswith("```"):
-            text = text[: text.rfind("```")]
-        results = json.loads(text.strip())
+        msg = generate(prompt=prompt, tier=TaskComplexity.LIGHT)
+        results = extract_json(extract_text(msg))
+        if results is None:
+            return []
     except Exception as exc:
-        print(f"Gemini triage failed: {exc}")
+        print(f"Claude triage failed: {exc}")
         return []
 
     email_map = {e["id"]: e for e in emails}
@@ -333,47 +445,57 @@ def _gemini_triage_emails(emails):
     return flagged
 
 
-def _process_debrief_tasks(debrief_text, meeting_title="", scope_id="latest"):
-    """Parse [CREATE_TASK] tags from a debrief, store them as pending
-    proposals for user confirmation, and return cleaned text with a
-    nicely formatted suggestion section replacing the raw tags."""
-    import re
-    from conversation_store import store_pending_tasks
+def _process_debrief_tasks(debrief_text, meeting_title="", space="", scope_id=""):
+    """Parse [CREATE_TASK] tags, dedup against open tasks, and append a plain-text
+    "Suggested follow-ups" list to the cleaned debrief.
 
-    pattern = r'\[CREATE_TASK\]\s*title="([^"]+)"(?:\s*due="([^"]*)")?(?:\s*notes="([^"]*)")?'
+    Reverted from interactive tray cards: async REST cards posted by the service
+    account never deliver CARD_CLICKED button events in Google Chat, so debrief
+    suggestions are rendered as text. The user creates any they want via a normal
+    conversational request, which returns a synchronous (working) tray card. No
+    task batch is stored and no card is sent here — the caller sends the returned
+    text. ``space`` / ``scope_id`` are accepted for call-site compatibility.
+    """
+    import re
+    import tasks_service
+
+    pattern = r'\[CREATE_TASK\]\s*title="([^"]+)"(?:\s*due="([^"]*)")?(?:\s*owner="([^"]*)")?(?:\s*priority="([^"]*)")?'
     matches = list(re.finditer(pattern, debrief_text))
     if not matches:
         return debrief_text
 
     cleaned = re.sub(r'\[CREATE_TASK\][^\n]*\n?', '', debrief_text).rstrip()
 
-    pending = []
-    suggestion_lines = []
-    for idx, match in enumerate(matches, start=1):
+    try:
+        open_tasks = tasks_service.fetch_open_tasks()
+    except Exception:
+        open_tasks = []
+
+    suggestions = []
+    for match in matches:
         title = match.group(1)
         due = match.group(2) or None
-        notes = match.group(3) or ""
-        task = {"title": title}
-        if due:
-            task["due"] = due
-        if notes:
-            task["notes"] = notes
-        pending.append(task)
-        due_str = f" (due {due})" if due else ""
-        suggestion_lines.append(f"  {idx}. {title}{due_str}")
 
-    store_pending_tasks(pending, meeting_title=meeting_title, scope_id=scope_id)
-
-    cleaned += "\n\n📋 *Suggested tasks:*\n" + "\n".join(suggestion_lines)
-    if len(pending) == 1:
-        cleaned += "\n\n_Reply *yes* to create this task in Google Tasks, or *no* to dismiss it_"
-    else:
-        cleaned += (
-            f"\n\n_Reply *yes* to create all {len(pending)} tasks in Google Tasks, "
-            "*approve 2* to create only task #2, or *no* to dismiss them_"
+        is_dup = any(
+            tasks_service._task_identity_match(title, due, t.get("title", ""), t.get("due"))
+            for t in open_tasks
         )
+        if is_dup:
+            continue
+        suggestions.append((title, due))
 
-    return cleaned
+    if not suggestions:
+        return cleaned
+
+    lines = ["📋 Suggested follow-ups:"]
+    for title, due in suggestions:
+        lines.append(f"• {title} (due {due})" if due else f"• {title}")
+    lines.append("")
+    lines.append(
+        f'want any of these added? just tell me — e.g. "add the {suggestions[0][0]} task".'
+    )
+
+    return f"{cleaned}\n\n" + "\n".join(lines)
 
 
 def _notes_are_substantive(granola_notes: str) -> bool:
@@ -502,12 +624,15 @@ def run_post_meeting_debrief(bg_tasks=None):
         try:
             end_time = meeting.get("end_time", "")
             event_id = meeting.get("id", "")
-            debrief = generate_post_meeting_debrief(title, attendees, granola_notes, end_time)
-            pending_scope = f"space:{config.CHAT_SPACE_ID}" if config.CHAT_SPACE_ID else "latest"
+            try:
+                open_tasks = fetch_open_tasks()
+            except Exception:
+                open_tasks = []
+            debrief = generate_post_meeting_debrief(title, attendees, granola_notes, end_time, open_tasks=open_tasks)
             debrief = _process_debrief_tasks(
                 debrief,
                 meeting_title=title,
-                scope_id=pending_scope,
+                space=config.CHAT_SPACE_ID,
             )
             formatted = format_for_google_chat(debrief)
             send_chat_message(config.CHAT_SPACE_ID, formatted)
@@ -549,8 +674,12 @@ def run_post_meeting_debrief(bg_tasks=None):
             print(f"    {reason} past grace window ({grace}m), sending without notes")
             try:
                 end_time = meeting.get("end_time", "")
-                debrief = generate_post_meeting_debrief(title, attendees, "", end_time)
-                debrief = _process_debrief_tasks(debrief, meeting_title=title)
+                try:
+                    nm_open_tasks = fetch_open_tasks()
+                except Exception:
+                    nm_open_tasks = []
+                debrief = generate_post_meeting_debrief(title, attendees, "", end_time, open_tasks=nm_open_tasks)
+                debrief = _process_debrief_tasks(debrief, meeting_title=title, space=config.CHAT_SPACE_ID)
                 formatted = format_for_google_chat(debrief)
                 send_chat_message(config.CHAT_SPACE_ID, formatted)
                 _store_proactive_message(debrief, config.CHAT_SPACE_ID)

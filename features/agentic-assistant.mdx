@@ -1,0 +1,50 @@
+---
+title: "Agentic Conversational Assistant"
+description: "A Claude Sonnet 5-powered agent loop with tool calling across 13 tools"
+---
+
+Momo uses a **Claude Sonnet 5-powered agent loop with tool calling**. When you send a message, Claude autonomously decides which tools to invoke — Gmail, Calendar, Tasks, Knowledge Graph, Granola, Jira — executes them, observes the results, and iterates (up to 6 rounds) until it has enough data to respond. Each tool has its own timeout (10-15s) and runs in a thread pool.
+
+Ask Momo anything about your work context in plain language:
+
+- *"what's on my calendar today?"* → calls `get_todays_calendar`
+- *"any urgent emails from clients?"* → calls `get_recent_emails`
+- *"what did we decide in the product standup?"* → calls `search_knowledge_graph`
+- *"pull up the action items from yesterday's call"* → calls `get_meeting_notes` + `search_knowledge_graph`
+- *"push all my tasks to Friday"* → calls `get_open_tasks` then `update_task` for each
+- *"what commitments have I made this week?"* → calls `search_knowledge_graph`
+- *"create a task to follow up with Sarah by Friday"* → calls `create_task`
+
+## The 13 tools
+
+The agent has access to **13 tools**:
+
+| Tool | Description |
+|---|---|
+| `get_todays_calendar` | Today's meetings with times, attendees, details |
+| `get_calendar_for_date` | Meetings for a specific date |
+| `get_open_tasks` | All open tasks across task lists |
+| `create_task` | Create a new task (with dedup) |
+| `update_task` | Update task title, due date, or notes |
+| `complete_task` | Mark a task as done |
+| `delete_task` | Delete a task |
+| `get_recent_emails` | Recent unread inbox emails |
+| `search_emails` | Search emails by query, person, or topic |
+| `search_knowledge_graph` | Semantic search across all institutional memory |
+| `get_meeting_notes` | Search Granola meeting notes and transcripts |
+| `get_jira_tickets` | Active Jira tickets for the user |
+| `search_jira_tickets` | Search Jira by text query |
+
+Chat messages are also extracted into the knowledge graph in the background, so context from conversations is captured alongside meetings and emails.
+
+## When a connector is unauthenticated
+
+If a tool call hits an expired token or revoked scope, the agent no longer treats the empty response as "no data". The tool returns a structured error and Momo replies with the affected service name and a prompt to reconnect — for example:
+
+> Jira credentials look expired, so I can't see your tickets right now. Reconnect Jira and ask me again.
+
+This prevents Momo from confidently reporting "no results" when the underlying integration is actually broken.
+
+<Note>
+Agentic mode is on by default (`AGENTIC_MODE_ENABLED=true`). If disabled, Momo falls back to a legacy context mode for chat.
+</Note>

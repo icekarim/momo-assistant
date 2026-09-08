@@ -1,5 +1,7 @@
 import unittest
-from unittest.mock import MagicMock, patch
+from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from meeting_prep_accuracy import (
     PrepEvidence,
@@ -10,6 +12,10 @@ from meeting_prep_accuracy import (
     select_prep_evidence,
     format_prep_evidence_context,
 )
+
+
+def _claude_message(text):
+    return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)])
 
 
 class TestMeetingPrepAccuracyUtilities(unittest.TestCase):
@@ -200,12 +206,71 @@ class TestMeetingPrepAccuracyUtilities(unittest.TestCase):
         )
         self.assertNotIn("hallucinated", brief)
 
+    def test_missing_context_notes_reserve_bullets_without_citations(self):
+        evidence = [PrepEvidence(
+            "E1", {"source_title": "Launch", "source_date": "2026-05-13"},
+            80, ["exact source title"],
+        )]
+        notes = ["(No relevant prior context found for Dana.)", "(No relevant prior context found for Alex.)"]
+        brief = finalize_evidence_gated_prep(
+            "Launch", "\n".join(f"- Item {i} [E1]" for i in range(1, 9)),
+            evidence, missing_context_notes=notes,
+        )
+
+        bullets = [line for line in brief.splitlines() if line.startswith("- ")]
+        self.assertEqual(len(bullets), 6)
+        self.assertIn("Item 5", bullets[4])
+        self.assertNotIn("Item 6", brief)
+        self.assertEqual(bullets[-1], f"- {' '.join(notes)}")
+        self.assertNotIn("source:", bullets[-1])
+
+    def test_missing_context_notes_never_drop_attendees_beyond_six(self):
+        notes = [f"(No relevant prior context found for Person {i}.)" for i in range(10)]
+        brief = finalize_evidence_gated_prep(
+            "weekly sync", "- Invented context [E1]", [],
+            missing_context_notes=notes,
+        )
+
+        self.assertEqual(sum(line.startswith("- ") for line in brief.splitlines()), 1)
+        self.assertIn("I don't have strong prep context for this one yet.", brief)
+        for note in notes:
+            self.assertIn(note, brief)
+        self.assertNotIn("source:", brief)
+        self.assertNotIn("Invented", brief)
+
+    def test_missing_context_overflow_preserves_notes_with_cited_evidence(self):
+        evidence = [
+            PrepEvidence("E1", {"source_title": "Launch", "source_date": "2026-05-13"}, 80, []),
+            PrepEvidence("E2", {"source_title": "Decision", "source_date": "2026-05-12"}, 80, []),
+        ]
+        raw = "\n".join(f"- Supported detail {i} [E{i % 2 + 1}]" for i in range(1, 8))
+        for count in (6, 8):
+            with self.subTest(note_count=count):
+                notes = [f"(No relevant prior context found for Person {i}.)" for i in range(count)]
+                brief = finalize_evidence_gated_prep(
+                    "Launch", raw, evidence, missing_context_notes=notes,
+                )
+
+                bullets = [line for line in brief.splitlines() if line.startswith("- ")]
+                self.assertEqual(len(bullets), 6)
+                self.assertEqual(sum("source:" in line for line in bullets), 5)
+                self.assertIn("Supported detail 5", bullets[4])
+                self.assertNotIn("Supported detail 6", brief)
+                self.assertIn("_(source: Launch, 2026-05-13)_", brief)
+                self.assertIn("_(source: Decision, 2026-05-12)_", brief)
+                for note in notes:
+                    self.assertIn(note, bullets[-1])
+                self.assertNotIn("source:", bullets[-1])
+                self.assertNotIn("[E1]", brief)
+                self.assertNotIn("[E2]", brief)
+                self.assertNotIn("I don't have strong prep context", brief)
+
 
 class TestMeetingPrepRetrievalPlanning(unittest.TestCase):
     def test_large_generic_meeting_skips_title_search_and_limits_people(self):
         meeting = {
             "title": "last sync part 2",
-            "description": "Agenda: final handovers for Agnes Jang",
+            "description": "Agenda: final handovers for Alex Rivera",
             "organizer": "user@example.com",
             "attendees": [
                 {"name": "alex.rivera@example.com"},
@@ -242,13 +307,13 @@ class TestMeetingPrepRetrievalPlanning(unittest.TestCase):
 
     def test_large_generic_meeting_does_not_treat_email_domain_as_a_mention(self):
         # The description quotes the organizer's personal gmail. The ".com"
-        # token used to match every attendee's @rokt.com email, falsely
+        # token used to match every attendee's @example.com email, falsely
         # promoting unrelated attendees into the "mentioned in description"
-        # bucket. Only Agnes is actually named in the text.
+        # bucket. Pat is the only non-organizer attendee named in the text.
         meeting = {
             "title": "last sync part 2",
             "description": (
-                "Piggy backing onto Parth's event. Come say bye! "
+                "Piggy backing onto Pat Miller's event. Come say bye! "
                 "alex.rivera98@example.com"
             ),
             "organizer": "alex.rivera@example.com",
@@ -275,6 +340,19 @@ class TestMeetingPrepRetrievalPlanning(unittest.TestCase):
 
 
 class TestMeetingPrepEvidenceScoring(unittest.TestCase):
+    def setUp(self):
+        # Keep real modules and Claude text extraction, with external boundaries
+        # stubbed and the clock fixed to the evidence fixtures' date.
+        import proactive_intelligence
+
+        for name, value in (("KG_RESOLUTION_ENABLED", False), ("OWNER_NAME", "Karim Tanber")):
+            patcher = patch.object(proactive_intelligence.config, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        clock = patch.object(proactive_intelligence, "datetime", wraps=datetime)
+        clock.start().now.return_value = datetime(2026, 5, 13, 12)
+        self.addCleanup(clock.stop)
+
     def test_selects_evidence_ids_stably_independent_of_input_order(self):
         meeting = {
             "title": "PacSun launch",
@@ -398,9 +476,10 @@ class TestMeetingPrepEvidenceScoring(unittest.TestCase):
 
         captured_prompts = []
 
-        def fake_generate(_model, prompt, model_name):
+        def fake_generate(*, prompt, tier):
+            self.assertEqual(tier, proactive_intelligence.TaskComplexity.LIGHT)
             captured_prompts.append(prompt)
-            return MagicMock(text="brief")
+            return _claude_message("brief")
 
         meeting = {
             "title": "weekly sync",
@@ -410,8 +489,7 @@ class TestMeetingPrepEvidenceScoring(unittest.TestCase):
 
         with (
             patch.object(proactive_intelligence, "query_by_person", return_value=[]),
-            patch.object(proactive_intelligence.genai, "GenerativeModel", return_value=object()),
-            patch.object(proactive_intelligence, "traced_generate_content", side_effect=fake_generate),
+            patch.object(proactive_intelligence, "generate", side_effect=fake_generate),
         ):
             brief = proactive_intelligence._build_meeting_prep(meeting)
 
@@ -459,11 +537,10 @@ class TestMeetingPrepEvidenceScoring(unittest.TestCase):
             patch.object(proactive_intelligence, "query_by_person", return_value=[duplicate_entry]),
             patch.object(knowledge_graph, "semantic_search", return_value=[duplicate_entry]),
             patch.object(meeting_prep_accuracy, "select_prep_evidence", side_effect=capture_select),
-            patch.object(proactive_intelligence.genai, "GenerativeModel", return_value=object()),
             patch.object(
                 proactive_intelligence,
-                "traced_generate_content",
-                return_value=MagicMock(text="brief"),
+                "generate",
+                return_value=_claude_message("brief"),
             ),
         ):
             proactive_intelligence._build_meeting_prep(meeting)
@@ -503,11 +580,10 @@ class TestMeetingPrepEvidenceScoring(unittest.TestCase):
 
         with (
             patch.object(proactive_intelligence, "query_by_person", return_value=[evidence_entry]),
-            patch.object(proactive_intelligence.genai, "GenerativeModel", return_value=object()),
             patch.object(
                 proactive_intelligence,
-                "traced_generate_content",
-                return_value=MagicMock(text=raw_brief),
+                "generate",
+                return_value=_claude_message(raw_brief),
             ),
         ):
             brief = proactive_intelligence._build_meeting_prep(meeting)

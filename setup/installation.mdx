@@ -1,0 +1,36 @@
+---
+title: "Installation"
+description: "Prerequisites, cloning the repo, and running Momo locally"
+---
+
+## Prerequisites
+
+- Python 3.12+
+- A Google Cloud project with the following APIs enabled:
+  - Gmail API
+  - Google Calendar API
+  - Google Tasks API
+  - Google Chat API
+  - Cloud Firestore
+- A Google Chat App (bot) configured with your Cloud Run URL as the HTTP endpoint
+- An [Anthropic API key](https://console.anthropic.com/) (used by Claude for the agent loop, briefings, debriefs, meeting prep, entity extraction, and email triage)
+- A Gemini API key from [Google AI Studio](https://aistudio.google.com/) (used only for vector embeddings via `gemini-embedding-001`)
+
+## Clone and install
+
+```bash
+git clone https://github.com/icekarim/momo-assistant.git
+cd momo-assistant
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+## Run locally
+
+Once you've completed [Google auth](/setup/google-auth) and [configuration](/setup/configuration):
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8080 --reload
+```
+
+Use [ngrok](https://ngrok.com/) to expose the local server and point your Google Chat App HTTP endpoint to `https://<your-ngrok-url>/chat`.

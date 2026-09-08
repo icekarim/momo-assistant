@@ -1,0 +1,33 @@
+---
+title: "Morning Briefing"
+description: "A structured daily briefing in Google Chat at 8 AM"
+---
+
+At 8 AM, Momo sends a structured daily briefing covering:
+
+- **Inbox** — prioritized summary of unread emails with triage (urgent / needs attention / FYI)
+- **Calendar** — today's meetings and schedule
+- **Tasks** — all open items from Google Tasks
+- **Yesterday's meetings** — key decisions, action items, and follow-ups pulled from Granola notes
+- **Momo's nudges** — proactive insights from the intelligence engine: overdue commitments, patterns, stale items
+
+## How it's assembled
+
+The `/briefing` endpoint is triggered daily by Cloud Scheduler and orchestrated by `briefing.py`:
+
+1. Fetches unread emails, today's meetings, all open tasks (in parallel)
+2. Optionally fetches yesterday's meeting notes from Granola
+3. Runs proactive intelligence engines (commitment follow-up, pattern detection, drift detection)
+4. Sends all context + nudges to Claude Sonnet 5 → formatted morning briefing
+5. Posts the result to the configured Google Chat space
+6. Feeds calendar events, tasks, and Granola notes into the knowledge graph (background)
+
+## When a connector needs re-auth
+
+If a source (Gmail, Calendar, Tasks, Granola, or Jira) can't authenticate when the briefing runs, Momo prepends a visible line to the briefing instead of quietly leaving that section empty:
+
+```
+⚠️ Jira connection needs re-auth
+```
+
+That way you can see at a glance that the missing content is a credential problem, not a genuinely quiet day. Reconnect the flagged service to restore that section on the next run.

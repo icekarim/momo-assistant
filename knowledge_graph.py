@@ -6,6 +6,7 @@ Firestore, and provides query functions for surfacing institutional memory in
 Momo's chat responses.
 """
 
+import hashlib
 import json
 import re
 import threading
@@ -15,12 +16,17 @@ from email.utils import parsedate_to_datetime
 
 import google.generativeai as genai
 from cachetools import TTLCache
+from google.api_core import exceptions as gapi_exceptions
+from google.api_core import retry as gapi_retry
 from google.cloud.firestore_v1.base_query import FieldFilter
 from google.cloud.firestore_v1.base_vector_query import DistanceMeasure
 from google.cloud.firestore_v1.vector import Vector
 
 import config
+from claude_client import TaskComplexity, extract_json, extract_text, generate
+from connection_errors import ExternalAuthError
 from conversation_store import get_db
+from observability import observe
 
 _kg_cache = TTLCache(maxsize=128, ttl=300)
 _kg_cache_lock = threading.Lock()
@@ -49,15 +55,55 @@ def _build_embedding_text(entry: dict, source_type: str = "") -> str:
     return " | ".join(p for p in parts if p)
 
 
+def _is_gemini_auth_error(exc: Exception) -> bool:
+    """Classify google.api_core / genai auth failures (expired or invalid API
+    key, revoked access, missing permission) without hard dependencies."""
+    try:
+        from google.api_core import exceptions as gac_exceptions
+        if isinstance(exc, (gac_exceptions.Unauthenticated, gac_exceptions.PermissionDenied)):
+            return True
+    except ImportError:
+        pass
+    code = getattr(exc, "code", None)
+    if code in (401, 403):
+        return True
+    text = str(exc)
+    return any(marker in text for marker in (
+        "API key not valid", "API_KEY_INVALID", "UNAUTHENTICATED", "PERMISSION_DENIED",
+    ))
+
+
 def _get_embedding(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list[float]:
-    """Generate an embedding vector for a text string using Gemini."""
-    result = genai.embed_content(
-        model=config.GEMINI_EMBEDDING_MODEL,
-        content=text,
-        task_type=task_type,
-        output_dimensionality=config.GEMINI_EMBEDDING_DIM,
-    )
+    """Generate an embedding vector for a text string using Gemini.
+
+    Auth failures raise ExternalAuthError("gemini") so callers can distinguish
+    "credentials expired" from a transient embedding failure."""
+    try:
+        result = genai.embed_content(
+            model=config.GEMINI_EMBEDDING_MODEL,
+            content=text,
+            task_type=task_type,
+            output_dimensionality=config.GEMINI_EMBEDDING_DIM,
+        )
+    except Exception as exc:
+        if _is_gemini_auth_error(exc):
+            raise ExternalAuthError(
+                "gemini",
+                f"Gemini embedding auth failure — {exc}",
+                reconnect_hint="check/rotate GEMINI_API_KEY",
+            ) from exc
+        raise
     return result["embedding"]
+
+
+@observe(name="kg-query-embedding", as_type="embedding", capture_output=False)
+def _get_query_embedding(text: str) -> list[float]:
+    """Query-time embedding (traced as an embedding observation).
+
+    Ingestion-time embeddings go through the raw _get_embedding and stay
+    untraced on purpose — they're bulk micro-ops and would burn the Langfuse
+    unit budget (Hobby = 50k units/mo)."""
+    return _get_embedding(text, task_type="RETRIEVAL_QUERY")
 
 
 _EMAIL_RE = re.compile(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}")
@@ -119,6 +165,25 @@ def _normalize_text(value: str | None) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", (value or "").lower()))
 
 
+def stable_key(entity: dict) -> str:
+    """Generate a stable, deterministic key for entity dedup in nudge system.
+
+    Produces a 16-character lowercase hex string from source_id and normalized name.
+    Used for nudge dedup in KG v2 Phase 0.5 to maintain stable identity across
+    Firestore document-id changes.
+
+    Args:
+        entity: dict with optional 'source_id' and 'name' keys
+
+    Returns:
+        16-character lowercase hex string (first 16 chars of SHA1 hexdigest)
+    """
+    source_id = str(entity.get("source_id") or "")
+    normalized_name = _normalize_text(str(entity.get("name") or ""))
+    key_input = f"{source_id}|{normalized_name}".encode()
+    return hashlib.sha1(key_input).hexdigest()[:16]
+
+
 def _person_tokens(value: str | None) -> list[str]:
     text = (value or "").strip().lower()
     if not text:
@@ -170,6 +235,43 @@ def _project_matches(query: str, candidate: str) -> bool:
     return q in c or c in q
 
 
+# Write-schema fields (see _store_entries) minus the heavy `embedding` vector.
+# The full-collection scan below once fetched every doc's 2048-dim float array
+# (~100MB across ~5.7k docs), intermittently tripping Firestore's 503 "Query
+# timed out". Projecting the scan down to these fields keeps it cheap. Firestore
+# projection semantics: docs MISSING a selected field are still returned (the
+# field is simply absent from the snapshot), so pre-embedding entries and
+# entries stored without vectors are unaffected. No consumer of these results
+# reads `embedding` (drift engine / query_all_entries / query_open_commitments
+# only touch scalar + list metadata fields).
+_ENTRY_FIELDS = [
+    "entity_type", "name", "content", "status", "owner",
+    "related_people", "related_projects", "tags",
+    "_search_people", "_search_projects",
+    "source_type", "source_id", "source_title", "source_date",
+    "extracted_at", "embedding_model",
+]
+
+# Explicit Retry: the firestore client's DEFAULT mid-stream retry path is
+# broken in all 2.x releases (googleapis/python-firestore#596 — accesses
+# `_retry` on the raw gRPC `_UnaryStreamMultiCallable` → AttributeError),
+# turning a transient 503 "Query timed out" into the hard failure
+# "'_UnaryStreamMultiCallable' object has no attribute '_retry'". An explicit
+# Retry bypasses that lookup entirely and resumes the stream after the last
+# seen snapshot on mid-stream failures.
+_KG_STREAM_RETRY = gapi_retry.Retry(
+    initial=0.1,
+    maximum=60.0,
+    multiplier=1.3,
+    predicate=gapi_retry.if_exception_type(
+        gapi_exceptions.DeadlineExceeded,
+        gapi_exceptions.InternalServerError,
+        gapi_exceptions.ServiceUnavailable,
+    ),
+    timeout=300.0,
+)
+
+
 def _load_all_entries() -> list[dict]:
     cache_key = ("all_entries",)
     with _kg_cache_lock:
@@ -178,7 +280,12 @@ def _load_all_entries() -> list[dict]:
         return cached
 
     db = get_db()
-    entries = [_doc_to_dict(doc) for doc in db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION).stream()]
+    entries = [
+        _doc_to_dict(doc)
+        for doc in db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
+        .select(_ENTRY_FIELDS)
+        .stream(retry=_KG_STREAM_RETRY, timeout=120.0)
+    ]
     with _kg_cache_lock:
         _kg_cache[cache_key] = entries
     return entries
@@ -251,7 +358,7 @@ def _already_extracted(source_id: str) -> bool:
 
 def _run_extraction(source_type: str, source_title: str, content: str,
                     attendees: list[str]) -> list[dict]:
-    """Call Gemini Flash to extract structured entities from content."""
+    """Call Claude Haiku to extract structured entities from content."""
     if not content or not content.strip():
         return []
 
@@ -263,24 +370,18 @@ def _run_extraction(source_type: str, source_title: str, content: str,
         content=content[:8000],
     )
 
-    model = genai.GenerativeModel(model_name=config.GEMINI_MODEL_FLASH)
-
     try:
-        resp = model.generate_content(prompt)
-        text = resp.text.strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-        if text.endswith("```"):
-            text = text[: text.rfind("```")]
-        parsed = json.loads(text.strip())
+        msg = generate(prompt=prompt, tier=TaskComplexity.LIGHT)
+        text = extract_text(msg)
+        parsed = extract_json(text)
 
-        if isinstance(parsed, dict):
-            parsed = [parsed]
-        if not isinstance(parsed, list):
-            print(f"Knowledge graph: unexpected response type {type(parsed)}, skipping")
+        if parsed is None:
             return []
 
         return [e for e in parsed if isinstance(e, dict)]
+    except ExternalAuthError:
+        # Anthropic credentials expired — never swallow into "no entities".
+        raise
     except Exception as exc:
         print(f"Knowledge graph extraction failed: {exc}")
         return []
@@ -354,6 +455,11 @@ def _prepare_entry_document(
         text = _build_embedding_text(entry, source_type=source_type)
         doc["embedding"] = Vector(_get_embedding(text))
         doc["embedding_model"] = config.GEMINI_EMBEDDING_MODEL
+    except ExternalAuthError as exc:
+        # Ingestion keeps storing without vectors, but the auth failure is
+        # logged distinctly so it's never mistaken for a transient blip.
+        print(f"  Knowledge graph: EMBEDDING AUTH FAILURE ({exc}) - "
+              "storing without vector; gemini credentials need attention")
     except Exception as exc:
         print(f"  Knowledge graph: embedding generation failed ({exc}), storing without")
     return doc
@@ -569,6 +675,59 @@ def extract_from_granola_notes(granola_context: str, source_date: str | None = N
         extract_and_store_via_bg_tasks(bg_tasks, **kwargs)
     else:
         extract_and_store_background(**kwargs)
+
+
+def extract_from_jira_tickets(tickets: list[dict], bg_tasks=None):
+    """Extract knowledge from Jira tickets (background, per-ticket).
+
+    source_id is the ticket key plus its last-updated date, so a ticket is
+    re-extracted when it changes but not on every run. Assignee and reporter
+    are passed as attendees so the model populates related_people.
+
+    When bg_tasks is supplied (FastAPI BackgroundTasks), extraction is queued
+    onto it so Cloud Run keeps CPU alive until completion. Otherwise falls back
+    to daemon threads.
+    """
+    if not config.KNOWLEDGE_GRAPH_ENABLED or not tickets:
+        return
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    for ticket in tickets:
+        key = ticket.get("key", "")
+        if not key:
+            continue
+
+        people = [p for p in (ticket.get("assignee"), ticket.get("reporter")) if p]
+        parts = [f"Jira ticket {key}: {ticket.get('summary', '')}"]
+        parts.append(
+            f"Type: {ticket.get('issue_type', '')} | "
+            f"Status: {ticket.get('status', '')} | "
+            f"Priority: {ticket.get('priority', '')}"
+        )
+        if ticket.get("project"):
+            parts.append(f"Project: {ticket['project']}")
+        if ticket.get("assignee"):
+            parts.append(f"Assignee: {ticket['assignee']}")
+        if ticket.get("reporter"):
+            parts.append(f"Reporter: {ticket['reporter']}")
+        if ticket.get("labels"):
+            parts.append(f"Labels: {', '.join(ticket['labels'])}")
+        if ticket.get("description"):
+            parts.append(f"Description: {ticket['description']}")
+
+        updated = ticket.get("updated") or today
+        kwargs = dict(
+            source_type="jira",
+            source_id=f"jira-{key}-{updated}",
+            source_title=f"{key}: {ticket.get('summary', '')}",
+            source_date=updated,
+            content="\n".join(parts),
+            attendees=people,
+        )
+        if bg_tasks is not None:
+            extract_and_store_via_bg_tasks(bg_tasks, **kwargs)
+        else:
+            extract_and_store_background(**kwargs)
 
 
 # ── Query functions ──────────────────────────────────────────
@@ -815,19 +974,28 @@ def update_entity_status(doc_id: str, new_status: str):
 
 
 def semantic_search(query: str, limit: int | None = None,
-                    threshold: float | None = None) -> list[dict]:
+                    threshold: float | None = None,
+                    rerank: bool = False) -> list[dict]:
     """Semantic search over the knowledge graph using Firestore's native
     vector search (FindNearest with COSINE distance).
 
-    Note: threshold is applied client-side because Firestore vector queries
-    don't support a similarity-cutoff predicate yet. Set threshold to 0 (or
-    None falling back to config) to skip the filter.
+    threshold is applied client-side because Firestore vector queries don't
+    support a similarity-cutoff predicate yet.
+
+    rerank: opt-in Claude reranking of the candidate pool. Adds ~3s latency, so
+    callers on the interactive chat path leave it False; async/background callers
+    (proactive prep, briefings) pass True. Globally gated by config.RERANK_ENABLED
+    so it can be killed without code changes.
     """
     limit = limit if limit is not None else config.SEMANTIC_SEARCH_LIMIT
     threshold = threshold if threshold is not None else config.SEMANTIC_SEARCH_THRESHOLD
 
     try:
-        query_embedding = _get_embedding(query, task_type="RETRIEVAL_QUERY")
+        query_embedding = _get_query_embedding(query)
+    except ExternalAuthError:
+        # Credentials expired — propagate so callers can't mistake this for
+        # "no knowledge found".
+        raise
     except Exception as exc:
         print(f"Knowledge graph: query embedding failed ({exc})")
         return []
@@ -835,9 +1003,14 @@ def semantic_search(query: str, limit: int | None = None,
     db = get_db()
     collection = db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION)
 
-    # Over-fetch when a similarity threshold is set, since Firestore returns
-    # the K nearest unconditionally — we'll filter below.
-    fetch_limit = limit * 3 if threshold > 0 else limit
+    rerank_on = rerank and config.RERANK_ENABLED
+    # Over-fetch when reranking (need a candidate pool) or threshold-filtering.
+    if rerank_on:
+        fetch_limit = max(config.RERANK_CANDIDATES, limit)
+    elif threshold > 0:
+        fetch_limit = limit * 3
+    else:
+        fetch_limit = limit
 
     vector_query = collection.find_nearest(
         vector_field="embedding",
@@ -847,7 +1020,7 @@ def semantic_search(query: str, limit: int | None = None,
         distance_result_field="_distance",
     )
 
-    results = []
+    candidates = []
     for doc in vector_query.stream():
         entity = _doc_to_dict(doc)
         # COSINE distance in Firestore = 1 - cosine_similarity, so similarity
@@ -857,10 +1030,48 @@ def semantic_search(query: str, limit: int | None = None,
             similarity = 1.0 - distance
             if similarity < threshold:
                 continue
-        results.append(entity)
-        if len(results) >= limit:
+        candidates.append(entity)
+        if not rerank_on and len(candidates) >= limit:
             break
 
+    if not rerank_on or len(candidates) <= 1:
+        return _canonicalize_results(candidates[:limit])
+
+    from claude_client import rerank
+    texts = [_build_embedding_text(c, source_type=c.get("source_type", "")) for c in candidates]
+    order = rerank(query, texts, top_k=limit)
+    return _canonicalize_results([candidates[i] for i in order])
+
+
+def _canonicalize_results(results: list[dict]) -> list[dict]:
+    """Display-level canonicalization of semantic_search results (KG v2 Phase 1).
+
+    Maps owner / related_people values through resolve_canonical so every
+    consumer of semantic_search sees canonical display names. No-op when
+    KG_RESOLUTION_ENABLED is false. Operates ONLY on the result dicts
+    (_doc_to_dict returns fresh dicts per doc) — raw knowledge_graph docs are
+    never mutated.
+    """
+    if not config.KG_RESOLUTION_ENABLED or not results:
+        return results
+
+    names: set[str] = set()
+    for entity in results:
+        if entity.get("owner"):
+            names.add(str(entity["owner"]))
+        for person in entity.get("related_people") or []:
+            names.add(str(person))
+    if not names:
+        return results
+
+    mapping = resolve_canonical(sorted(names))
+    for entity in results:
+        if entity.get("owner"):
+            entity["owner"] = mapping.get(str(entity["owner"]), entity["owner"])
+        if entity.get("related_people"):
+            entity["related_people"] = [
+                mapping.get(str(p), p) for p in entity["related_people"]
+            ]
     return results
 
 
@@ -1059,3 +1270,99 @@ def query_knowledge_graph(user_message: str) -> str:
         return ""
 
     return format_knowledge_for_context(results)
+
+
+# ── Canonical resolution (KG v2 Phase 1, read-time overlay) ──
+# Mirrors the _kg_cache / _kg_cache_lock TTLCache pattern above, but kept
+# separate so canonical lookups and raw-entry caches expire independently.
+# resolve_canonical NEVER mutates raw knowledge_graph docs — it only READS the
+# kg_canonical overlay collection.
+_canonical_cache = TTLCache(maxsize=8, ttl=300)
+_canonical_cache_lock = threading.Lock()
+
+
+def _load_canonical_map() -> dict[str, str]:
+    """Build {normalized_alias -> display_name} from the kg_canonical overlay,
+    cached for 300s (mirrors _load_all_entries)."""
+    cache_key = ("canonical_map",)
+    with _canonical_cache_lock:
+        cached = _canonical_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    db = get_db()
+    mapping: dict[str, str] = {}
+    for doc in db.collection(config.FIRESTORE_KG_CANONICAL_COLLECTION).stream():
+        data = doc.to_dict()
+        display = data.get("display_name") or ""
+        if not display:
+            continue
+        for alias in data.get("aliases", []):
+            normalized = _normalize_text(alias)
+            if normalized:
+                mapping[normalized] = display
+
+    with _canonical_cache_lock:
+        _canonical_cache[cache_key] = mapping
+    return mapping
+
+
+def resolve_canonical(names: list[str]) -> dict[str, str]:
+    """Map raw name/email strings to canonical display names (read-time overlay).
+
+    Returns an identity mapping ({name: name}) when KG_RESOLUTION_ENABLED is
+    false OR when the kg_canonical overlay is empty. This is a pure read against
+    the kg_canonical overlay and NEVER mutates raw knowledge_graph docs.
+    """
+    identity = {name: name for name in names}
+    if not config.KG_RESOLUTION_ENABLED:
+        return identity
+
+    mapping = _load_canonical_map()
+    if not mapping:
+        return identity
+
+    return {name: mapping.get(_normalize_text(name), name) for name in names}
+
+
+def _load_canonical_groups() -> dict[str, list[str]]:
+    """Build {normalized_alias -> full alias list} from the kg_canonical overlay,
+    cached for 300s (mirrors _load_canonical_map). Used by get_canonical_aliases
+    to expand a single name into every alias of its canonical group."""
+    cache_key = ("canonical_groups",)
+    with _canonical_cache_lock:
+        cached = _canonical_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    db = get_db()
+    groups: dict[str, list[str]] = {}
+    for doc in db.collection(config.FIRESTORE_KG_CANONICAL_COLLECTION).stream():
+        data = doc.to_dict()
+        aliases = list(data.get("aliases", []))
+        if not aliases:
+            continue
+        for alias in aliases:
+            normalized = _normalize_text(alias)
+            if normalized:
+                groups[normalized] = aliases
+
+    with _canonical_cache_lock:
+        _canonical_cache[cache_key] = groups
+    return groups
+
+
+def get_canonical_aliases(name: str) -> list[str]:
+    """Return every alias of the canonical group ``name`` belongs to.
+
+    Returns an empty list when KG_RESOLUTION_ENABLED is false OR when ``name``
+    has no canonical match (so callers can unconditionally expand a lookup set
+    without changing behaviour while the flag is off). Pure read against the
+    kg_canonical overlay — NEVER mutates raw knowledge_graph docs.
+    """
+    if not config.KG_RESOLUTION_ENABLED:
+        return []
+    normalized = _normalize_text(name)
+    if not normalized:
+        return []
+    return list(_load_canonical_groups().get(normalized, []))

@@ -2,24 +2,33 @@
 Momo — FastAPI Application
 
 Endpoints:
-  POST /chat                    — Google Chat webhook (receives user messages)
-  POST /briefing                — Trigger morning briefing (called by Cloud Scheduler)
-  POST /email-alerts            — Trigger proactive important email checks
-  POST /meeting-debrief         — Post-meeting debrief with Granola notes (Cloud Scheduler)
-  POST /meeting-prep            — Pre-meeting prep briefs with KG context (Cloud Scheduler)
-  POST /knowledge-backfill      — Backfill knowledge graph from recent meetings/emails
-  POST /knowledge-embed-backfill — Add vector embeddings to existing KG entities
-  GET  /health                  — Health check
+  POST /chat                    - Google Chat webhook (receives user messages)
+  POST /briefing                - Trigger morning briefing (called by Cloud Scheduler)
+  POST /email-alerts            - Trigger proactive important email checks
+  POST /meeting-debrief         - Post-meeting debrief with Granola notes (Cloud Scheduler)
+  POST /meeting-prep            - Pre-meeting prep briefs with KG context (Cloud Scheduler)
+  POST /knowledge-backfill      - Backfill knowledge graph from recent meetings/emails
+  POST /knowledge-embed-backfill - Add vector embeddings to existing KG entities
+  POST /google-token-refresh    - Keep Google OAuth token alive and surface reauth
+  GET  /google-auth/start       - Browser-based Google reauth, requires one-time ticket ?t=
+  GET  /google-auth/callback    - Completes Google reauth and stores credentials
+  GET  /health                  - Health check
 """
 
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
+import asyncio
 import html
 import traceback
 import threading
+import uuid
+from contextlib import asynccontextmanager
 
 import re
+from datetime import datetime, timezone
 import config
+import observability
+from cards import build_task_tray_card
 from briefing import run_morning_briefing, run_proactive_email_alerts, run_post_meeting_debrief
 from gmail_service import (
     fetch_unread_client_emails,
@@ -38,7 +47,7 @@ from tasks_service import (
     complete_task,
     delete_task,
 )
-from gemini_service import chat_response, transcribe_audio
+from gemini_service import chat_response
 from chat_service import format_for_google_chat, send_chat_message, download_attachment, _SUPPORTED_AUDIO_TYPES
 from conversation_store import (
     get_conversation,
@@ -49,14 +58,32 @@ from conversation_store import (
     clear_pending_task_actions,
     store_pending_task_actions,
     store_pending_task_actions_if_empty,
+    get_pending_jira_actions,
+    clear_pending_jira_actions,
+    store_pending_jira_actions_if_empty,
+    record_jira_write_audit,
+    store_task_batch,
+    get_task_batch,
+    update_task_batch,
+    claim_message_once,
+    release_message_claim,
 )
 
-app = FastAPI(title="Momo")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _startup_warmup()
+    yield
+    # Cloud Run gives ~10s between SIGTERM and SIGKILL — flush + shut down the
+    # Langfuse exporter so in-flight spans aren't lost (no-op when disabled).
+    observability.shutdown()
+
+
+app = FastAPI(title="Momo", lifespan=lifespan)
 
 # ── API Secret Middleware ────────────────────────────────────
 # Protects all endpoints except /health, /, and /chat (Google Chat webhook)
 
-_OPEN_PATHS = {"/health", "/", "/chat", "/granola-auth/start", "/granola-auth/callback"}
+_OPEN_PATHS = {"/health", "/", "/chat", "/granola-auth/start", "/granola-auth/callback", "/google-auth/start", "/google-auth/callback"}
 
 
 @app.middleware("http")
@@ -73,11 +100,14 @@ async def api_secret_middleware(request: Request, call_next):
     return await call_next(request)
 
 
-@app.on_event("startup")
-async def startup_warmup():
-    """Pre-initialize Google credentials, discovery docs, and KG embeddings on startup."""
+def _startup_warmup():
+    """Pre-initialize Google credentials, discovery docs, and KG embeddings on
+    startup (called from the FastAPI lifespan)."""
     if not config.MOMO_API_SECRET:
         print("WARNING: MOMO_API_SECRET is not set — all protected endpoints are exposed without auth")
+    if not config.MOMO_SERVICE_URL:
+        print("WARNING: MOMO_SERVICE_URL is not set — task-card buttons will use a relative '/chat' "
+              "function the add-on cannot route (clicks will silently fail). Set MOMO_SERVICE_URL.")
     from google_auth import warmup
     warmup()
     try:
@@ -97,7 +127,8 @@ async def startup_warmup():
 def _parse_event(body: dict) -> dict:
     """Parse both standard Chat events and Workspace Add-on events into a
     normalized dict with keys: event_type, text, user_id, user_name, space,
-    is_addon, attachments."""
+    is_addon, attachments, invoked_function, parameters, form_inputs,
+    message_name, dialog_event_type."""
     is_addon = "commonEventObject" in body or "chat" in body
 
     event_type = body.get("type")
@@ -106,6 +137,11 @@ def _parse_event(body: dict) -> dict:
     user_name = "there"
     space = ""
     attachments = []
+    invoked_function = ""
+    parameters: dict = {}
+    form_inputs: dict = {}
+    message_name = ""
+    dialog_event_type = ""
 
     if is_addon:
         chat_payload = body.get("chat", {})
@@ -130,6 +166,28 @@ def _parse_event(body: dict) -> dict:
 
         space_info = msg_payload.get("space", {})
         space = space_info.get("name", "")
+
+        btn = chat_payload.get("buttonClickedPayload", {})
+        # In a Workspace add-on event, commonEventObject (parameters /
+        # invokedFunction / formInputs) is TOP-LEVEL on the body, a sibling of
+        # "chat" (HANDOFF §4b + Google's add-on event format). Read it there
+        # first; fall back to the nested locations for robustness.
+        common_obj = (
+            body.get("commonEventObject")
+            or btn.get("commonEventObject")
+            or chat_payload.get("commonEventObject")
+            or {}
+        )
+        invoked_function = common_obj.get("invokedFunction", "")
+        raw_params = common_obj.get("parameters", {})
+        parameters = (
+            {p["key"]: p["value"] for p in raw_params}
+            if isinstance(raw_params, list)
+            else dict(raw_params)
+        )
+        form_inputs = common_obj.get("formInputs", {})
+        message_name = btn.get("message", {}).get("name", "") or msg.get("name", "")
+        dialog_event_type = body.get("dialogEventType", "") or ""
     else:
         msg = body.get("message", {})
         text = msg.get("argumentText", msg.get("text", "")).strip()
@@ -139,6 +197,18 @@ def _parse_event(body: dict) -> dict:
         user_name = user.get("displayName", "there")
         space = body.get("space", {}).get("name", "")
 
+        common = body.get("common", {})
+        invoked_function = common.get("invokedFunction", "")
+        raw_params = common.get("parameters", {})
+        parameters = (
+            {p["key"]: p["value"] for p in raw_params}
+            if isinstance(raw_params, list)
+            else dict(raw_params)
+        )
+        form_inputs = common.get("formInputs", {})
+        message_name = msg.get("name", "")
+        dialog_event_type = body.get("dialogEventType", "") or ""
+
     return {
         "event_type": event_type,
         "text": text,
@@ -147,6 +217,11 @@ def _parse_event(body: dict) -> dict:
         "space": space,
         "is_addon": is_addon,
         "attachments": attachments,
+        "invoked_function": invoked_function,
+        "parameters": parameters,
+        "form_inputs": form_inputs,
+        "message_name": message_name,
+        "dialog_event_type": dialog_event_type,
     }
 
 
@@ -169,6 +244,292 @@ def _make_response(text: str, is_addon: bool) -> dict:
     return {"text": text}
 
 
+def _make_card_response(cards_v2: list, is_addon: bool, update: bool = True, text: str = "") -> dict:
+    """Build a Cards v2 response envelope. When ``text`` is non-empty it rides
+    alongside the card — standard Chat allows text + cardsV2 in one Message, and
+    the Add-on action message carries both. ``update=False`` is the new-message
+    (create) envelope used for synchronous conversational create cards."""
+    if is_addon:
+        try:
+            action = "updateMessageAction" if update else "createMessageAction"
+            message = {"cardsV2": cards_v2}
+            if text:
+                message["text"] = text
+            return {
+                "hostAppDataAction": {
+                    "chatDataAction": {
+                        action: {"message": message}
+                    }
+                }
+            }
+        except Exception:
+            # Safe degradation: fall through to standard-Chat shape
+            pass
+    if update:
+        response = {"actionResponse": {"type": "UPDATE_MESSAGE"}, "cardsV2": cards_v2}
+    else:
+        response = {"cardsV2": cards_v2}
+    if text:
+        response["text"] = text
+    return response
+
+
+# ── Card-click task-tray handler (PLAN_card_task_ux.md §6.4) ──
+
+def _date_to_ms_epoch(due):
+    if not due:
+        return None
+    try:
+        dt = datetime.strptime(str(due)[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except (ValueError, TypeError):
+        return None
+
+
+def _ms_epoch_to_date(ms):
+    if ms is None:
+        return None
+    try:
+        return datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+    except (ValueError, TypeError, OSError):
+        return None
+
+
+def _form_text_value(form_inputs, name):
+    try:
+        return form_inputs[name]["stringInputs"]["value"][0]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+def _form_date_ms(form_inputs, name):
+    try:
+        return form_inputs[name]["dateInput"]["msSinceEpoch"]
+    except (KeyError, TypeError):
+        return None
+
+
+def _state_for_create_result(result):
+    """Map a create_task() result to a tray row state.
+
+    create_task returns {"status": "created"|"already_exists"|"already_completed"}
+    on success or {"error": ...} (no "status") on failure. A non-dict, a dict
+    carrying "error", or one missing "status" is a hard failure — labelling it
+    "already_exists" would mislead the user ("Already in your tasks")."""
+    if not isinstance(result, dict) or "error" in result or "status" not in result:
+        return "failed"
+    status = result.get("status")
+    if status == "created":
+        return "added"
+    if status == "already_completed":
+        return "already_completed"
+    if status == "already_exists":
+        return "already_exists"
+    return "failed"
+
+
+def _chat_url() -> str:
+    return config.MOMO_SERVICE_URL.rstrip("/") + "/chat"
+
+
+def _make_edit_dialog(batch_id, row, is_addon: bool = False, chat_url: str = ""):
+    picker = {"name": "due", "label": "Due date", "type": "DATE_ONLY"}
+    due_ms = _date_to_ms_epoch(row.get("due"))
+    if due_ms is not None:
+        picker["valueMsEpoch"] = due_ms
+
+    widgets = [
+        {"textInput": {"name": "title", "label": "Task", "value": row.get("title", "")}},
+        {"dateTimePicker": picker},
+        {"buttonList": {"buttons": [
+            {"text": "Save", "onClick": {"action": {
+                "function": chat_url,
+                "parameters": [
+                    {"key": "actionName", "value": "task_edit_submit"},
+                    {"key": "batchId", "value": batch_id},
+                    {"key": "taskId", "value": row.get("taskId")},
+                ],
+            }}},
+        ]}},
+    ]
+    standard_dialog = {
+        "actionResponse": {
+            "type": "DIALOG",
+            "dialogAction": {"dialog": {"body": {"sections": [
+                {"header": "Edit task", "widgets": widgets}
+            ]}}},
+        }
+    }
+    if is_addon:
+        try:
+            # Add-on Edit dialog may need the navigations/pushCard model (HANDOFF
+            # §4d); standard-Chat DIALOG is kept for v1 and degrades safely.
+            return standard_dialog
+        except Exception:
+            pass
+    return standard_dialog
+
+
+def _safe_create_state(row):
+    """Run create_task for a row and map the result to a state, treating any
+    exception as a 'failed' state so a Tasks-API error never aborts the click
+    or leaves a batch half-mutated."""
+    try:
+        return _state_for_create_result(
+            create_task(
+                title=row["title"],
+                notes=row.get("notes", ""),
+                due_date=row.get("due"),
+            )
+        )
+    except Exception as e:
+        print(f"create_task failed for {row.get('title')!r}: {e}")
+        return "failed"
+
+
+_CARD_STATE_PHRASES = {
+    "added": "added to Google Tasks",
+    "already_exists": "already on the list",
+    "already_completed": "already completed",
+    "failed": "failed to add",
+    "dismissed": "dismissed (not added)",
+}
+
+
+def _log_card_action_to_history(batch: dict, affected: list) -> None:
+    """Mirror a task-tray button outcome into conversation history.
+
+    Card clicks mutate the task_batches doc and re-render the card, but they
+    never write a conversation turn — so the agent reads stale history on the
+    next message and thinks a created task is "still pending approval" (the
+    phantom-approval loop the text-reply flow already guards against at
+    _apply_pending_task_actions_background). Logging an assistant turn here
+    gives the agent ground truth that the task was actually added/dismissed.
+
+    The batch stores the space it was created in; conversation history is
+    space-scoped (conversation_scope -> "space:{space}"), so we reconstruct
+    the exact same scope id from batch["space"]. affected is a list of
+    (title, state) tuples for the rows this click resolved.
+    """
+    if not affected:
+        return
+    space = batch.get("space", "")
+    if not space:
+        return
+    conversation_id = conversation_scope(space=space)
+    lines = [
+        f"• {title} — {_CARD_STATE_PHRASES.get(state, state)}"
+        for title, state in affected
+    ]
+    summary = "[task card resolved]\n" + "\n".join(lines)
+    try:
+        add_turn(conversation_id, "assistant", summary)
+    except Exception as e:
+        print(f"failed to log card action to history: {e}")
+
+
+def handle_card_click(ev: dict) -> dict:
+    """Synchronously dispatch a Cards v2 task-tray button click.
+
+    Outer guard: a card click must never surface as a 500. Any unexpected
+    exception degrades to a safe no-op envelope (partial row progress is
+    persisted inside the dispatcher before any re-raise could occur).
+    """
+    is_addon = ev.get("is_addon", False)
+    try:
+        return _dispatch_card_click(ev, is_addon)
+    except Exception as e:
+        print(f"handle_card_click failed: {e}")
+        traceback.print_exc()
+        return _make_response("", is_addon)
+
+
+def _dispatch_card_click(ev: dict, is_addon: bool) -> dict:
+    """Load the batch named by the click, mutate the targeted row(s), persist
+    the batch, and re-render the whole tray inside an UPDATE_MESSAGE. Unknown
+    functions or a missing batch return a safe empty response."""
+    params = ev.get("parameters", {})
+    # Add-on buttons set function=<URL>, so the action lives in actionName;
+    # standard Chat still uses invoked_function. Dispatch on actionName first.
+    func = params.get("actionName") or ev.get("invoked_function", "")
+    batch_id = params.get("batchId")
+    task_id = params.get("taskId")
+    form_inputs = ev.get("form_inputs", {})
+    chat_url = _chat_url()
+
+    batch = get_task_batch(batch_id) if batch_id else None
+    if not batch:
+        return {}
+
+    rows = batch.get("rows", [])
+    source = batch.get("source", "")
+
+    def _find_row(tid):
+        for row in rows:
+            if row.get("taskId") == tid:
+                return row
+        return None
+
+    def _rerender():
+        update_task_batch(batch_id, rows)
+        tray = build_task_tray_card(batch_id, source, rows, chat_url=chat_url)
+        return _make_card_response(tray, is_addon, update=True)
+
+    if func == "task_add":
+        row = _find_row(task_id)
+        if row is not None:
+            row["state"] = _safe_create_state(row)
+            _log_card_action_to_history(batch, [(row.get("title", ""), row["state"])])
+        return _rerender()
+
+    if func == "task_dismiss":
+        row = _find_row(task_id)
+        if row is not None:
+            row["state"] = "dismissed"
+            _log_card_action_to_history(batch, [(row.get("title", ""), "dismissed")])
+        return _rerender()
+
+    if func == "task_add_all":
+        # One row failing must not abort the loop or skip the persist: every
+        # pending row is attempted and the batch is always re-rendered/persisted.
+        affected = []
+        for row in rows:
+            if row.get("state") == "pending":
+                row["state"] = _safe_create_state(row)
+                affected.append((row.get("title", ""), row["state"]))
+        _log_card_action_to_history(batch, affected)
+        return _rerender()
+
+    if func == "task_dismiss_all":
+        affected = []
+        for row in rows:
+            if row.get("state") == "pending":
+                row["state"] = "dismissed"
+                affected.append((row.get("title", ""), "dismissed"))
+        _log_card_action_to_history(batch, affected)
+        return _rerender()
+
+    if func == "task_edit":
+        row = _find_row(task_id)
+        if row is None:
+            return {}
+        return _make_edit_dialog(batch_id, row, is_addon=is_addon, chat_url=chat_url)
+
+    if func == "task_edit_submit":
+        row = _find_row(task_id)
+        if row is not None:
+            new_title = _form_text_value(form_inputs, "title")
+            if new_title:
+                row["title"] = new_title
+            new_due = _ms_epoch_to_date(_form_date_ms(form_inputs, "due"))
+            if new_due:
+                row["due"] = new_due
+            row["state"] = "pending"
+        return _rerender()
+
+    return {}
+
+
 # ── Health Check ─────────────────────────────────────────────
 
 @app.get("/health")
@@ -188,10 +549,21 @@ async def trigger_briefing(background_tasks: BackgroundTasks):
     """Called by Cloud Scheduler at 8 AM daily."""
     try:
         result = run_morning_briefing(bg_tasks=background_tasks)
+        if isinstance(result, dict) and result.get("status") == "failed":
+            # Delivery failed — return non-2xx so Cloud Scheduler records a
+            # failed attempt instead of a silent success.
+            raise HTTPException(
+                status_code=500,
+                detail=result.get("reason", "briefing failed"),
+            )
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Internal server error")
+    finally:
+        observability.flush()
 
 
 @app.post("/email-alerts")
@@ -203,6 +575,8 @@ async def trigger_email_alerts(background_tasks: BackgroundTasks):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Internal server error")
+    finally:
+        observability.flush()
 
 
 # ── Post-Meeting Debrief Trigger ─────────────────────────────
@@ -217,6 +591,8 @@ async def trigger_meeting_debrief(background_tasks: BackgroundTasks):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Internal server error")
+    finally:
+        observability.flush()
 
 
 # ── Pre-Meeting Prep Trigger ─────────────────────────────────
@@ -232,6 +608,8 @@ async def trigger_meeting_prep():
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Internal server error")
+    finally:
+        observability.flush()
 
 
 # ── KG + Meeting Prep E2E Test ────────────────────────────────
@@ -313,15 +691,15 @@ async def test_kg(query: str = "test", person: str = ""):
     return results
 
 
-# ── LangSmith Evals Trigger ──────────────────────────────────
+# ── Langfuse Evals Trigger ───────────────────────────────────
 
 @app.post("/run-evals")
 async def trigger_evals():
     """Called by Cloud Scheduler once daily to run LLM-as-judge evals
-    against production traces collected in the momo-prod-traces dataset."""
+    against the momo-eval-golden dataset (live agent, Langfuse experiments)."""
     from datetime import datetime
     try:
-        from scripts.run_langsmith_evals import run_evals
+        from scripts.run_langfuse_evals import run_evals
         prefix = f"momo-eval-{datetime.now().strftime('%Y%m%d')}"
         run_evals(prefix=prefix, limit=50)
         return {"status": "ok", "experiment": prefix}
@@ -331,6 +709,8 @@ async def trigger_evals():
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Internal server error")
+    finally:
+        observability.flush()
 
 
 @app.post("/promote-eval-failures")
@@ -348,6 +728,34 @@ async def trigger_promote_eval_failures():
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+# ── Google Token Refresh ─────────────────────────────────────
+
+@app.post("/google-token-refresh")
+async def google_token_refresh():
+    """Proactively refresh the Google OAuth token.
+
+    Called by Cloud Scheduler to keep Google credentials alive and to surface
+    a re-auth link when refresh is no longer possible.
+    """
+    try:
+        from google_auth import refresh_google_credentials, is_reauth_required
+
+        refreshed = refresh_google_credentials()
+        if refreshed:
+            return {"status": "ok", "message": "Google credentials are valid"}
+
+        if is_reauth_required():
+            return {
+                "status": "reauth_required",
+                "message": "Google credentials need re-authentication",
+            }
+
+        return {"status": "error", "message": "Google credentials refresh failed"}
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "message": f"Google credentials refresh failed: {str(e)}"}
 
 
 # ── Granola Token Refresh ────────────────────────────────────
@@ -383,7 +791,114 @@ async def granola_token_refresh():
         return {"status": "error", "message": f"Granola token refresh failed: {str(e)}"}
 
 
+# ── Connection Health ────────────────────────────────────────
+
+@app.post("/connection-health")
+async def connection_health_check():
+    """Probe every external connector (Jira, Google Workspace/Chat, Granola,
+    MCP servers, Anthropic, Gemini, Firestore, Langfuse) and alert in Chat on
+    auth-state transitions. Called by Cloud Scheduler (e.g. hourly).
+
+    Protected by the MOMO_API_SECRET middleware like the neighboring
+    token-refresh endpoints (not in _OPEN_PATHS)."""
+    try:
+        from connection_health import run_connection_health_check
+        return await asyncio.to_thread(run_connection_health_check)
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "message": f"Connection health check failed: {str(e)}"}
+
+
 # ── Granola Self-Serve Re-Auth ───────────────────────────────
+
+
+@app.post("/mcp-token-refresh")
+async def mcp_token_refresh():
+    """Proactively refresh tokens for all enabled OAuth MCP servers.
+
+    Add to Cloud Scheduler (e.g. every 4h) alongside granola-token-refresh.
+    RoktGPT tokens last 8h but rotate on each refresh, so frequent keepalives
+    prevent the refresh chain from going stale.
+    """
+    if not config.MCP_ENABLED:
+        return {"status": "skipped", "reason": "mcp disabled"}
+    try:
+        from mcp_client import refresh_all_tokens
+        results = refresh_all_tokens()
+        all_ok = all(results.values()) if results else True
+        return {
+            "status": "ok" if all_ok else "partial",
+            "servers": results,
+        }
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "message": f"MCP token refresh failed: {str(e)}"}
+
+
+def _oauth_callback_uri(callback_path: str) -> str:
+    """Build callbacks from the configured origin, never proxy/request headers."""
+    from ipaddress import ip_address
+    from urllib.parse import urlsplit
+
+    service_url = getattr(config, "MOMO_SERVICE_URL", "")
+    error = (
+        "MOMO_SERVICE_URL must be an absolute HTTPS origin "
+        "(HTTP is allowed only for localhost development)."
+    )
+    # Reject characters urlsplit may discard or browsers may reinterpret.
+    if (
+        not isinstance(service_url, str)
+        or not service_url
+        or any(ord(char) <= 32 or ord(char) >= 127 for char in service_url)
+        or any(char in service_url for char in "\\%?#")
+    ):
+        raise ValueError(error)
+
+    try:
+        origin = urlsplit(service_url)
+        host = origin.hostname or ""
+        port = origin.port
+        try:
+            ip_address(host)
+        except ValueError:
+            if len(host) > 253 or not all(
+                re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                for label in host.split(".")
+            ):
+                raise ValueError(error)
+
+        authority = f"[{host}]" if ":" in host else host
+        if port is not None:
+            authority += f":{port}"
+        if (
+            origin.netloc.lower() != authority
+            or origin.username is not None
+            or origin.password is not None
+            or origin.path not in ("", "/")
+            or port == 0
+            or not (
+                origin.scheme == "https"
+                or (origin.scheme == "http" and host in {"localhost", "127.0.0.1", "::1"})
+            )
+        ):
+            raise ValueError(error)
+    except ValueError:
+        raise ValueError(error) from None
+
+    return f"{service_url.rstrip('/')}{callback_path}"
+
+
+def _notify_oauth_completion(message: str) -> None:
+    """Remember delivered auth notices without letting Chat/history break OAuth."""
+    space = config.CHAT_SPACE_ID
+    if not space:
+        return
+    try:
+        if send_chat_message(space, message):
+            add_turn(conversation_scope(space=space), "assistant", message)
+    except Exception:
+        pass
+
 
 @app.get("/granola-auth/start")
 async def granola_auth_start(request: Request):
@@ -394,10 +909,8 @@ async def granola_auth_start(request: Request):
     """
     from granola_service import start_web_reauth
 
-    base_url = str(request.base_url).rstrip("/")
-    redirect_uri = f"{base_url}/granola-auth/callback"
-
     try:
+        redirect_uri = _oauth_callback_uri("/granola-auth/callback")
         auth_url = await start_web_reauth(redirect_uri)
     except Exception as e:
         traceback.print_exc()
@@ -449,20 +962,112 @@ async def granola_auth_callback(code: str = "", state: str = "", error: str = ""
             status_code=400,
         )
 
-    if config.CHAT_SPACE_ID:
-        try:
-            from chat_service import send_chat_message
-            send_chat_message(
-                config.CHAT_SPACE_ID,
-                "✅ *Granola reconnected!* meeting notes and debriefs are back online.",
-            )
-        except Exception:
-            pass
+    _notify_oauth_completion(
+        "✅ *Granola authorization updated.* "
+        "Momo will try fetching meeting notes on the next check."
+    )
 
     return HTMLResponse(
         "<html><body style='font-family: system-ui; text-align: center; padding: 60px;'>"
-        "<h1>&#10004; Granola reconnected</h1>"
-        "<p>Momo will resume pulling meeting notes automatically. You can close this tab.</p>"
+        "<h1>&#10004; Granola authorization updated</h1>"
+        "<p>Your authorization has been saved. Momo will try fetching meeting notes "
+        "on its next check. You can close this tab.</p>"
+        "</body></html>"
+    )
+
+
+# ── Google Self-Serve Re-Auth ───────────────────────────────
+
+@app.get("/google-auth/start")
+async def google_auth_start(request: Request, t: str = ""):
+    """Browser-based Google OAuth re-authentication."""
+    from google_auth import start_web_reauth
+
+    if not t:
+        return HTMLResponse(
+            "<html><body><h2>Missing or invalid re-auth link</h2>"
+            "<p>Please open the link from Chat again.</p></body></html>",
+            status_code=403,
+        )
+
+    try:
+        redirect_uri = _oauth_callback_uri("/google-auth/callback")
+        auth_url = await start_web_reauth(redirect_uri, t)
+    except Exception as e:
+        traceback.print_exc()
+        return HTMLResponse(
+            f"<html><body><h2>Google re-auth failed</h2><p>{html.escape(str(e))}</p></body></html>",
+            status_code=500,
+        )
+
+    if not auth_url:
+        return HTMLResponse(
+            "<html><body><h2>Re-auth link invalid or expired</h2>"
+            "<p>Please request a new link from Chat.</p></body></html>",
+            status_code=403,
+        )
+
+    return RedirectResponse(auth_url)
+
+
+@app.get("/google-auth/callback")
+async def google_auth_callback(code: str = "", state: str = "", error: str = ""):
+    """OAuth callback from Google after user authenticates."""
+    if error:
+        return HTMLResponse(
+            "<html><body><h2>Google auth failed</h2>"
+            "<p>Google sign-in was not completed. Please request a fresh reconnect link "
+            "and allow all required permissions.</p></body></html>",
+            status_code=400,
+        )
+
+    if not code or not state:
+        return HTMLResponse(
+            "<html><body><h2>Missing code or state parameter</h2></body></html>",
+            status_code=400,
+        )
+
+    from google_auth import complete_web_reauth, GoogleReauthError
+
+    try:
+        success = await complete_web_reauth(code, state)
+    except GoogleReauthError as e:
+        status_code = {
+            "insufficient_scope": 400,
+            "exchange_failed": 502,
+            "config_unavailable": 503,
+            "persistence_failed": 500,
+        }.get(e.reason, 500)
+        return HTMLResponse(
+            f"<html><body><h2>Google re-auth failed</h2><p>{html.escape(str(e))}</p></body></html>",
+            status_code=status_code,
+        )
+    except Exception as e:
+        print(f"Google auth callback: unexpected failure ({type(e).__name__})")
+        return HTMLResponse(
+            "<html><body><h2>Google re-auth failed</h2>"
+            "<p>Google sign-in could not be completed. Please request a fresh reconnect link "
+            "and try again.</p></body></html>",
+            status_code=500,
+        )
+
+    if not success:
+        return HTMLResponse(
+            "<html><body><h2>Re-auth failed</h2>"
+            "<p>Invalid or expired state. Try clicking the re-auth link again.</p></body></html>",
+            status_code=400,
+        )
+
+    _notify_oauth_completion(
+        "✅ *Google authorization updated.* "
+        "Momo will try accessing Gmail, Calendar, and Tasks on the next check."
+    )
+
+    return HTMLResponse(
+        "<html><body style='font-family: system-ui; text-align: center; padding: 60px;'>"
+        "<h1>&#10004; Google authorization updated</h1>"
+        "<p>Your authorization has been saved. Momo will try accessing workspace data "
+        "on its next check. You can close this tab.</p>"
         "</body></html>"
     )
 
@@ -521,6 +1126,55 @@ async def trigger_search_index_backfill():
     thread = threading.Thread(target=_run, daemon=True)
     thread.start()
     return {"status": "started", "message": "search index backfill running in background, check logs for progress"}
+
+
+
+@app.post("/knowledge-resolve")
+async def trigger_knowledge_resolve(background_tasks: BackgroundTasks):
+    """Run entity resolution over all KG entities, writing to overlay collections.
+    Returns immediately; resolution runs in a background task."""
+    if not config.KG_RESOLUTION_ENABLED:
+        return {"status": "disabled"}
+
+    def _run():
+        from conversation_store import get_db
+        import knowledge_resolution
+        from datetime import datetime, timezone
+        db = get_db()
+        now = datetime.now(timezone.utc)
+        entities = [
+            doc.to_dict()
+            for doc in db.collection(config.FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION).stream()
+        ]
+        print(f"Resolution: loaded {len(entities)} entities, starting...")
+        summary = knowledge_resolution.run_resolution(entities, db, now)
+        print(f"Resolution complete: {summary}")
+
+    background_tasks.add_task(_run)
+    return {"status": "started"}
+
+
+@app.post("/knowledge-link")
+async def trigger_knowledge_link(background_tasks: BackgroundTasks):
+    """Run commitment linking over open commitments.
+    Returns immediately; linking runs in a background task."""
+    if not config.KG_LINKING_ENABLED:
+        return {"status": "disabled"}
+
+    def _run():
+        from conversation_store import get_db
+        import knowledge_linking
+        from knowledge_graph import query_open_by_age
+        from datetime import datetime, timezone
+        db = get_db()
+        commitments = query_open_by_age(min_days=config.COMMITMENT_FOLLOWUP_DAYS, limit=50)
+        now = datetime.now(timezone.utc)
+        print(f"Linking: loaded {len(commitments)} open commitments, starting...")
+        summary = knowledge_linking.run_linking(commitments, db, now)
+        print(f"Linking complete: {summary}")
+
+    background_tasks.add_task(_run)
+    return {"status": "started"}
 
 
 def _run_backfill():
@@ -637,9 +1291,23 @@ def _run_backfill():
         print(f"  Backfill: tasks processing failed: {e}")
         traceback.print_exc()
 
+    # Jira tickets — extract active tickets
+    jira_ok = 0
+    if config.JIRA_ENABLED:
+        try:
+            from jira_service import fetch_active_jira_tickets_data
+            from knowledge_graph import extract_from_jira_tickets
+            jira_tickets = fetch_active_jira_tickets_data()
+            print(f"Backfill: found {len(jira_tickets)} Jira tickets to process")
+            extract_from_jira_tickets(jira_tickets)
+            jira_ok = len(jira_tickets)
+        except Exception as e:
+            print(f"  Backfill: Jira processing failed: {e}")
+            traceback.print_exc()
+
     print(f"Backfill complete: meetings={meetings_ok} ok/{meetings_fail} fail, "
           f"emails={emails_ok} ok/{emails_fail} fail, "
-          f"calendar={calendar_ok}, tasks={tasks_ok}")
+          f"calendar={calendar_ok}, tasks={tasks_ok}, jira={jira_ok}")
 
 
 # ── Google Chat Webhook ──────────────────────────────────────
@@ -680,6 +1348,9 @@ async def chat_webhook(request: Request, background_tasks: BackgroundTasks):
 
     if event_type == "MESSAGE":
         return await handle_message(ev, background_tasks)
+
+    if event_type == "CARD_CLICKED":
+        return handle_card_click(ev)
 
     return _make_response("Momo is here. Send me a message to get started.", is_addon)
 
@@ -1004,26 +1675,17 @@ def _user_task_scope(user_id: str, space: str) -> str:
     return f"user:{space or 'direct'}:{user_id}"
 
 
-def _space_task_scope(space: str) -> str | None:
-    """Scope scheduled debrief approvals to the chat space."""
-    if not space:
-        return None
-    return f"space:{space}"
-
-
 def _get_pending_task_request(user_id: str, space: str) -> tuple[dict | None, str | None]:
-    """Fetch the highest-priority pending task request for this message."""
+    """Fetch the user-scope pending task request for this message.
+
+    Debrief suggestions now flow through tray cards (task_batches), so a
+    ``space:``-scoped pending doc is never written — only the user scope is
+    checked here.
+    """
     user_scope = _user_task_scope(user_id, space)
     pending = get_pending_task_actions(scope_id=user_scope)
     if pending:
         return pending, user_scope
-
-    space_scope = _space_task_scope(space)
-    if space_scope:
-        pending = get_pending_task_actions(scope_id=space_scope)
-        if pending:
-            return pending, space_scope
-
     return None, None
 
 
@@ -1235,22 +1897,114 @@ async def handle_message(ev: dict, background_tasks: BackgroundTasks) -> dict:
                 add_turn(approval_conversation_id, "assistant", reply)
                 return _make_response(reply, is_addon)
         else:
-            # No pending tasks — if the message is a bare approval/decline word,
-            # don't fall through to the agent (prevents phantom approval loops
-            # where the LLM hallucinates having queued a task).
-            if _check_pending_task_intent(lower):
-                return _make_response(
-                    "nothing pending to approve right now — what task do you need?",
-                    is_addon,
+            # No pending TASK approval. A pending JIRA approval is mutually
+            # exclusive with tasks, so check it next on its dedicated path.
+            jira_pending, jira_scope_id = _get_pending_jira_request(
+                user_id, space or config.CHAT_SPACE_ID,
+            )
+            if jira_pending:
+                jira_conv_id = conversation_scope(
+                    user_id=user_id, space=space or config.CHAT_SPACE_ID,
                 )
+                parsed_jira = _parse_pending_jira_reply(lower, jira_pending["actions"])
+                if parsed_jira["intent"] == "needs_explicit":
+                    msg = (
+                        "that writes to Jira (your team will see it). reply "
+                        "*confirm jira* to apply, include a ticket key like "
+                        "*yes OSD-123* for just one, or *no* to cancel."
+                    )
+                    add_turn(jira_conv_id, "user", text)
+                    add_turn(jira_conv_id, "assistant", msg)
+                    return _make_response(msg, is_addon)
+                if parsed_jira["intent"] == "confirm":
+                    selected = parsed_jira["selected_indices"]
+                    selected_actions = [a for i, a in enumerate(jira_pending["actions"]) if i in selected]
+                    remaining_actions = [a for i, a in enumerate(jira_pending["actions"]) if i not in selected]
+                    target_space = space or config.CHAT_SPACE_ID
+                    # Race guard: clear selected actions from pending BEFORE
+                    # dispatch so a Chat 30s-deadline retry of this confirmation
+                    # can't double-apply a Jira write.
+                    clear_pending_jira_actions(jira_scope_id)
+                    if remaining_actions:
+                        store_pending_jira_actions_if_empty(
+                            remaining_actions, scope_id=jira_scope_id,
+                            approval_message=_build_jira_approval_block(remaining_actions),
+                        )
+                    add_turn(jira_conv_id, "user", text)
+                    background_tasks.add_task(
+                        _apply_pending_jira_actions_background,
+                        selected_actions, remaining_actions, target_space,
+                        jira_scope_id, jira_conv_id, text,
+                    )
+                    return _make_response("", is_addon)
+                if parsed_jira["intent"] == "decline":
+                    clear_pending_jira_actions(jira_scope_id)
+                    reply = "okay — canceled that Jira request."
+                    add_turn(jira_conv_id, "user", text)
+                    add_turn(jira_conv_id, "assistant", reply)
+                    return _make_response(reply, is_addon)
+                # intent None — not an approval reply; fall through to the agent.
+            elif _check_pending_task_intent(lower) or (
+                config.JIRA_WRITE_ENABLED and _check_pending_jira_intent(lower)
+            ):
+                # A bare "yes"/"no" may instead be answering the agent's own
+                # clarifying question (nothing queued because it asked rather
+                # than acted). If the last assistant turn ended with "?", fall
+                # through so the agent sees its question + this reply; only the
+                # context-free case keeps the phantom-approval guard.
+                last_assistant_was_question = False
+                try:
+                    history = get_conversation(
+                        conversation_scope(user_id=user_id, space=space)
+                    )
+                except Exception:
+                    history = None
+                for turn in reversed(history or []):
+                    if turn.get("role") == "assistant":
+                        last_assistant_was_question = (
+                            turn.get("content") or ""
+                        ).strip().endswith("?")
+                        break
+                if not last_assistant_was_question:
+                    return _make_response(
+                        "nothing pending to approve — tell me what you'd "
+                        "like me to do.",
+                        is_addon,
+                    )
 
     target_space = space or config.CHAT_SPACE_ID
-    background_tasks.add_task(
-        _process_message_background,
-        text, user_id, target_space, audio_attachments,
-    )
 
-    return _make_response("", is_addon)
+    # Voice/audio stays on the async background path: transcription happens there
+    # and an immediate empty ack returns well within Chat's 30s deadline (no claim
+    # guard needed). Cloud Run keeps CPU allocated for the BackgroundTask.
+    if audio_attachments:
+        background_tasks.add_task(
+            _process_message_background,
+            text, user_id, target_space, audio_attachments,
+        )
+        return _make_response("", is_addon)
+
+    # Text: run the agent loop SYNCHRONOUSLY so a conversational create can return
+    # an interactive tray card as the HTTP response — the only way add-on card
+    # buttons call back (HANDOFF §6). claim_message_once makes a Chat 30s-deadline
+    # retry idempotent: a retry that finds a live claim no-ops, so create_task /
+    # store_task_batch never run twice. The claim is KEPT on success (a late >30s
+    # response may be dropped by Chat, but a task is never double-created) and
+    # released ONLY on failure so a transient error can be retried.
+    message_name = ev.get("message_name", "")
+    if message_name and not claim_message_once(message_name):
+        return {}
+    try:
+        history = get_conversation(conversation_scope(user_id=user_id, space=space))
+        return await asyncio.to_thread(
+            _process_message_sync,
+            text, user_id, target_space, history, background_tasks, is_addon,
+        )
+    except Exception as e:
+        if message_name:
+            release_message_claim(message_name)
+        traceback.print_exc()
+        return _make_response(f"sorry, something went wrong: {str(e)}", is_addon)
 
 
 def _apply_pending_task_actions_background(
@@ -1348,43 +2102,241 @@ def _apply_pending_task_actions_background(
             print(f"Failed to send error message: {e}")
 
 
+# ── Dedicated Jira write-approval flow ────────────────────────────────────────
+# Separate from the Google Tasks approval flow so a task "yes" can never apply a
+# Jira write. Safety rules (Oracle-reviewed): (a) a Jira and a task approval are
+# never pending at the same time; (b) a Jira write requires an explicit
+# Jira-scoped confirmation — a bare "yes" never fires one.
+
+_JIRA_WRITE_ACTIONS = {"create_jira", "comment_jira", "transition_jira"}
+_JIRA_DECLINE_WORDS = {
+    "no", "nope", "no thanks", "decline", "cancel", "cancel it", "skip",
+    "don't do it", "dont do it",
+}
+_JIRA_APPROVE_WORDS = {
+    "yes", "approve", "approved", "confirm", "confirmed",
+}
+_JIRA_APPROVE_PHRASES = {"go ahead", "do it", "ship it", "post it", "apply it", "send it"}
+_JIRA_TICKET_KEY_RE = re.compile(r"[a-z][a-z0-9]+-\d+")
+
+
+def _user_jira_scope(user_id: str, space: str) -> str:
+    """Scope pending Jira write approvals to the user in the current space."""
+    return f"user:{space or 'direct'}:{user_id}"
+
+
+def _get_pending_jira_request(user_id: str, space: str) -> tuple[dict | None, str | None]:
+    # Dark-launch guard: with the write feature disabled nothing can ever be
+    # pending, so skip the Firestore read entirely — a disabled feature must
+    # cost zero reads on the synchronous Chat path.
+    if not config.JIRA_WRITE_ENABLED:
+        return None, None
+    scope = _user_jira_scope(user_id, space)
+    pending = get_pending_jira_actions(scope_id=scope)
+    if pending:
+        return pending, scope
+    return None, None
+
+
+def _format_pending_jira_action(action: dict) -> str:
+    op = action.get("action", "")
+    if op == "create_jira":
+        return f"create *{action.get('project', '?')}* ticket: \"{action.get('summary', '')}\" ({action.get('issue_type', 'Task')})"
+    if op == "comment_jira":
+        return f"comment on *{action.get('key', '?')}*: \"{(action.get('comment') or '')[:80]}\""
+    if op == "transition_jira":
+        return f"move *{action.get('key', '?')}* → {action.get('transition', '?')}"
+    return f"{op} request"
+
+
+def _build_jira_approval_block(actions: list[dict]) -> str:
+    lines = ["🎫 *Approve these Jira changes* — ⚠️ these write to Jira and are visible to your team"]
+    lines.extend(f"  {idx}. {_format_pending_jira_action(a)}" for idx, a in enumerate(actions, start=1))
+    lines.append("")
+    lines.append(
+        "_This is NOT done yet. Reply *confirm jira* to apply"
+        + (" all of these" if len(actions) > 1 else "")
+        + ", or include a ticket key (e.g. *yes OSD-123*) to apply just that one. Reply *no* to cancel. "
+        "A plain \"yes\" will not apply a Jira change._"
+    )
+    return "\n".join(lines)
+
+
+def _append_jira_approval_block(response: str, actions: list[dict]) -> str:
+    block = _build_jira_approval_block(actions)
+    if not response:
+        return block
+    return f"{response.rstrip()}\n\n{block}"
+
+
+def _build_jira_conflict_reply(pending: dict) -> str:
+    return (
+        "you already have a pending Jira approval, so i didn't queue this new one.\n\n"
+        "reply *confirm jira* to apply it or *no* to cancel, then resend.\n\n"
+        f"{_build_jira_approval_block(pending['actions'])}"
+    )
+
+
+def _check_pending_jira_intent(lower: str) -> bool:
+    """True if the message is shaped like a Jira approval/decline reply.
+
+    Used by the phantom-approval guard so a stray "confirm jira" with nothing
+    pending doesn't fall through to the agent and risk a hallucinated write.
+    Deliberately strict: approval requires an explicit approve token AND the
+    literal word "jira" — a ticket key alone (e.g. "go check OSD-123") is a
+    normal conversational message and must never be swallowed by the guard.
+    """
+    normalized = re.sub(r"\s+", " ", lower).strip().rstrip(".,!?")
+    if normalized in _JIRA_DECLINE_WORDS:
+        return True
+    tokens = set(normalized.split())
+    has_approve = bool(_JIRA_APPROVE_WORDS & tokens) or normalized in _JIRA_APPROVE_PHRASES
+    return has_approve and "jira" in tokens
+
+
+def _parse_pending_jira_reply(lower: str, actions: list[dict]) -> dict:
+    """Classify a reply to a pending Jira approval.
+
+    Returns intent: "confirm" | "decline" | "needs_explicit" | None.
+    SAFETY (rule b): a bare "yes"/"approve" returns "needs_explicit" — it never
+    confirms. Confirmation requires the word "jira" or a matching ticket key.
+    """
+    normalized = re.sub(r"\s+", " ", lower).strip().rstrip(".,!?")
+    if normalized in _JIRA_DECLINE_WORDS:
+        return {"intent": "decline", "selected_indices": set(range(len(actions)))}
+
+    tokens = set(normalized.split())
+    has_approve = bool(_JIRA_APPROVE_WORDS & tokens) or normalized in _JIRA_APPROVE_PHRASES
+    has_jira = "jira" in tokens
+    keys = {k.lower() for k in _JIRA_TICKET_KEY_RE.findall(normalized)}
+    matched = {i for i, a in enumerate(actions) if (a.get("key") or "").lower() in keys}
+
+    if has_approve and matched:
+        return {"intent": "confirm", "selected_indices": matched}
+    if has_approve and has_jira:
+        return {"intent": "confirm", "selected_indices": set(range(len(actions)))}
+    if has_approve:
+        # Bare approval without a Jira-scoped token — refuse, keep pending.
+        return {"intent": "needs_explicit", "selected_indices": set()}
+    return {"intent": None, "selected_indices": set()}
+
+
+def _route_jira_pending(response: str, jira_actions: list[dict], user_id: str, space: str) -> str:
+    """Queue Jira write actions behind the dedicated approval flow.
+
+    Enforces mutual exclusion (rule a): if a task approval is already pending,
+    the Jira request is not queued.
+    """
+    task_scope = _user_task_scope(user_id, space)
+    if get_pending_task_actions(scope_id=task_scope):
+        return (
+            (response.rstrip() + "\n\n" if response else "")
+            + "heads up — you've got a pending Google Tasks approval. reply to that "
+            "first, then resend your Jira request."
+        )
+    jira_scope = _user_jira_scope(user_id, space)
+    approval = _append_jira_approval_block(response, jira_actions)
+    if store_pending_jira_actions_if_empty(jira_actions, scope_id=jira_scope, approval_message=approval):
+        return approval
+    existing = get_pending_jira_actions(scope_id=jira_scope)
+    if existing:
+        return _build_jira_conflict_reply(existing)
+    return "sorry, something went wrong queueing that Jira change — try again?"
+
+
+def _apply_pending_jira_actions_background(
+    pending_actions, remaining_actions, space, scope_id, conversation_id=None,
+    confirmation_text="",
+):
+    """Apply approved Jira write actions and report back.
+
+    Only invoked after explicit Jira-scoped approval. An allow-list assertion
+    rejects any non-Jira action that somehow reached here, and every executed
+    write is recorded to the audit log with the confirmation the user typed.
+    """
+    from jira_service import add_jira_comment, create_jira_ticket, transition_jira_ticket
+    try:
+        results, errors = [], []
+        for action in pending_actions:
+            op = action.get("action", "")
+            if op not in _JIRA_WRITE_ACTIONS:
+                errors.append(f"refused unknown action '{op}'")
+                continue
+            try:
+                if op == "create_jira":
+                    res = create_jira_ticket(
+                        project_key=action["project"],
+                        summary=action["summary"],
+                        description=action.get("description", ""),
+                        issue_type=action.get("issue_type", "Task"),
+                        priority=action.get("priority"),
+                    )
+                    label = f"{action['project']} ticket"
+                elif op == "comment_jira":
+                    res = add_jira_comment(action["key"], action["comment"])
+                    label = f"comment on {action['key']}"
+                else:
+                    res = transition_jira_ticket(action["key"], action["transition"])
+                    label = f"{action['key']} → {action['transition']}"
+
+                if res.get("success"):
+                    url = res.get("url", "")
+                    key = res.get("key", "")
+                    results.append(f"{label}" + (f" → <{url}|{key}>" if url else ""))
+                else:
+                    errors.append(f"{label}: {res.get('error', 'failed')}")
+                record_jira_write_audit({
+                    "action": op,
+                    "args": {k: v for k, v in action.items() if k != "action"},
+                    "result": res,
+                    "scope_id": scope_id,
+                    "confirmation_text": confirmation_text,
+                })
+            except Exception as e:
+                errors.append(f"{op}: {str(e)}")
+
+        lines = []
+        if results:
+            lines.append(f"✅ *{len(results)} Jira change(s) applied:*")
+            lines.extend(f"  • {r}" for r in results)
+        if errors:
+            lines.append(f"🔴 *{len(errors)} failed:*")
+            lines.extend(f"  • {e}" for e in errors)
+        if remaining_actions:
+            lines.append("")
+            lines.append(_build_jira_approval_block(remaining_actions))
+        reply = "\n".join(lines) if lines else "No Jira changes were applied."
+        send_chat_message(space, format_for_google_chat(reply))
+        if conversation_id:
+            add_turn(conversation_id, "assistant", reply)
+    except Exception as e:
+        traceback.print_exc()
+        try:
+            err = f"sorry, something went wrong applying that Jira request: {str(e)}"
+            send_chat_message(space, err)
+            if conversation_id:
+                add_turn(conversation_id, "assistant", err)
+        except Exception:
+            print(f"Failed to send Jira error message: {e}")
+
+
 def _transcribe_voice_message(audio_attachments, existing_text, space):
-    """Download and transcribe audio attachments. Returns the final text to
-    process, or None if transcription fails entirely (error already sent)."""
-    for attachment in audio_attachments:
-        content_type = attachment.get("contentType", "")
-        if content_type not in _SUPPORTED_AUDIO_TYPES:
-            print(f"Unsupported audio type: {content_type}")
-            continue
-
-        resource_name = attachment.get("attachmentDataRef", {}).get("resourceName")
-        if not resource_name:
-            resource_name = attachment.get("name", "")
-        if not resource_name:
-            print("Attachment missing resource name, skipping")
-            continue
-
-        result = download_attachment(resource_name)
-        if result is None:
-            continue
-
-        audio_bytes, detected_type = result
-        mime = detected_type if detected_type.startswith("audio/") else content_type
-
-        transcription = transcribe_audio(audio_bytes, mime)
-        if transcription:
-            if existing_text:
-                return f"{existing_text}\n\n[voice message]: {transcription}"
-            return transcription
-
-    if not existing_text:
-        send_chat_message(space, "couldn't process that voice message — try typing it out?")
-        return None
-    return existing_text
+    """Voice transcription is currently unsupported (Claude has no audio
+    input). If text accompanies the audio, process the text and drop the
+    audio; otherwise return the graceful unsupported message."""
+    if existing_text:
+        return existing_text
+    send_chat_message(space, "voice messages aren't supported right now — try typing it out?")
+    return None
 
 
 def _process_message_background(text, user_id, space, audio_attachments=None):
-    """Heavy processing in background thread — no 30s webhook pressure."""
+    """Run the agent loop and send the reply on the async background path.
+
+    Queued by handle_message for both text and voice messages so Cloud Run keeps
+    CPU allocated until the loop finishes (works under cpu-throttling=true). All
+    pending task actions (create/update/complete/delete) route through the TEXT
+    'reply yes' approval flow; KG extraction runs inline after the reply."""
     import time
     _t0 = time.time()
     print(f"[perf] processing message ({len(text or '')} chars)")
@@ -1396,51 +2348,54 @@ def _process_message_background(text, user_id, space, audio_attachments=None):
 
         conversation_id = conversation_scope(user_id=user_id, space=space)
         history = get_conversation(conversation_id)
-        _t1 = time.time()
-        print(f"[perf] get_conversation: {_t1 - _t0:.2f}s (history={len(history)} turns)")
 
-        pending_task_actions = []
         if config.AGENTIC_MODE_ENABLED:
             from agent import run_agent_loop
-            response, pending_task_actions = run_agent_loop(text, history, thread_id=conversation_id, user_id=user_id)
-            if pending_task_actions:
+            jira_sink: list[dict] = []
+            response, pending_task_actions = run_agent_loop(
+                text, history, thread_id=conversation_id, user_id=user_id,
+                jira_actions_sink=jira_sink,
+            )
+            if jira_sink:
+                response = _route_jira_pending(
+                    _strip_llm_approval_block(response), jira_sink, user_id, space,
+                )
+            elif pending_task_actions:
                 response = _strip_llm_approval_block(response)
                 pending_scope_id = _user_task_scope(user_id, space)
-                approval_response = _append_task_approval_block(response, pending_task_actions)
-                if store_pending_task_actions_if_empty(
-                    pending_task_actions,
-                    scope_id=pending_scope_id,
-                    approval_message=approval_response,
-                ):
-                    response = approval_response
+                jira_block = (
+                    get_pending_jira_actions(scope_id=_user_jira_scope(user_id, space))
+                    if config.JIRA_WRITE_ENABLED else None
+                )
+                if jira_block:
+                    response = _build_jira_conflict_reply(jira_block)
                 else:
-                    existing_pending = get_pending_task_actions(scope_id=pending_scope_id)
-                    if existing_pending:
-                        response = _build_pending_conflict_reply(existing_pending)
+                    approval_response = _append_task_approval_block(response, pending_task_actions)
+                    if store_pending_task_actions_if_empty(
+                        pending_task_actions,
+                        scope_id=pending_scope_id,
+                        approval_message=approval_response,
+                    ):
+                        response = approval_response
                     else:
-                        response = "sorry, something went wrong queueing that task change — try again?"
+                        existing_pending = get_pending_task_actions(scope_id=pending_scope_id)
+                        if existing_pending:
+                            response = _build_pending_conflict_reply(existing_pending)
+                        else:
+                            response = "sorry, something went wrong queueing that task change — try again?"
         else:
             context_data = _build_context(text)
             response = chat_response(text, history, context_data, thread_id=conversation_id)
             response = _remove_task_tags(response)
 
-        _t2 = time.time()
-        print(f"[perf] response: {_t2 - _t1:.2f}s ({len(response or '')} chars)")
-
         add_turn(conversation_id, "user", text)
         add_turn(conversation_id, "assistant", response)
 
-        formatted = format_for_google_chat(response)
-        _t3 = time.time()
-        send_chat_message(space, formatted)
-        _t4 = time.time()
-        print(f"[perf] send_chat_message: {_t4 - _t3:.2f}s")
+        send_chat_message(space, format_for_google_chat(response))
 
-        # KG extraction runs synchronously after the reply is sent — under
-        # cpu-throttling=true a spawned daemon thread would be CPU-starved
-        # 100ms after this BackgroundTask returns, and the work would silently
-        # drop. Running inline keeps it inside the request scope where CPU
-        # stays allocated. Adds ~2-5s post-response; user already saw the reply.
+        # KG extraction runs inline — under cpu-throttling=true a spawned daemon
+        # thread would be CPU-starved ~100ms after this BackgroundTask returns and
+        # the work would silently drop. Inline keeps it in request scope.
         if config.KNOWLEDGE_GRAPH_ENABLED:
             from datetime import datetime as _dt
             from knowledge_graph import extract_and_store
@@ -1462,6 +2417,125 @@ def _process_message_background(text, user_id, space, audio_attachments=None):
             send_chat_message(space, f"sorry, something went wrong: {str(e)}")
         except Exception:
             print(f"Failed to send error message: {e}")
+
+
+def _kg_extract_chat(text, user_id):
+    from knowledge_graph import extract_and_store
+    _now = datetime.now()
+    extract_and_store(
+        source_type="chat",
+        source_id=f"chat-{user_id}-{_now.strftime('%Y%m%d%H%M%S')}",
+        source_title="Chat message",
+        source_date=_now.strftime("%Y-%m-%d"),
+        content=text,
+        attendees=[],
+    )
+
+
+def _queue_kg(background_tasks, text, user_id):
+    if config.KNOWLEDGE_GRAPH_ENABLED:
+        background_tasks.add_task(_kg_extract_chat, text, user_id)
+
+
+def _build_create_rows(create_actions):
+    """Map agent CREATE actions ({"action":"create","title","due"?,"notes"?}) to
+    tray rows. taskId is the 1-based position; rows start pending."""
+    rows = []
+    for i, action in enumerate(create_actions, start=1):
+        rows.append({
+            "taskId": f"t{i}",
+            "title": action.get("title", ""),
+            "due": action.get("due"),
+            "notes": action.get("notes", ""),
+            "owner": None,
+            "priority": None,
+            "state": "pending",
+        })
+    return rows
+
+
+def _process_message_sync(text, user_id, space, history, background_tasks, is_addon):
+    """Run the agent loop in-request and return the HTTP response envelope.
+
+    A conversational CREATE returns an interactive tray card SYNCHRONOUSLY as the
+    response to the MESSAGE event — the only way add-on card buttons call back
+    (HANDOFF §6). Non-create or MIXED turns fall back to the TEXT "reply yes"
+    approval flow; plain replies return text. KG extraction is deferred to
+    background_tasks so it never adds latency before the (30s-bounded) response.
+    """
+    conversation_id = conversation_scope(user_id=user_id, space=space)
+
+    if not config.AGENTIC_MODE_ENABLED:
+        context_data = _build_context(text)
+        response = _remove_task_tags(
+            chat_response(text, history, context_data, thread_id=conversation_id)
+        )
+        add_turn(conversation_id, "user", text)
+        add_turn(conversation_id, "assistant", response)
+        _queue_kg(background_tasks, text, user_id)
+        return _make_response(response, is_addon)
+
+    from agent import run_agent_loop
+    jira_sink: list[dict] = []
+    response, actions = run_agent_loop(
+        text, history, thread_id=conversation_id, user_id=user_id,
+        jira_actions_sink=jira_sink,
+    )
+
+    if jira_sink:
+        response = _route_jira_pending(
+            _strip_llm_approval_block(response), jira_sink, user_id, space,
+        )
+        add_turn(conversation_id, "user", text)
+        add_turn(conversation_id, "assistant", response)
+        _queue_kg(background_tasks, text, user_id)
+        return _make_response(response, is_addon)
+
+    create_only = bool(actions) and all(a.get("action") == "create" for a in actions)
+
+    if create_only:
+        response = _strip_llm_approval_block(response)
+        batch_id = uuid.uuid4().hex
+        rows = _build_create_rows(actions)
+        store_task_batch(batch_id, "New tasks", space, rows)
+        add_turn(conversation_id, "user", text)
+        add_turn(conversation_id, "assistant", response)
+        _queue_kg(background_tasks, text, user_id)
+        tray = build_task_tray_card(batch_id, "New tasks", rows, chat_url=_chat_url())
+        return _make_card_response(tray, is_addon, update=False, text=response)
+
+    if actions:
+        # Mixed (create + non-create) or non-create only: keep the proven TEXT
+        # approval flow (only a pure-create turn becomes a card).
+        response = _strip_llm_approval_block(response)
+        pending_scope_id = _user_task_scope(user_id, space)
+        jira_block = (
+            get_pending_jira_actions(scope_id=_user_jira_scope(user_id, space))
+            if config.JIRA_WRITE_ENABLED else None
+        )
+        if jira_block:
+            response = _build_jira_conflict_reply(jira_block)
+        else:
+            approval_response = _append_task_approval_block(response, actions)
+            if store_pending_task_actions_if_empty(
+                actions, scope_id=pending_scope_id, approval_message=approval_response
+            ):
+                response = approval_response
+            else:
+                existing_pending = get_pending_task_actions(scope_id=pending_scope_id)
+                if existing_pending:
+                    response = _build_pending_conflict_reply(existing_pending)
+                else:
+                    response = "sorry, something went wrong queueing that task change — try again?"
+        add_turn(conversation_id, "user", text)
+        add_turn(conversation_id, "assistant", response)
+        _queue_kg(background_tasks, text, user_id)
+        return _make_response(response, is_addon)
+
+    add_turn(conversation_id, "user", text)
+    add_turn(conversation_id, "assistant", response)
+    _queue_kg(background_tasks, text, user_id)
+    return _make_response(response, is_addon)
 
 
 def _remove_task_tags(response):

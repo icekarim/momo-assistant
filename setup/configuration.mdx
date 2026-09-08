@@ -1,0 +1,122 @@
+---
+title: "Configuration"
+description: "Environment variables, Granola setup, and the full configuration reference"
+---
+
+## Environment variables
+
+Copy the example and fill in your values:
+
+```bash
+cp .env.example .env
+```
+
+```env
+# Gemini (embeddings only — generation runs on Claude)
+GEMINI_API_KEY=your-gemini-api-key
+
+# Anthropic Claude (all generation/chat/reasoning)
+ANTHROPIC_API_KEY=your-anthropic-api-key
+
+GCP_PROJECT_ID=your-gcp-project-id
+
+# Paths to local credential files
+GOOGLE_CLIENT_SECRET_FILE=client_secret.json
+GOOGLE_TOKEN_FILE=token.json
+
+# Public Cloud Run base URL used for self-serve Google reauth links
+MOMO_SERVICE_URL=https://your-cloud-run-url
+
+# Cloud Run seed / break-glass fallback for Google OAuth token JSON
+# Firestore is the durable source of truth
+GOOGLE_TOKEN_JSON=
+
+# Google Chat space to post briefings to
+# Format: spaces/XXXXXXXXX — you'll see this logged on the first message Momo receives
+CHAT_SPACE_ID=
+
+# Proactive email alerts
+EMAIL_ALERTS_ENABLED=true
+EMAIL_ALERT_GMAIL_QUERY=is:unread in:inbox newer_than:2d
+EMAIL_ALERTS_MAX_PER_RUN=5
+IMPORTANT_EMAIL_KEYWORDS=urgent,asap,important,action required,deadline,escalation,blocker
+CLIENT_EMAIL_KEYWORDS=client,customer
+CLIENT_DOMAINS=
+```
+
+## Granola integration (optional)
+
+Momo can pull meeting notes, decisions, and action items from [Granola](https://granola.ai).
+
+**Authenticate once:**
+
+```bash
+python granola_auth_setup.py
+```
+
+This runs a full OAuth 2.0 + PKCE flow: discovers OAuth endpoints automatically, opens a browser for sign-in, captures the auth code via local callback, exchanges it for tokens, and saves them to `granola_token.json` (gitignored) + Firestore. The token auto-refreshes — you only need to run this once.
+
+**Enable it in `.env`:**
+
+```env
+GRANOLA_ENABLED=true
+```
+
+If Granola is disabled, all meeting-note features are silently skipped.
+
+## Environment variable reference
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| **Core** | | | |
+| `ANTHROPIC_API_KEY` | Yes | — | Anthropic API key used by Claude for the agent loop, briefings, debriefs, meeting prep, entity extraction, and email triage |
+| `GEMINI_API_KEY` | Yes | — | Gemini API key from Google AI Studio, used only for vector embeddings (`gemini-embedding-001`) |
+| `GCP_PROJECT_ID` | Yes | — | GCP project ID (used for Firestore) |
+| `CHAT_SPACE_ID` | No | — | Google Chat space to post to (`spaces/XXX`). If unset, briefings print to console |
+| `PORT` | No | `8080` | Server port |
+| **Google Auth** | | | |
+| `GOOGLE_CLIENT_SECRET_FILE` | Local only | `client_secret.json` | Path to OAuth client secret |
+| `GOOGLE_TOKEN_FILE` | Local only | `token.json` | Local bootstrap token written by `auth_setup.py`, and final file fallback if Firestore and env are unavailable |
+| `MOMO_SERVICE_URL` | Cloud Run | — | Public Cloud Run base URL used for self-serve Google reauth links, for example `${MOMO_SERVICE_URL}/google-auth/start` |
+| `GOOGLE_TOKEN_JSON` | Cloud Run | — | Seed or break-glass fallback for Google OAuth token JSON, not the durable source of truth |
+| **Claude Models** | | | |
+| `CLAUDE_MODEL_HAIKU` | No | `claude-haiku-4-5-20251001` | Model for light tasks (extraction, triage, meeting prep) |
+| `CLAUDE_MODEL_SONNET` | No | `claude-sonnet-5` | Model for standard tasks (agentic chat, briefings, debriefs) |
+| `CLAUDE_MODEL_OPUS` | No | `claude-opus-5` | Model for deep responses (when knowledge-graph context is present) |
+| `CLAUDE_MAX_TOKENS_LIGHT` | No | `1024` | Max output tokens for light-tier calls |
+| `CLAUDE_MAX_TOKENS_STANDARD` | No | `2048` | Max output tokens for standard-tier calls |
+| `CLAUDE_MAX_TOKENS_DEEP` | No | `4096` | Max output tokens for deep-tier calls |
+| `CLAUDE_TEMPERATURE` | No | `1.0` | Sampling temperature (clamped to 0.0–1.0) |
+| **Email** | | | |
+| `EMAIL_ALERTS_ENABLED` | No | `true` | Toggle proactive email alerts |
+| `EMAIL_ALERT_GMAIL_QUERY` | No | `is:unread in:inbox newer_than:2d` | Gmail search query for alert candidates |
+| `EMAIL_ALERTS_MAX_PER_RUN` | No | `5` | Max alerts to send per scheduler run |
+| `IMPORTANT_EMAIL_KEYWORDS` | No | `urgent,asap,...` | Keywords that flag an email as important |
+| `CLIENT_EMAIL_KEYWORDS` | No | `client,customer` | Keywords that identify client emails |
+| `CLIENT_DOMAINS` | No | — | Comma-separated domains to treat as clients |
+| `BRIEFING_LOOKBACK_HOURS` | No | `24` | How far back to look for unread emails in briefing |
+| `SEARCH_LOOKBACK_DAYS` | No | `90` | How far back to search when looking up specific emails |
+| **Knowledge Graph** | | | |
+| `KNOWLEDGE_GRAPH_ENABLED` | No | `true` | Toggle knowledge graph extraction and querying |
+| `GEMINI_EMBEDDING_MODEL` | No | `models/gemini-embedding-001` | Model for generating entity embeddings (must support embedContent API) |
+| `SEMANTIC_SEARCH_THRESHOLD` | No | `0.60` | Minimum cosine similarity for semantic search results |
+| `SEMANTIC_SEARCH_LIMIT` | No | `15` | Maximum number of semantic search results |
+| **Agentic Mode** | | | |
+| `AGENTIC_MODE_ENABLED` | No | `true` | Use agent tool-use loop for chat (falls back to legacy context mode if disabled) |
+| **Proactive Intelligence** | | | |
+| `PROACTIVE_INTELLIGENCE_ENABLED` | No | `true` | Toggle all proactive intelligence engines |
+| `MEETING_PREP_ENABLED` | No | `true` | Toggle pre-meeting prep briefs |
+| `MEETING_PREP_LOOKAHEAD_HOURS` | No | `1` | How far ahead to look for upcoming meetings to prep |
+| `MEETING_PREP_CONTEXT_MAX_AGE_DAYS` | No | `90` | Max age of knowledge graph context attached to meeting prep. Older dated entries are excluded; undated entries are kept |
+| `COMMITMENT_FOLLOWUP_DAYS` | No | `3` | Days before an open commitment triggers a follow-up nudge |
+| `DRIFT_THRESHOLD_DAYS` | No | `14` | Days of inactivity before flagging a project/item as stale |
+| `NUDGE_COOLDOWN_DAYS` | No | `7` | Minimum days between repeat nudges for the same item |
+| **Granola** | | | |
+| `GRANOLA_ENABLED` | No | `false` | Enable Granola meeting notes integration |
+| `GRANOLA_MCP_URL` | No | `https://mcp.granola.ai/mcp` | Granola MCP server URL |
+| `GRANOLA_TOKEN_JSON` | Cloud Run | — | Full Granola token JSON as a string (seeds Firestore on first boot) |
+| `MEETING_DEBRIEF_LOOKBACK_MINUTES` | No | `120` | How far back to look for recently ended meetings |
+| `MEETING_DEBRIEF_GRACE_MINUTES` | No | `45` | Grace period before sending debrief without notes |
+| **Firestore** | | | |
+| `FIRESTORE_DATABASE` | No | `testing` | Firestore database name |
+| `MAX_CONVERSATION_TURNS` | No | `50` | Max conversation turns stored per user |

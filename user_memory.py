@@ -14,7 +14,8 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 
 import config
 from conversation_store import get_db
-from langsmith_config import traceable
+from observability import observe
+from claude_client import generate, extract_text, TaskComplexity
 
 
 _memory_cache = TTLCache(maxsize=64, ttl=120)   # 2-min TTL, keyed by user_id
@@ -34,7 +35,7 @@ def _collection():
 # ── Read ────────────────────────────────────────────────────
 
 
-@traceable(run_type="tool", name="get-user-memories")
+@observe(name="get-user-memories", as_type="tool")
 def get_user_memories(user_id: str) -> list[dict]:
     """Load all active memories for a user. Cached for 2 minutes."""
     key = _safe_key(user_id)
@@ -67,7 +68,7 @@ def get_user_memories(user_id: str) -> list[dict]:
 # ── Write ───────────────────────────────────────────────────
 
 
-@traceable(run_type="tool", name="add-user-memory")
+@observe(name="add-user-memory", as_type="tool")
 def add_memory(
     user_id: str,
     content: str,
@@ -124,7 +125,7 @@ def add_memory(
 # ── Delete (soft) ───────────────────────────────────────────
 
 
-@traceable(run_type="tool", name="remove-user-memory")
+@observe(name="remove-user-memory", as_type="tool")
 def remove_memory(user_id: str, content_hint: str) -> dict | None:
     """Soft-delete the memory best matching content_hint.
 
@@ -164,18 +165,16 @@ def _find_best_match(memories: list[dict], hint: str) -> dict | None:
         if hint_lower in mem["content"].lower() or mem["content"].lower() in hint_lower:
             return mem
 
-    # Fall back to Gemini Flash for fuzzy matching
+    # Fall back to Claude Haiku for fuzzy matching
     try:
-        import google.genai as genai
-        model = genai.GenerativeModel(model_name=config.GEMINI_MODEL_FLASH)
         numbered = "\n".join(f"{i+1}. {m['content']}" for i, m in enumerate(memories))
         prompt = (
             f"The user wants to forget a memory. Their hint: \"{hint}\"\n\n"
             f"Which of these memories is the best match? Reply with ONLY the number.\n\n"
             f"{numbered}"
         )
-        resp = model.generate_content(prompt)
-        text = resp.text.strip()
+        msg = generate(prompt=prompt, tier=TaskComplexity.LIGHT)
+        text = extract_text(msg)
         # Extract first number from response
         digits = "".join(c for c in text if c.isdigit())
         if digits:
@@ -183,7 +182,7 @@ def _find_best_match(memories: list[dict], hint: str) -> dict | None:
             if 0 <= idx < len(memories):
                 return memories[idx]
     except Exception as exc:
-        print(f"[user_memory] Gemini fuzzy match failed: {exc}")
+        print(f"[user_memory] Claude fuzzy match failed: {exc}")
 
     return None
 

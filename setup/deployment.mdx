@@ -1,0 +1,57 @@
+---
+title: "Deployment (Google Cloud Run)"
+description: "Deploy Momo to Cloud Run and wire up Cloud Scheduler jobs"
+---
+
+Set your secrets in the environment, then run:
+
+```bash
+export PROJECT_ID="your-gcp-project-id"
+export ANTHROPIC_API_KEY="your-anthropic-api-key"
+export GEMINI_API_KEY="your-gemini-api-key"
+export CHAT_SPACE_ID="spaces/XXXXXXXXX"
+
+./deploy.sh
+```
+
+## What the deploy script does
+
+- Seeds Firestore from local `token.json`, then passes `GOOGLE_TOKEN_JSON` only as a Cloud Run seed, or break-glass fallback
+- Resolves Google creds at runtime from in-memory cache -\> Firestore -\> `GOOGLE_TOKEN_JSON` -\> local file fallback
+- Syncs the Granola token to Firestore (if present)
+- Falls back to reading `CHAT_SPACE_ID` from `.env` if not in the environment, and warns if still unset
+- Deploys to Cloud Run with 2Gi memory, 300s timeout, 0-3 instances, unauthenticated access
+
+## After deploying
+
+<Steps>
+  <Step title="Copy the Cloud Run URL">
+    You'll need it for the Chat App config and every Cloud Scheduler job below.
+  </Step>
+  <Step title="Point Google Chat at the service">
+    Set the Cloud Run URL as the HTTP endpoint in your Google Chat App config: `https://<url>/chat`
+  </Step>
+  <Step title="Create Cloud Scheduler jobs">
+    - `POST https://<url>/briefing` — daily at 8 AM (or your preferred time)
+    - `POST https://<url>/email-alerts` — every 5 minutes
+    - `POST https://<url>/meeting-debrief` — every 10 minutes during work hours (e.g. `*/10 9-18 * * 1-5`)
+    - `POST https://<url>/meeting-prep` — every 10 minutes during work hours
+  </Step>
+  <Step title="Bootstrap the knowledge graph (one-time)">
+    `curl -X POST https://<url>/knowledge-backfill`
+  </Step>
+  <Step title="Add embeddings to existing entities (one-time)">
+    `curl -X POST https://<url>/knowledge-embed-backfill`
+  </Step>
+  <Step title="Google token keepalive">
+    Create a Cloud Scheduler job: `POST https://<url>/google-token-refresh` — every ~4 hours
+  </Step>
+  <Step title="Granola token keepalive">
+    Create a Cloud Scheduler job: `POST https://<url>/granola-token-refresh` — every 4 hours
+  </Step>
+  <Step title="Connector health checks">
+    Create a Cloud Scheduler job: `POST https://<url>/connection-health` — hourly (e.g. `0 * * * *`).
+
+    The endpoint probes every configured connector and posts a Chat alert when one flips to `auth_failed` (and again on recovery). Without it, an expired token can silently degrade briefings and agent answers until someone notices.
+  </Step>
+</Steps>

@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from googleapiclient.discovery import build
-from google_auth import get_credentials
+from google_auth import get_credentials, raise_if_google_auth_error
 
 
 def get_calendar_service():
@@ -36,16 +36,20 @@ def fetch_upcoming_meetings(hours=4):
 
 def _fetch_events(time_min, time_max):
     """Fetch events between two datetimes."""
-    svc = get_calendar_service()
+    try:
+        svc = get_calendar_service()
 
-    resp = svc.events().list(
-        calendarId="primary",
-        timeMin=time_min.isoformat(),
-        timeMax=time_max.isoformat(),
-        singleEvents=True,
-        orderBy="startTime",
-        maxResults=50,
-    ).execute()
+        resp = svc.events().list(
+            calendarId="primary",
+            timeMin=time_min.isoformat(),
+            timeMax=time_max.isoformat(),
+            singleEvents=True,
+            orderBy="startTime",
+            maxResults=50,
+        ).execute()
+    except Exception as exc:
+        raise_if_google_auth_error(exc, source="calendar_events")
+        raise
 
     events = []
     for ev in resp.get("items", []):

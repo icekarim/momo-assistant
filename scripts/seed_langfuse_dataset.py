@@ -1,13 +1,16 @@
-"""Seed the momo-eval-golden dataset in LangSmith.
+"""Seed the momo-eval-golden dataset in Langfuse.
 
-Creates a curated evaluation dataset with ideal trajectories for each example.
-Examples are organized by behavior category (calendar, retrieval, tool_use,
-memory, conversation, multi_tool) and include expected tool sequences, step
-counts, and correctness criteria.
+Creates the curated evaluation dataset with ideal trajectories per example.
+Examples were ported verbatim from the retired LangSmith seeder
+(scripts/seed_eval_dataset.py) — the golden set has always lived locally in
+this repo (also mirrored in eval_dataset_golden.csv), so nothing was lost with
+the LangSmith trial expiring.
+
+Items use deterministic ids (golden-001, ...) so re-running UPSERTS instead of
+duplicating.
 
 Usage:
-    python scripts/seed_eval_dataset.py           # create if doesn't exist
-    python scripts/seed_eval_dataset.py --force    # recreate from scratch
+    python scripts/seed_langfuse_dataset.py
 """
 
 import argparse
@@ -17,10 +20,6 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 load_dotenv()
-
-from langsmith import Client
-
-client = Client()
 
 DATASET_NAME = "momo-eval-golden"
 
@@ -286,49 +285,40 @@ GOLDEN_EXAMPLES = [
 ]
 
 
-def seed_dataset(force: bool = False):
-    """Create the golden eval dataset in LangSmith."""
+def seed_dataset():
+    """Create/refresh the golden eval dataset in Langfuse (upsert by item id)."""
+    from langfuse import get_client
 
-    # Check if dataset already exists
-    existing = list(client.list_datasets(dataset_name=DATASET_NAME))
-    if existing and not force:
-        print(f"Dataset '{DATASET_NAME}' already exists ({len(list(client.list_examples(dataset_id=existing[0].id)))} examples).")
-        print("Use --force to delete and recreate.")
-        return
+    langfuse = get_client()
 
-    if existing and force:
-        print(f"Deleting existing dataset '{DATASET_NAME}'...")
-        client.delete_dataset(dataset_name=DATASET_NAME)
-
-    dataset = client.create_dataset(
-        dataset_name=DATASET_NAME,
+    langfuse.create_dataset(
+        name=DATASET_NAME,
         description="Curated golden evaluation dataset for Momo agent with ideal trajectories and correctness criteria.",
     )
 
-    # Group examples by split for batch creation
-    for example in GOLDEN_EXAMPLES:
-        split = example.pop("split", None)
-        client.create_example(
-            dataset_id=dataset.id,
-            inputs=example["inputs"],
-            outputs=example["outputs"],
-            metadata=example["metadata"],
-            split=split,
+    for i, example in enumerate(GOLDEN_EXAMPLES, start=1):
+        metadata = dict(example["metadata"])
+        metadata["split"] = example.get("split", metadata.get("category", ""))
+        langfuse.create_dataset_item(
+            dataset_name=DATASET_NAME,
+            id=f"golden-{i:03d}",     # deterministic id → reruns upsert
+            input=example["inputs"],
+            expected_output=example["outputs"],
+            metadata=metadata,
         )
 
-    print(f"\nCreated dataset '{DATASET_NAME}' with {len(GOLDEN_EXAMPLES)} examples.")
-    print(f"\nCategory breakdown:")
-
+    print(f"Seeded dataset '{DATASET_NAME}' with {len(GOLDEN_EXAMPLES)} examples (upserted).")
+    print("\nCategory breakdown:")
     from collections import Counter
     cats = Counter(ex["metadata"]["category"] for ex in GOLDEN_EXAMPLES)
     for cat, count in sorted(cats.items()):
         print(f"  {cat}: {count}")
 
-    print(f"\nView at: https://smith.langchain.com")
+    langfuse.flush()
+    langfuse.shutdown()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Seed the momo-eval-golden dataset")
-    parser.add_argument("--force", action="store_true", help="Delete and recreate the dataset")
-    args = parser.parse_args()
-    seed_dataset(force=args.force)
+    parser = argparse.ArgumentParser(description="Seed the momo-eval-golden dataset in Langfuse")
+    parser.parse_args()
+    seed_dataset()

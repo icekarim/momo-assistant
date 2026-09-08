@@ -1,0 +1,27 @@
+---
+title: "Proactive Intelligence"
+description: "Four engines that surface insights before you think to ask"
+---
+
+Momo doesn't just answer questions — it surfaces insights before you think to ask. Four engines run daily (during the morning briefing) and throughout the day:
+
+**1. Pre-meeting prep** — Before each meeting, Momo pulls relevant context from the knowledge graph: past interactions with attendees, open commitments involving them, related project history, and outstanding blockers. Delivered as a brief to Chat before the meeting starts (configurable lookahead, default 1 hour).
+
+Prep context is scoped to the attendees and topic, not you. Momo excludes entries tied only to the owner identity (`OWNER_NAME` and email aliases) so a brand-new attendee doesn't get padded with your unrelated history. Retrieved entries older than `MEETING_PREP_CONTEXT_MAX_AGE_DAYS` (default 90) are dropped, and the merged person, project, and semantic results are reranked against the meeting title and non-owner attendees before being attached. If an attendee has no matching context, the prep says so explicitly instead of substituting stale material.
+
+**2. Commitment follow-up** — Scans the knowledge graph for open commitments older than 3 days (configurable). Cross-references Gmail and Google Tasks for evidence of completion — if a matching email was sent or a task was completed, the commitment is auto-resolved in the knowledge graph. Otherwise, it's flagged as a nudge with days elapsed and source context. High-priority nudges (commitments overdue by 2x the threshold) are sent as standalone Chat messages immediately.
+
+**3. Pattern detection** — Analyzes the last 30 days of knowledge graph entries to spot recurring people, projects, and tags. Feeds the patterns into Claude Haiku 4.5 for interpretation — surfaces things like recurring topics that need a dedicated discussion or frequent collaborators worth noting.
+
+**4. Drift detection** — Flags open items (commitments, action items) and projects that haven't been mentioned in any meeting or email for 14+ days (configurable). Helps catch things that silently fell off the radar.
+
+## Nudge delivery
+
+All nudges are deduplicated via Firestore with a configurable cooldown (default 7 days) so you're never spammed with the same reminder. Nudges are delivered in two modes:
+
+- **Briefing** — included as a section in the morning briefing (default for medium/low priority)
+- **Standalone** — sent as immediate Chat messages (for high-priority items like severely overdue commitments)
+
+<Note>
+Tuning knobs: `PROACTIVE_INTELLIGENCE_ENABLED`, `MEETING_PREP_ENABLED`, `MEETING_PREP_LOOKAHEAD_HOURS`, `MEETING_PREP_CONTEXT_MAX_AGE_DAYS`, `COMMITMENT_FOLLOWUP_DAYS`, `DRIFT_THRESHOLD_DAYS`, and `NUDGE_COOLDOWN_DAYS`. See the [environment variable reference](/setup/configuration#environment-variable-reference).
+</Note>

@@ -4,6 +4,7 @@ import time
 import google.auth
 from google.auth.transport.requests import AuthorizedSession
 import config
+from connection_errors import ExternalAuthError
 
 _CHAT_SCOPES = ["https://www.googleapis.com/auth/chat.bot"]
 _MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024  # 10 MB
@@ -55,27 +56,58 @@ def download_attachment(resource_name: str) -> tuple[bytes, str] | None:
         return None
 
 
-def send_chat_message(space_id, text):
+def send_chat_message(space_id, text=None, cards=None) -> bool:
     """Send a message to a Google Chat space as the bot (app credentials).
-    Retries up to 3 times on transient network/SSL errors."""
+    Pass text= for plain text (auto-split at 4000 chars) or cards= for cardsV2.
+    Retries up to 3 times on transient network/SSL errors.
+
+    Returns True only if every chunk was actually accepted (2xx). Auth
+    failures (401/403) are logged distinctly and reported as failure — they
+    never crash scheduled jobs."""
+    if cards is None and (text is None or not text.strip()):
+        # The Chat API 400s on empty messages ("Message cannot be empty") —
+        # refuse locally so callers get a clean failure signal.
+        print("send_chat_message: refusing to send empty message")
+        return False
     session = _get_chat_session()
     url = f"https://chat.googleapis.com/v1/{space_id}/messages"
 
-    chunks = _split_message(text, max_len=4000)
+    try:
+        if cards is not None:
+            return _send_with_retry(session, url, space_id, cards=cards)
 
-    for chunk in chunks:
-        _send_with_retry(session, url, chunk, space_id)
+        ok = True
+        for chunk in _split_message(text, max_len=4000):
+            ok = _send_with_retry(session, url, space_id, text=chunk) and ok
+        return ok
+    except ExternalAuthError as exc:
+        print(f"Chat API AUTH FAILURE — message NOT sent to {space_id}: {exc}")
+        return False
 
 
-def _send_with_retry(session, url, text, space_id, max_retries=3):
+def _send_with_retry(session, url, space_id, text=None, cards=None, max_retries=3) -> bool:
+    # PLAN §6.7: message name capture only if async PATCH is ever pursued
     for attempt in range(max_retries):
         try:
-            resp = session.post(url, json={"text": text})
-            if resp.status_code != 200:
-                print(f"Chat API error ({resp.status_code}): {resp.text}")
+            if cards is not None:
+                resp = session.post(url, json={"cardsV2": cards})
             else:
-                print(f"Momo sent message to {space_id}")
-            return
+                resp = session.post(url, json={"text": text})
+            if resp.status_code in (401, 403):
+                raise ExternalAuthError(
+                    "google_chat",
+                    f"Google Chat API returned {resp.status_code} — bot credentials rejected",
+                    status=resp.status_code,
+                    reconnect_hint="check the Cloud Run service account / chat.bot scope",
+                )
+            if not (200 <= resp.status_code < 300):
+                # Non-2xx is a FAILED send — never report success.
+                print(f"Chat API error ({resp.status_code}): {resp.text}")
+                return False
+            print(f"Momo sent message to {space_id}")
+            return True
+        except ExternalAuthError:
+            raise
         except Exception as e:
             if attempt < max_retries - 1:
                 wait = 1.0 * (attempt + 1)
@@ -84,6 +116,7 @@ def _send_with_retry(session, url, text, space_id, max_retries=3):
             else:
                 print(f"Chat API send failed after {max_retries} attempts: {e}")
                 raise
+    return False
 
 
 def format_for_google_chat(markdown_text):

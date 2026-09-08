@@ -1,32 +1,7 @@
-import sys
 import unittest
 from unittest.mock import MagicMock, patch
 
-_MOCKED_MODULES = (
-    "google",
-    "google.cloud",
-    "google.cloud.firestore",
-    "google.cloud.firestore_v1",
-    # Submodules referenced via `from ... import ...` in knowledge_graph
-    "google.cloud.firestore_v1.base_query",
-    "google.cloud.firestore_v1.base_vector_query",
-    "google.cloud.firestore_v1.vector",
-    "google.generativeai",
-)
-
-_saved_modules = {name: sys.modules.get(name) for name in _MOCKED_MODULES}
-for name in _MOCKED_MODULES:
-    sys.modules[name] = MagicMock()
-
-try:
-    import knowledge_graph
-finally:
-    for name in _MOCKED_MODULES:
-        original = _saved_modules[name]
-        if original is None:
-            sys.modules.pop(name, None)
-        else:
-            sys.modules[name] = original
+import knowledge_graph
 
 
 class TestKnowledgeGraphPeopleFields(unittest.TestCase):
@@ -55,3 +30,35 @@ class TestKnowledgeGraphPeopleFields(unittest.TestCase):
         self.assertEqual(doc["attendees"], ["Jessica Francis", "Patrick Tsui"])
         self.assertIn("agnes", doc["_search_mentioned_people"])
         self.assertIn("jessica", doc["_search_attendees"])
+
+    def test_store_entries_keeps_people_fields_and_source_metadata_on_embedding_auth_failure(self):
+        entry = {
+            "name": "Finalize mapping",
+            "mentioned_people": ["Agnes Jang"],
+            "related_people": ["Agnes Jang"],
+        }
+        db = MagicMock()
+        failure = knowledge_graph.ExternalAuthError("gemini", "Expired credentials")
+        with (
+            patch.object(knowledge_graph, "get_db", return_value=db),
+            patch.object(knowledge_graph, "_get_embedding", side_effect=failure),
+            patch("builtins.print") as logged,
+        ):
+            knowledge_graph._store_entries(
+                [entry], "meeting", "event-52", "last sync part 2", "2026-05-13",
+                attendees=["Jessica Francis"],
+            )
+
+        db.collection.return_value.add.assert_called_once()
+        doc = db.collection.return_value.add.call_args.args[0]
+        self.assertEqual(doc["source_id"], "event-52")
+        self.assertEqual(doc["source_date"], "2026-05-13")
+        self.assertTrue(doc["extracted_at"])
+        self.assertEqual(doc["mentioned_people"], ["Agnes Jang"])
+        self.assertEqual(doc["attendees"], ["Jessica Francis"])
+        self.assertIn("agnes", doc["_search_mentioned_people"])
+        self.assertIn("jessica", doc["_search_attendees"])
+        self.assertNotIn("embedding", doc)
+        self.assertNotIn("embedding_model", doc)
+        self.assertIn("EMBEDDING AUTH FAILURE", logged.call_args.args[0])
+        self.assertNotIn("embedding generation failed", logged.call_args.args[0])

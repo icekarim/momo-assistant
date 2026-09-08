@@ -1,0 +1,23 @@
+---
+title: "Meeting Intelligence (Granola)"
+description: "Answer questions about any recorded meeting via the Granola MCP"
+---
+
+Momo is connected to [Granola](https://granola.ai) via the Model Context Protocol (MCP) and can answer questions about any recorded meeting:
+
+- *"what were the action items from Monday's sync?"*
+- *"who was in the planning meeting?"*
+- *"pull the full transcript from yesterday's call"*
+- *"what decisions have we made about [topic] this month?"*
+
+## Token lifecycle
+
+The Granola token is managed automatically — it's stored in Firestore and refreshed in the background using OAuth 2.0 with PKCE. Token resolution order: in-memory cache → local file → Firestore → environment variable. You authenticate once with `python granola_auth_setup.py`, and a **Cloud Scheduler job refreshes the token every 4 hours** (`POST /granola-token-refresh`) to prevent the refresh_token from expiring due to inactivity.
+
+## Matching and fetching
+
+Calendar meetings are matched to Granola notes using fuzzy title matching, and notes are batch-fetched (up to 10 at a time) to minimize API calls.
+
+<Note>
+Granola integration is optional. If Granola is disabled (`GRANOLA_ENABLED=false`, the default), all meeting-note features are silently skipped. See [Configuration](/setup/configuration#granola-integration-optional) for setup instructions.
+</Note>

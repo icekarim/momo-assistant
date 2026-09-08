@@ -254,7 +254,15 @@ def finalize_evidence_gated_prep(
     title: str,
     raw_text: str,
     evidence: list[PrepEvidence],
+    *,
+    missing_context_notes: list[str] | None = None,
 ) -> str:
+    """Gate model claims by citations, then append caller-supplied absence notes.
+
+    Combine all deterministic notes into one bullet, reserving up to five
+    sourced bullets when notes exist, or six otherwise.
+    Notes are not evidence and never receive fabricated source citations.
+    """
     header = f"📋 *meeting prep — {title}*"
     evidence_by_id = {item.evidence_id: item for item in evidence}
     valid_ids = set(evidence_by_id)
@@ -298,10 +306,13 @@ def finalize_evidence_gated_prep(
         if len(kept_lines) >= 6:
             break
 
+    notes = list(missing_context_notes or [])
+    note_lines = [f"- {' '.join(notes)}"] if notes else []
+    context_lines = kept_lines[:6 - len(note_lines)]
     if not kept_lines:
-        return f"{header}\nI don't have strong prep context for this one yet."
+        context_lines = ["I don't have strong prep context for this one yet."]
 
-    return "\n".join([header, *kept_lines])
+    return "\n".join([header, *context_lines, *note_lines])
 
 
 def build_prep_diagnostics(

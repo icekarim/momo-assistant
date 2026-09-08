@@ -3,6 +3,7 @@
 .env.local
 token.json
 granola_token.json
+mcp_token_*.json
 client_secret.json
 service_account.json
 .mcp.json
@@ -11,8 +12,23 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+.pytest_cache/
 .cursor/
 PLAN_*.md
 test_generated*.py
 .DS_Store
 **/.DS_Store
+
+# KG v2 eval evidence (reproducible) + unreviewed candidates
+qa/candidates/
+qa/*.json
+qa/*.txt
+
+# Local agent/tooling artifacts (never committed)
+.codex/
+.omo/
+
+# Eval evidence / labeled sets (contain real data — regenerate locally, never commit)
+eval_report_*.json
+eval_kg_labels.json
+eval_kg_golden.csv

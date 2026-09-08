@@ -1,0 +1,34 @@
+---
+title: "Google Authentication"
+description: "OAuth credentials, the local token bootstrap, and self-healing reauth"
+---
+
+## Google OAuth credentials
+
+In the [Google Cloud Console](https://console.cloud.google.com/):
+
+1. Go to **APIs & Services > Credentials**
+2. Create an **OAuth 2.0 Client ID** (Application type: Web application)
+3. Add `http://localhost:8080/` to Authorized redirect URIs. In production, you MUST also add `https://<cloud-run-url>/google-auth/callback` and any custom-domain equivalent to the OAuth client's Authorized redirect URIs.
+4. Download the JSON and save it as `client_secret.json` in the project root
+
+Keep this as user OAuth for Gmail, Calendar, and Tasks. For production, the OAuth consent screen should not stay in External or Testing mode, because Google refresh tokens can expire after 7 days in that state. The self-serve reauth link is ticket-gated and only arrives via the Chat reauth alert, so the callback URI needs to be registered ahead of time.
+
+## Generate token.json (local bootstrap)
+
+```bash
+python auth_setup.py
+```
+
+This opens a browser OAuth flow and writes `token.json` locally. It is the bootstrap token for personal development, not the durable source of truth. `client_secret.json` and `token.json` are gitignored and never committed.
+
+## Google OAuth self-healing
+
+Momo keeps Google user OAuth alive with Firestore-backed token storage and a browser reauth flow.
+
+1. Local bootstrap writes `token.json` with `python auth_setup.py`
+2. `deploy.sh` seeds Firestore from that file, then passes `GOOGLE_TOKEN_JSON` to Cloud Run as a seed, or break-glass fallback
+3. At runtime, Google creds resolve in this order: in-memory cache -> Firestore `google_auth/token` -> `GOOGLE_TOKEN_JSON` -> local `token.json`
+4. If refresh fails, Momo marks `google_auth_pending/reauth_required`, then surfaces a self-serve link at `${MOMO_SERVICE_URL}/google-auth/start`
+5. The OAuth callback lands at `${MOMO_SERVICE_URL}/google-auth/callback`
+6. Cloud Scheduler calls `POST /google-token-refresh` every ~4 hours so refresh tokens stay warm and reauth gets surfaced early

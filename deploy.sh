@@ -8,7 +8,12 @@ set -e
 #   export CHAT_SPACE_ID="spaces/XXXXXXXXX"
 PROJECT_ID="${PROJECT_ID:?PROJECT_ID env var is required}"
 GEMINI_API_KEY="${GEMINI_API_KEY:?GEMINI_API_KEY env var is required}"
-CHAT_SPACE_ID="${CHAT_SPACE_ID:-$(grep '^CHAT_SPACE_ID=' .env 2>/dev/null | cut -d= -f2)}"
+ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-$(grep '^ANTHROPIC_API_KEY=' .env 2>/dev/null | cut -d= -f2-)}"
+if [ -z "$ANTHROPIC_API_KEY" ]; then
+  echo "ERROR: ANTHROPIC_API_KEY is required (all LLM generation runs on Claude)." >&2
+  exit 1
+fi
+CHAT_SPACE_ID="${CHAT_SPACE_ID:-$(grep '^CHAT_SPACE_ID=' .env 2>/dev/null | cut -d= -f2-)}"
 if [ -z "$CHAT_SPACE_ID" ]; then
   echo "WARNING: CHAT_SPACE_ID is not set. Briefings will print to console only."
 fi
@@ -25,29 +30,71 @@ gcloud config set project $PROJECT_ID
 if [ -f granola_token.json ]; then
     echo "Syncing Granola token to Firestore..."
     python3 -c "
-from granola_service import _write_token_to_firestore
-import json, time
+from granola_service import _read_token_from_firestore, _write_token_to_firestore
+import json, os
 with open('granola_token.json') as f:
     token = json.load(f)
 if '_expires_at' not in token:
-    import os
     token['_expires_at'] = os.path.getmtime('granola_token.json') + token.get('expires_in', 21600)
-_write_token_to_firestore(token)
-print('  Granola token synced to Firestore')
+existing = _read_token_from_firestore()
+if existing and existing.get('_expires_at', 0) >= token['_expires_at']:
+    print('  Firestore Granola token is fresher — keeping it (local file is stale)')
+else:
+    _write_token_to_firestore(token)
+    print('  Granola token synced to Firestore')
 " 2>/dev/null || echo "  (Firestore sync skipped — will use env var fallback)"
 fi
 
+if [ -f token.json ]; then
+    echo "Syncing Google token to Firestore..."
+    python3 -c "
+from google_auth import _write_credentials_to_firestore
+import json
+with open('token.json') as f:
+    credentials = json.load(f)
+_write_credentials_to_firestore(json.dumps(credentials))
+print('  Google token synced to Firestore')
+" 2>/dev/null || echo "  (Firestore sync skipped — will use env var fallback)"
+fi
+
+# Sync MCP server tokens (mcp_token_<server>.json) to Firestore so Cloud Run has them
+for mcp_token_file in mcp_token_*.json; do
+    [ -f "$mcp_token_file" ] || continue
+    server_name="${mcp_token_file#mcp_token_}"
+    server_name="${server_name%.json}"
+    echo "Syncing MCP token for '${server_name}' to Firestore..."
+    SERVER_NAME="$server_name" TOKEN_FILE="$mcp_token_file" python3 -c "
+import json, os
+from mcp_client import _read_token_from_firestore, _write_token_to_firestore
+name = os.environ['SERVER_NAME']
+with open(os.environ['TOKEN_FILE']) as f:
+    token = json.load(f)
+if '_expires_at' not in token:
+    token['_expires_at'] = os.path.getmtime(os.environ['TOKEN_FILE']) + token.get('expires_in', 28800)
+existing = _read_token_from_firestore(name)
+if existing and existing.get('_expires_at', 0) >= token['_expires_at']:
+    print('  Firestore MCP token is fresher — keeping it (local file is stale)')
+else:
+    _write_token_to_firestore(name, token)
+    print('  MCP token synced to Firestore')
+" 2>/dev/null || echo "  (Firestore sync skipped — will use env var fallback)"
+done
+
 # Read token files into variables for passing as env vars
-GOOGLE_TOKEN_JSON=$(cat token.json)
+GOOGLE_TOKEN_JSON="${GOOGLE_TOKEN_JSON:-$(cat token.json 2>/dev/null || echo "")}"
 GRANOLA_TOKEN_JSON=$(cat granola_token.json 2>/dev/null || echo "")
 
 # Build and deploy in one step
-JIRA_ENABLED="${JIRA_ENABLED:-$(grep '^JIRA_ENABLED=' .env 2>/dev/null | cut -d= -f2)}"
-JIRA_SITE_URL="${JIRA_SITE_URL:-$(grep '^JIRA_SITE_URL=' .env 2>/dev/null | cut -d= -f2)}"
-JIRA_USER_EMAIL="${JIRA_USER_EMAIL:-$(grep '^JIRA_USER_EMAIL=' .env 2>/dev/null | cut -d= -f2)}"
-JIRA_API_TOKEN="${JIRA_API_TOKEN:-$(grep '^JIRA_API_TOKEN=' .env 2>/dev/null | cut -d= -f2)}"
-LANGSMITH_API_KEY="${LANGSMITH_API_KEY:-$(grep '^LANGSMITH_API_KEY=' .env 2>/dev/null | cut -d= -f2)}"
-MOMO_API_SECRET="${MOMO_API_SECRET:-$(grep '^MOMO_API_SECRET=' .env 2>/dev/null | cut -d= -f2)}"
+JIRA_ENABLED="${JIRA_ENABLED:-$(grep '^JIRA_ENABLED=' .env 2>/dev/null | cut -d= -f2-)}"
+JIRA_SITE_URL="${JIRA_SITE_URL:-$(grep '^JIRA_SITE_URL=' .env 2>/dev/null | cut -d= -f2-)}"
+JIRA_USER_EMAIL="${JIRA_USER_EMAIL:-$(grep '^JIRA_USER_EMAIL=' .env 2>/dev/null | cut -d= -f2-)}"
+JIRA_API_TOKEN="${JIRA_API_TOKEN:-$(grep '^JIRA_API_TOKEN=' .env 2>/dev/null | cut -d= -f2-)}"
+JIRA_WRITE_ENABLED="${JIRA_WRITE_ENABLED:-$(grep '^JIRA_WRITE_ENABLED=' .env 2>/dev/null | cut -d= -f2-)}"
+LANGFUSE_PUBLIC_KEY="${LANGFUSE_PUBLIC_KEY:-$(grep '^LANGFUSE_PUBLIC_KEY=' .env 2>/dev/null | cut -d= -f2-)}"
+LANGFUSE_SECRET_KEY="${LANGFUSE_SECRET_KEY:-$(grep '^LANGFUSE_SECRET_KEY=' .env 2>/dev/null | cut -d= -f2-)}"
+LANGFUSE_BASE_URL="${LANGFUSE_BASE_URL:-$(grep '^LANGFUSE_BASE_URL=' .env 2>/dev/null | cut -d= -f2-)}"
+LANGFUSE_TRACING_ENABLED="${LANGFUSE_TRACING_ENABLED:-$(grep '^LANGFUSE_TRACING_ENABLED=' .env 2>/dev/null | cut -d= -f2-)}"
+MOMO_API_SECRET="${MOMO_API_SECRET:-$(grep '^MOMO_API_SECRET=' .env 2>/dev/null | cut -d= -f2-)}"
 
 # Get existing URL for MOMO_SERVICE_URL (pre-deploy for first-time, updated post-deploy)
 EXISTING_URL=$(gcloud run services describe $SERVICE_NAME --region=$REGION --format='value(status.url)' 2>/dev/null || echo "")
@@ -57,11 +104,13 @@ gcloud run deploy $SERVICE_NAME \
   --region $REGION \
   --platform managed \
   --allow-unauthenticated \
-  --set-env-vars="GEMINI_API_KEY=${GEMINI_API_KEY},GCP_PROJECT_ID=$PROJECT_ID,CHAT_SPACE_ID=${CHAT_SPACE_ID},GRANOLA_ENABLED=true" \
-  --set-env-vars="JIRA_ENABLED=${JIRA_ENABLED:-false},JIRA_SITE_URL=${JIRA_SITE_URL},JIRA_USER_EMAIL=${JIRA_USER_EMAIL},JIRA_API_TOKEN=${JIRA_API_TOKEN}" \
-  --set-env-vars="LANGSMITH_TRACING=true,LANGSMITH_API_KEY=${LANGSMITH_API_KEY},LANGSMITH_PROJECT=momo" \
+  --set-env-vars="GEMINI_API_KEY=${GEMINI_API_KEY},ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY},GCP_PROJECT_ID=$PROJECT_ID,CHAT_SPACE_ID=${CHAT_SPACE_ID},GRANOLA_ENABLED=true" \
+  --set-env-vars="JIRA_ENABLED=${JIRA_ENABLED:-false},JIRA_SITE_URL=${JIRA_SITE_URL},JIRA_USER_EMAIL=${JIRA_USER_EMAIL},JIRA_API_TOKEN=${JIRA_API_TOKEN},JIRA_WRITE_ENABLED=${JIRA_WRITE_ENABLED:-false}" \
+  --set-env-vars="LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY},LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY},LANGFUSE_BASE_URL=${LANGFUSE_BASE_URL:-https://us.cloud.langfuse.com},LANGFUSE_TRACING_ENABLED=${LANGFUSE_TRACING_ENABLED:-true}" \
   --set-env-vars="OWNER_NAME=${OWNER_NAME:-},MOMO_API_SECRET=${MOMO_API_SECRET}" \
   --set-env-vars="MOMO_SERVICE_URL=${EXISTING_URL}" \
+  --set-env-vars="KG_RESOLUTION_ENABLED=true,KG_LINKING_ENABLED=true,KG_LINK_MIN_CONFIDENCE=0.85" \
+  --set-env-vars="MCP_ENABLED=true" \
   --set-env-vars="^##^GOOGLE_TOKEN_JSON=${GOOGLE_TOKEN_JSON}##GRANOLA_TOKEN_JSON=${GRANOLA_TOKEN_JSON}" \
   --memory=2Gi \
   --timeout=300 \
@@ -90,3 +139,6 @@ echo "  3. Create another Cloud Scheduler job to call: ${URL}/email-alerts (e.g.
 echo "  4. Create Cloud Scheduler job for: ${URL}/meeting-debrief (e.g. */10 9-18 * * 1-5)"
 echo "  5. Create Cloud Scheduler job for: ${URL}/meeting-prep (e.g. */10 9-18 * * 1-5)"
 echo "  6. (One-time) Backfill knowledge graph: curl -X POST ${URL}/knowledge-backfill"
+echo "  7. Create Cloud Scheduler job for Google token keepalive: POST ${URL}/google-token-refresh (every ~4 hours)"
+echo "  8. Create Cloud Scheduler job for Granola token keepalive: POST ${URL}/granola-token-refresh (every 4 hours)"
+echo "  9. Create Cloud Scheduler job for connector health: POST ${URL}/connection-health (suggest hourly, e.g. 0 * * * *)"

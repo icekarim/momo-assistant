@@ -1,15 +1,40 @@
+import json
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Gemini ───────────────────────────────────────────────────
+# ── Gemini (embeddings only — generation migrated to Claude) ──
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = "gemini-3-flash-preview"
 GEMINI_MODEL_FLASH = os.getenv("GEMINI_MODEL_FLASH", "gemini-3-flash-preview")
 GEMINI_MODEL_PRO = os.getenv("GEMINI_MODEL_PRO", "gemini-3.1-pro-preview")
 # Truncated to 2048 to fit Firestore's flat vector index limit.
 GEMINI_EMBEDDING_DIM = int(os.getenv("GEMINI_EMBEDDING_DIM", "2048"))
+
+# ── Anthropic Claude (all generation/chat/reasoning) ─────────
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+# Cost-aware tiers: Haiku=light (extraction/triage/memory),
+# Sonnet=standard (chat/agent), Opus=deep (KG-context reasoning).
+CLAUDE_MODEL_HAIKU = os.getenv("CLAUDE_MODEL_HAIKU", "claude-haiku-4-5-20251001")
+CLAUDE_MODEL_SONNET = os.getenv("CLAUDE_MODEL_SONNET", "claude-sonnet-5")
+CLAUDE_MODEL_OPUS = os.getenv("CLAUDE_MODEL_OPUS", "claude-opus-5")
+# Per-tier max_tokens (Claude requires explicit max_tokens per call).
+CLAUDE_MAX_TOKENS_LIGHT = int(os.getenv("CLAUDE_MAX_TOKENS_LIGHT", "1024"))
+CLAUDE_MAX_TOKENS_STANDARD = int(os.getenv("CLAUDE_MAX_TOKENS_STANDARD", "2048"))
+CLAUDE_MAX_TOKENS_DEEP = int(os.getenv("CLAUDE_MAX_TOKENS_DEEP", "4096"))
+# Morning briefing budget. Reasoning models can burn an entire STANDARD budget
+# on a thinking block (stop_reason "length"/"max_tokens" with ZERO text blocks),
+# which once made the briefing silently deliver an empty message. Keep this
+# comfortably above the tier default.
+CLAUDE_MAX_TOKENS_BRIEFING = int(os.getenv("CLAUDE_MAX_TOKENS_BRIEFING", "8192"))
+# Interactive agent-loop ceiling — same failure mode: a reasoning model can
+# burn the whole 2048-token STANDARD budget on a thinking block and hand the
+# user an empty reply (or a raw truncation placeholder).
+CLAUDE_MAX_TOKENS_AGENT = int(os.getenv("CLAUDE_MAX_TOKENS_AGENT", "8192"))
+# Sampling temperature. Claude's valid range is 0..1 (default 1.0); 1.0 is the
+# loosest/warmest. Clamped so a bad env value can never 400 the generation call.
+CLAUDE_TEMPERATURE = max(0.0, min(1.0, float(os.getenv("CLAUDE_TEMPERATURE", "1.0"))))
 
 # ── Gmail ────────────────────────────────────────────────────
 GMAIL_QUERY = "is:unread in:inbox"
@@ -59,6 +84,11 @@ CHAT_SPACE_ID = os.getenv("CHAT_SPACE_ID", "")
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "")
 FIRESTORE_DATABASE = os.getenv("FIRESTORE_DATABASE", "testing")
 FIRESTORE_COLLECTION = "conversations"
+# Idempotency guard for the synchronous inbound message path. Google Chat
+# retries the webhook when the synchronous agent loop exceeds its 30s deadline;
+# a claim doc keyed by the Chat message_name makes processing exactly-once so a
+# retry never re-runs store_task_batch / create_task.
+FIRESTORE_PROCESSED_MESSAGES_COLLECTION = "processed_messages"
 FIRESTORE_EMAIL_ALERTS_COLLECTION = "email_alerts"
 FIRESTORE_MEETING_DEBRIEFS_COLLECTION = "meeting_debriefs"
 FIRESTORE_KNOWLEDGE_GRAPH_COLLECTION = "knowledge_graph"
@@ -69,6 +99,31 @@ KNOWLEDGE_GRAPH_ENABLED = os.getenv("KNOWLEDGE_GRAPH_ENABLED", "true").lower() =
 GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "models/gemini-embedding-001")
 SEMANTIC_SEARCH_THRESHOLD = float(os.getenv("SEMANTIC_SEARCH_THRESHOLD", "0.60"))
 SEMANTIC_SEARCH_LIMIT = int(os.getenv("SEMANTIC_SEARCH_LIMIT", "15"))
+# Claude-as-reranker: re-score the top vector-search candidates with Claude
+# (Haiku) for better precision. RERANK_CANDIDATES are fetched, reranked, then
+# truncated to the requested limit. Falls back to raw vector order on any error.
+RERANK_ENABLED = os.getenv("RERANK_ENABLED", "true").lower() == "true"
+RERANK_CANDIDATES = int(os.getenv("RERANK_CANDIDATES", "30"))
+
+# ── KG v2 — Entity Resolution (Phase 1, overlay model) ───────
+# Default OFF. When false, resolve_canonical returns identity mappings and the
+# resolution batch job is a no-op. Rollback for the whole phase = flag off; the
+# raw knowledge_graph collection is never mutated either way.
+KG_RESOLUTION_ENABLED = os.getenv("KG_RESOLUTION_ENABLED", "false").lower() == "true"
+# Hybrid merge policy thresholds (Momus-approved plan): auto-apply at >=0.90
+# confidence, queue 0.75-0.90 for one-tap approval, drop below 0.75.
+KG_MERGE_AUTO_THRESHOLD = float(os.getenv("KG_MERGE_AUTO_THRESHOLD", "0.90"))
+KG_MERGE_QUEUE_THRESHOLD = float(os.getenv("KG_MERGE_QUEUE_THRESHOLD", "0.75"))
+# Overlay collections — written by knowledge_resolution.py ONLY. Never the raw
+# knowledge_graph collection.
+FIRESTORE_KG_CANONICAL_COLLECTION = "kg_canonical"
+FIRESTORE_KG_MERGE_QUEUE_COLLECTION = "kg_merge_queue"
+
+# ── KG v2 — Commitment-Evidence Linking (Phase 2, overlay model) ──
+# Default OFF. Links are written by knowledge_linking.py ONLY, to kg_links.
+KG_LINKING_ENABLED = os.getenv("KG_LINKING_ENABLED", "false").lower() == "true"
+KG_LINK_MIN_CONFIDENCE = float(os.getenv("KG_LINK_MIN_CONFIDENCE", "0.85"))
+FIRESTORE_KG_LINKS_COLLECTION = "kg_links"
 
 # ── User Memory ─────────────────────────────────────────────
 USER_MEMORY_ENABLED = os.getenv("USER_MEMORY_ENABLED", "true").lower() == "true"
@@ -82,12 +137,16 @@ AGENTIC_MODE_ENABLED = os.getenv("AGENTIC_MODE_ENABLED", "true").lower() == "tru
 PROACTIVE_INTELLIGENCE_ENABLED = os.getenv("PROACTIVE_INTELLIGENCE_ENABLED", "true").lower() == "true"
 MEETING_PREP_ENABLED = os.getenv("MEETING_PREP_ENABLED", "true").lower() == "true"
 MEETING_PREP_LOOKAHEAD_HOURS = int(os.getenv("MEETING_PREP_LOOKAHEAD_HOURS", "2"))
+# Max age of KG context attached to meeting preps — entries older than this
+# are considered stale and excluded from retrieval (undated entries are kept).
+MEETING_PREP_CONTEXT_MAX_AGE_DAYS = int(os.getenv("MEETING_PREP_CONTEXT_MAX_AGE_DAYS", "90"))
 COMMITMENT_FOLLOWUP_DAYS = int(os.getenv("COMMITMENT_FOLLOWUP_DAYS", "3"))
 DRIFT_THRESHOLD_DAYS = int(os.getenv("DRIFT_THRESHOLD_DAYS", "14"))
 NUDGE_COOLDOWN_DAYS = int(os.getenv("NUDGE_COOLDOWN_DAYS", "7"))
 FIRESTORE_MEETING_PREP_COLLECTION = "meeting_prep_sent"
 FIRESTORE_NUDGES_COLLECTION = "proactive_nudges_sent"
 FIRESTORE_PENDING_TASKS_COLLECTION = "pending_task_proposals"
+FIRESTORE_TASK_BATCHES_COLLECTION = "task_batches"
 
 # ── Granola MCP ──────────────────────────────────────────────
 GRANOLA_ENABLED = os.getenv("GRANOLA_ENABLED", "false").lower() == "true"
@@ -108,6 +167,19 @@ JIRA_JQL_FILTER = os.getenv(
     "(assignee = currentUser() OR reporter = currentUser() OR watcher = currentUser()) "
     "AND statusCategory != Done ORDER BY updated DESC",
 )
+# Master switch for Jira WRITE tools (create/comment/transition). Default false:
+# write tools are not even declared to the agent unless this is explicitly true.
+JIRA_WRITE_ENABLED = os.getenv("JIRA_WRITE_ENABLED", "false").lower() == "true"
+FIRESTORE_PENDING_JIRA_COLLECTION = "pending_jira_proposals"
+FIRESTORE_JIRA_AUDIT_COLLECTION = "jira_write_audit"
+
+# ── Langfuse observability ───────────────────────────────────
+# Tracing is a no-op when keys are absent or LANGFUSE_TRACING_ENABLED=false.
+LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY", "")
+LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY", "")
+LANGFUSE_BASE_URL = os.getenv("LANGFUSE_BASE_URL", "https://us.cloud.langfuse.com")
+LANGFUSE_TRACING_ENABLED = os.getenv("LANGFUSE_TRACING_ENABLED", "true").lower() == "true"
+LANGFUSE_TRACING_ENVIRONMENT = os.getenv("LANGFUSE_TRACING_ENVIRONMENT", "production")
 
 # ── Owner ────────────────────────────────────────────────────
 OWNER_NAME = os.getenv("OWNER_NAME", "")
@@ -117,6 +189,49 @@ MOMO_API_SECRET = os.getenv("MOMO_API_SECRET", "")
 
 # ── Service URL (for self-serve OAuth re-auth links) ─────────
 MOMO_SERVICE_URL = os.getenv("MOMO_SERVICE_URL", "")
+
+
+# ── MCP (Model Context Protocol) servers ────────────────────
+# MCP_ENABLED=true activates generic MCP tool discovery and calling in the
+# agent loop.  Add servers via MCP_SERVERS_JSON (a JSON array) or rely on the
+# built-in default which registers the RoktGPT server.
+#
+# Each server object fields:
+#   name          - identifier; MUST NOT contain underscores (used in tool names)
+#   url           - MCP server URL (streamable HTTP transport)
+#   auth          - "oauth" | "bearer" | "none"
+#   enabled       - true/false (default true)
+#   tools         - optional list of allowed tool names (null = all)
+#   callback_path - OAuth callback path for local loopback (default /oauth/callback)
+MCP_ENABLED = os.getenv("MCP_ENABLED", "false").lower() == "true"
+
+_MCP_DEFAULT_SERVERS: list[dict] = [
+    {
+        "name": "roktgpt",
+        "url": "https://roktgpt-mcp-y7qoekew6a-ue.a.run.app/mcp",
+        "auth": "oauth",
+        "enabled": True,
+        "callback_path": "/oauth/callback",
+    }
+]
+
+
+def _parse_mcp_servers() -> list[dict]:
+    raw = os.getenv("MCP_SERVERS_JSON", "")
+    if raw:
+        try:
+            return json.loads(raw)
+        except Exception:
+            print("MCP: MCP_SERVERS_JSON is not valid JSON — using built-in defaults")
+    return _MCP_DEFAULT_SERVERS
+
+
+MCP_SERVERS: list[dict] = _parse_mcp_servers()
+
+# Default per-call timeout for MCP tool calls (seconds).
+# Bounded at 25s so a single slow MCP call (e.g. RoktGPT thinking-mode) can't by
+# itself blow past Google Chat's 30s synchronous deadline on the text path.
+MCP_DEFAULT_TIMEOUT = int(os.getenv("MCP_DEFAULT_TIMEOUT", "25"))
 
 # ── Server ───────────────────────────────────────────────────
 PORT = int(os.getenv("PORT", "8080"))

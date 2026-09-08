@@ -12,6 +12,7 @@ Token lifecycle:
 import asyncio
 import json
 import os
+import threading
 import time
 from datetime import datetime, timedelta
 
@@ -20,6 +21,8 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
 import config
+from connection_errors import ExternalAuthError
+from reauth_service import get_service_url, send_auth_notification
 
 _TOKEN_FILE = os.getenv("GRANOLA_TOKEN_FILE", "granola_token.json")
 _GRANOLA_TOKEN_JSON_ENV = os.getenv("GRANOLA_TOKEN_JSON", "")
@@ -254,7 +257,11 @@ async def _call_tool(tool_name: str, arguments: dict | None = None):
     for attempt in range(2):
         token = _load_token()
         if not token:
-            return None
+            send_reauth_alert()
+            raise ExternalAuthError(
+                "granola", "Granola credentials unavailable — reconnection required",
+                reconnect_hint="ask momo for a fresh Granola reconnect link",
+            )
 
         auth = _BearerAuth(token)
 
@@ -269,11 +276,25 @@ async def _call_tool(tool_name: str, arguments: dict | None = None):
                     result = await session.call_tool(tool_name, arguments=arguments or {})
                     return result
         except Exception as exc:
-            if attempt == 0 and _is_auth_error(exc):
-                print("Granola: 401 received, forcing token refresh and retrying...")
-                global _cached_token
-                _cached_token = None
-                continue
+            if _is_auth_error(exc):
+                if attempt == 0:
+                    print("Granola: 401 received, forcing token refresh and retrying...")
+                    global _cached_token
+                    _cached_token = None
+                    continue
+                # Final 401 after refresh retry: surface as a typed auth error
+                # and fire the (12h-throttled) reconnect alert.
+                print(f"Granola: auth failure after token refresh retry: {exc}")
+                try:
+                    send_reauth_alert()
+                except Exception as alert_exc:
+                    print(f"Granola: reauth alert failed: {alert_exc}")
+                raise ExternalAuthError(
+                    "granola",
+                    f"Granola MCP auth failure — {exc}",
+                    status=401,
+                    reconnect_hint="ask momo for a fresh Granola reconnect link",
+                ) from exc
             raise
 
 
@@ -384,6 +405,10 @@ def fetch_yesterday_meeting_notes() -> str:
         notes_by_id = fetch_meeting_notes_batch(target_ids[:10])
         return "\n\n".join(notes_by_id.values()).strip()
 
+    except ExternalAuthError:
+        # Credentials expired — propagate so callers (briefing) can surface a
+        # re-auth notice instead of silently substituting "no notes".
+        raise
     except Exception as exc:
         print(f"Granola: error fetching yesterday's notes via list+batch: {exc}")
         return ""
@@ -453,6 +478,7 @@ def format_granola_notes_for_context(notes: str) -> str:
 _FIRESTORE_REAUTH_COLLECTION = "granola_auth_pending"
 _FIRESTORE_REAUTH_ALERT_DOC = "last_reauth_alert"
 _REAUTH_ALERT_COOLDOWN_HOURS = 12
+_reauth_alert_lock = threading.Lock()
 
 
 def _generate_pkce_pair() -> tuple[str, str]:
@@ -583,8 +609,25 @@ async def complete_web_reauth(code: str, state: str) -> bool:
     _persist_token(tokens)
 
     db.collection(_FIRESTORE_REAUTH_COLLECTION).document(state).delete()
+    _clear_reauth_alert_cooldown()
     print("Granola reauth: token acquired and stored successfully")
     return True
+
+
+def create_reauth_link(service_url: str = "") -> str:
+    """Return the configured HTTPS reconnect URL without using credentials."""
+    return f"{get_service_url(service_url)}/granola-auth/start"
+
+
+def _clear_reauth_alert_cooldown() -> None:
+    """Allow a new failure to alert after successful reauth or confirmed recovery."""
+    try:
+        with _reauth_alert_lock:
+            _get_db().collection(_FIRESTORE_REAUTH_COLLECTION).document(
+                _FIRESTORE_REAUTH_ALERT_DOC
+            ).delete()
+    except Exception:
+        print("Granola reauth: could not clear reauth alert cooldown")
 
 
 def send_reauth_alert(service_url: str = "") -> bool:
@@ -593,37 +636,39 @@ def send_reauth_alert(service_url: str = "") -> bool:
     Throttled to one alert per REAUTH_ALERT_COOLDOWN_HOURS to avoid spam.
     Returns True if an alert was sent.
     """
+    with _reauth_alert_lock:
+        return _send_reauth_alert_unlocked(service_url)
+
+
+def _send_reauth_alert_unlocked(service_url: str = "") -> bool:
     if not config.CHAT_SPACE_ID:
         return False
 
-    url = service_url or config.MOMO_SERVICE_URL
-    if not url:
-        print("Granola reauth: no MOMO_SERVICE_URL configured, can't send reauth link")
+    try:
+        reauth_url = create_reauth_link(service_url)
+        db = _get_db()
+        alert_ref = db.collection(_FIRESTORE_REAUTH_COLLECTION).document(_FIRESTORE_REAUTH_ALERT_DOC)
+        alert_doc = alert_ref.get()
+        if alert_doc.exists:
+            last_sent = alert_doc.to_dict().get("sent_at", 0)
+            if time.time() - last_sent < _REAUTH_ALERT_COOLDOWN_HOURS * 3600:
+                return False
+    except Exception:
+        print("Granola reauth: could not prepare reauth alert")
         return False
 
-    db = _get_db()
-    alert_ref = db.collection(_FIRESTORE_REAUTH_COLLECTION).document(_FIRESTORE_REAUTH_ALERT_DOC)
-    alert_doc = alert_ref.get()
-    if alert_doc.exists:
-        last_sent = alert_doc.to_dict().get("sent_at", 0)
-        if time.time() - last_sent < _REAUTH_ALERT_COOLDOWN_HOURS * 3600:
-            return False
-
-    reauth_url = f"{url.rstrip('/')}/granola-auth/start"
     message = (
         "🔴 *Granola connection expired*\n\n"
         "my meeting notes integration lost its auth token and i can't pull "
         "Granola notes for debriefs or meeting prep.\n\n"
-        f"👉 <{reauth_url}|*click here to reconnect Granola*> (takes 10 seconds)\n\n"
-        "i'll resume pulling meeting notes automatically once you re-auth."
+        f"👉 <{reauth_url}|*click here to reconnect Granola*>\n\n"
+        "after sign-in, i can check meeting notes access again."
     )
 
-    try:
-        from chat_service import send_chat_message
-        send_chat_message(config.CHAT_SPACE_ID, message)
-        alert_ref.set({"sent_at": time.time()})
-        print("Granola reauth: alert sent to Chat")
-        return True
-    except Exception as exc:
-        print(f"Granola reauth: failed to send alert: {exc}")
+    if not send_auth_notification(message):
         return False
+    try:
+        alert_ref.set({"sent_at": time.time()})
+    except Exception:
+        print("Granola reauth: delivered, but could not record alert cooldown")
+    return True

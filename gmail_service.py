@@ -2,7 +2,7 @@ import base64
 import re
 from datetime import datetime, timedelta, timezone
 from googleapiclient.discovery import build
-from google_auth import get_credentials
+from google_auth import get_credentials, is_google_auth_error, raise_if_google_auth_error
 import config
 
 
@@ -46,12 +46,18 @@ def _search_emails(query, max_results):
     page_token = None
 
     while len(msg_refs) < max_results:
-        resp = svc.users().messages().list(
-            userId="me",
-            q=query,
-            maxResults=min(max_results - len(msg_refs), 50),
-            pageToken=page_token,
-        ).execute()
+        try:
+            resp = svc.users().messages().list(
+                userId="me",
+                q=query,
+                maxResults=min(max_results - len(msg_refs), 50),
+                pageToken=page_token,
+            ).execute()
+        except Exception as e:
+            # Top-level listing: 401/403 raises typed (credentials expired must
+            # never look like "no emails"); other failures propagate as before.
+            raise_if_google_auth_error(e, source="gmail_list")
+            raise
 
         messages = resp.get("messages", [])
         if not messages:
@@ -79,7 +85,12 @@ def _search_emails(query, max_results):
                 msg_id, parsed = future.result()
                 results_by_id[msg_id] = parsed
             except Exception as e:
-                print(f"Failed to fetch message {futures[future]}: {e}")
+                # Per-item failures: classify-then-continue — log auth
+                # distinctly but never abort the whole listing over one item.
+                if is_google_auth_error(e):
+                    print(f"Gmail AUTH FAILURE fetching message {futures[future]}: {e}")
+                else:
+                    print(f"Failed to fetch message {futures[future]}: {e}")
 
     return [results_by_id[ref["id"]] for ref in msg_refs if ref["id"] in results_by_id]
 

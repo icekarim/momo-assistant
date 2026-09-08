@@ -1,0 +1,299 @@
+import json
+from enum import Enum
+
+import anthropic
+
+import config
+import observability
+from connection_errors import ExternalAuthError, ExternalConnectionError
+
+# CRITICAL ordering: instrumentation (AnthropicInstrumentor) must patch the
+# SDK BEFORE the client object below is constructed. init_tracing is
+# idempotent and no-ops without Langfuse keys.
+observability.init_tracing()
+
+
+class TaskComplexity(Enum):
+    LIGHT = "light"
+    STANDARD = "standard"
+    DEEP = "deep"
+
+
+TASK_MODEL_MAP = {
+    TaskComplexity.LIGHT: config.CLAUDE_MODEL_HAIKU,
+    TaskComplexity.STANDARD: config.CLAUDE_MODEL_SONNET,
+    TaskComplexity.DEEP: config.CLAUDE_MODEL_OPUS,
+}
+
+TASK_MAX_TOKENS = {
+    TaskComplexity.LIGHT: config.CLAUDE_MAX_TOKENS_LIGHT,
+    TaskComplexity.STANDARD: config.CLAUDE_MAX_TOKENS_STANDARD,
+    TaskComplexity.DEEP: config.CLAUDE_MAX_TOKENS_DEEP,
+}
+
+TIER_TIMEOUTS = {
+    TaskComplexity.LIGHT: 30,
+    TaskComplexity.STANDARD: 60,
+    TaskComplexity.DEEP: 120,
+}
+
+_DEEP_FALLBACK = TaskComplexity.STANDARD
+_MAX_FALLBACK_ATTEMPTS = 1
+
+# max_retries=1: the interactive agent path runs synchronously under Google
+# Chat's 30s deadline, so a third attempt (each up to the per-call timeout) would
+# blow the worst-case wall time. One retry still rides out a transient blip.
+# Plain client — Langfuse's AnthropicInstrumentor (init_tracing above) captures
+# messages.create calls as generations; no per-client wrapper needed.
+_client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY, max_retries=1)
+
+
+def get_client():
+    return _client
+
+
+def extract_text(message) -> str:
+    return "".join(
+        b.text for b in message.content if getattr(b, "type", None) == "text"
+    ).strip()
+
+
+def extract_json(text):
+    if not text:
+        return None
+    t = text.strip()
+    if t.startswith("```"):
+        t = t.split("\n", 1)[1] if "\n" in t else t[3:]
+    if t.endswith("```"):
+        t = t[: t.rfind("```")]
+    t = t.strip()
+    try:
+        parsed = json.loads(t)
+    except Exception:
+        # Tolerate prose-prefixed output: slice from the first JSON bracket.
+        start = min((i for i in (t.find("["), t.find("{")) if i != -1), default=-1)
+        if start == -1:
+            print(f"claude_client.extract_json: no JSON found in output")
+            return None
+        try:
+            parsed = json.loads(t[start:])
+        except Exception as exc:
+            print(f"claude_client.extract_json: parse failed — {exc}")
+            return None
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    return parsed
+
+
+def _classify_auth(exc: Exception) -> ExternalAuthError | None:
+    """Map Anthropic auth/permission failures to a typed error, else None."""
+    if isinstance(exc, (anthropic.AuthenticationError, anthropic.PermissionDeniedError)):
+        return ExternalAuthError(
+            "anthropic",
+            f"Anthropic API auth failure — {exc}",
+            status=getattr(exc, "status_code", None),
+            reconnect_hint="check/rotate ANTHROPIC_API_KEY",
+        )
+    return None
+
+
+def _is_downshiftable(exc: Exception) -> bool:
+    # Transient/capacity failures justify a one-step tier downshift.
+    # Auth/bad-request (4xx except 429) must NOT downshift — a cheaper
+    # model won't fix a malformed request and only doubles spend.
+    if isinstance(exc, (anthropic.RateLimitError, anthropic.APITimeoutError,
+                        anthropic.InternalServerError, anthropic.APIConnectionError)):
+        return True
+    if isinstance(exc, anthropic.APIStatusError):
+        return exc.status_code in (429, 500, 502, 503, 529)
+    return False
+
+
+def generate(prompt=None, *, tier=TaskComplexity.STANDARD, system=None,
+             tools=None, messages=None, max_tokens=None, model=None,
+             temperature=None, allow_fallback=True, timeout=None):
+    if messages is None:
+        if prompt is None:
+            raise ValueError("generate requires either prompt or messages")
+        messages = [{"role": "user", "content": prompt}]
+
+    resolved_model = model or TASK_MODEL_MAP[tier]
+    resolved_max = max_tokens or TASK_MAX_TOKENS[tier]
+    resolved_temp = config.CLAUDE_TEMPERATURE if temperature is None else temperature
+    # Bound the call so it can't hang for the SDK default (~600s). The tier
+    # timeout doubles as the interactive deadline budget; callers may override.
+    resolved_timeout = TIER_TIMEOUTS.get(tier, TIER_TIMEOUTS[TaskComplexity.STANDARD]) if timeout is None else timeout
+    kwargs = {"model": resolved_model, "max_tokens": resolved_max,
+              "temperature": resolved_temp, "messages": messages,
+              "timeout": resolved_timeout}
+    if system is not None:
+        kwargs["system"] = system
+    if tools is not None:
+        kwargs["tools"] = tools
+
+    try:
+        return _client.messages.create(**kwargs)
+    except Exception as exc:
+        auth_err = _classify_auth(exc)
+        if auth_err is not None:
+            raise auth_err from exc
+        if (allow_fallback and tier == TaskComplexity.DEEP
+                and _is_downshiftable(exc)):
+            return _fallback(messages, system, tools, max_tokens, temperature,
+                             timeout=resolved_timeout)
+        raise
+
+
+def gemini_tool_to_claude(decl: dict) -> dict:
+    schema = decl.get("parameters") or {"type": "object", "properties": {}}
+    return {
+        "name": decl["name"],
+        "description": decl.get("description", ""),
+        "input_schema": schema,
+    }
+
+
+def run_tool_loop(*, messages, tools, system, dispatch, max_iterations=6,
+                  tier=TaskComplexity.STANDARD, on_tool=None, max_tokens=None):
+    """Drive a Claude tool-use conversation to a final text answer.
+
+    dispatch(name, input_dict) -> str. Returns (final_text, stop_reason).
+    Handles parallel tool_use blocks, malformed input, tool errors, and
+    max_tokens truncation mid-loop without silently dropping it.
+    """
+    convo = list(messages)
+    last_stop = None
+    retried_empty_truncation = False
+    for _ in range(max_iterations):
+        msg = generate(messages=convo, tools=tools, system=system, tier=tier,
+                       max_tokens=max_tokens)
+        last_stop = msg.stop_reason
+
+        if (msg.stop_reason == "max_tokens" and not extract_text(msg)
+                and not retried_empty_truncation):
+            # Reasoning models can burn the whole budget on a thinking block
+            # (zero text blocks) — the user would get a raw truncation
+            # placeholder. Retry ONCE with double budget (safe: the failed
+            # msg produced no text, dispatched no tools, and was never
+            # appended to convo), then let the retried msg flow through the
+            # normal handling below (it may contain tool_use blocks). One
+            # retry per loop run to respect the interactive ~30s deadline.
+            retried_empty_truncation = True
+            print("run_tool_loop: empty max_tokens response (all reasoning); retrying with larger budget")
+            msg = generate(messages=convo, tools=tools, system=system, tier=tier,
+                           max_tokens=(max_tokens or TASK_MAX_TOKENS[tier]) * 2)
+            last_stop = msg.stop_reason
+
+        if msg.stop_reason == "max_tokens":
+            text = extract_text(msg)
+            return (text or "sorry — that answer blew past my response limit "
+                            "twice. mind narrowing it down or asking again?"), "max_tokens"
+
+        tool_uses = [b for b in msg.content if getattr(b, "type", None) == "tool_use"]
+        if not tool_uses:
+            return extract_text(msg), msg.stop_reason
+
+        convo.append({"role": "assistant", "content": msg.content})
+        results = []
+        for tu in tool_uses:
+            name = getattr(tu, "name", None)
+            tool_input = getattr(tu, "input", None)
+            is_error = False
+            if not name or not isinstance(tool_input, dict):
+                result_str = f"Tool call malformed (name={name!r})"
+                is_error = True
+            else:
+                try:
+                    result_str = dispatch(name, tool_input)
+                    if isinstance(result_str, str) and result_str.startswith(("Tool '", "Error calling", "Unknown tool")):
+                        is_error = True
+                except Exception as exc:
+                    result_str = f"Tool '{name}' failed: {exc}"
+                    is_error = True
+            if on_tool:
+                on_tool(name, result_str, is_error)
+            results.append({
+                "type": "tool_result",
+                "tool_use_id": tu.id,
+                "content": str(result_str),
+                "is_error": is_error,
+            })
+        convo.append({"role": "user", "content": results})
+
+    return "", last_stop
+
+
+def _fallback(messages, system, tools, max_tokens, temperature=None, timeout=None):
+    attempts = 0
+    tier = _DEEP_FALLBACK
+    last_exc = None
+    resolved_temp = config.CLAUDE_TEMPERATURE if temperature is None else temperature
+    resolved_timeout = TIER_TIMEOUTS[tier] if timeout is None else timeout
+    while attempts < _MAX_FALLBACK_ATTEMPTS:
+        attempts += 1
+        kwargs = {
+            "model": TASK_MODEL_MAP[tier],
+            "max_tokens": max_tokens or TASK_MAX_TOKENS[tier],
+            "temperature": resolved_temp,
+            "messages": messages,
+            "timeout": resolved_timeout,
+        }
+        if system is not None:
+            kwargs["system"] = system
+        if tools is not None:
+            kwargs["tools"] = tools
+        try:
+            return _client.messages.create(**kwargs)
+        except Exception as exc:
+            auth_err = _classify_auth(exc)
+            if auth_err is not None:
+                raise auth_err from exc
+            last_exc = exc
+            if not _is_downshiftable(exc):
+                raise
+    raise last_exc
+
+
+_RERANK_SYSTEM = (
+    "You are a search reranker. Given a user query and a numbered list of candidate "
+    "results, return the candidate numbers ordered from MOST to LEAST relevant to the "
+    "query. Only include candidates that are genuinely relevant; drop irrelevant ones. "
+    "Respond with ONLY a JSON array of integers, e.g. [3,1,7]. No prose."
+)
+
+
+def rerank(query: str, candidates: list[str], top_k=None):
+    """Rerank candidate strings by relevance to query using Claude (Haiku).
+
+    Returns a list of 0-based indices into `candidates`, ordered most->least
+    relevant. On any failure returns the original order (graceful fallback),
+    so callers can always rely on getting a usable ordering.
+    """
+    if not candidates:
+        return []
+    n = len(candidates)
+    numbered = "\n".join(f"{i}: {c[:500]}" for i, c in enumerate(candidates))
+    prompt = f"Query: {query}\n\nCandidates:\n{numbered}"
+    try:
+        msg = generate(prompt=prompt, tier=TaskComplexity.LIGHT, system=_RERANK_SYSTEM)
+        order = extract_json(extract_text(msg))
+        if not isinstance(order, list):
+            return list(range(n))
+        seen = set()
+        cleaned = []
+        for x in order:
+            if isinstance(x, int) and 0 <= x < n and x not in seen:
+                cleaned.append(x)
+                seen.add(x)
+        if not cleaned:
+            return list(range(n))
+        if top_k is not None:
+            cleaned = cleaned[:top_k]
+        return cleaned
+    except ExternalConnectionError:
+        # Auth/connection failures must not be silently swallowed into
+        # "original order" — the caller needs to know credentials are dead.
+        raise
+    except Exception as exc:
+        print(f"claude_client.rerank failed, using original order — {exc}")
+        return list(range(n))

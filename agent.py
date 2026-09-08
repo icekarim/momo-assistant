@@ -1,6 +1,6 @@
 """Agentic tool-use loop for Momo.
 
-Gives Gemini a set of callable tools (calendar, tasks, gmail, knowledge graph,
+Gives Claude a set of callable tools (calendar, tasks, gmail, knowledge graph,
 Granola, Jira) and lets it decide which to invoke at inference time.  The agent
 iterates — calling tools, observing results, calling more tools — until it has
 enough information to compose a final text response.
@@ -12,19 +12,18 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta
 
-import google.generativeai as genai
-
 import config
-from langsmith_config import (
-    traceable, traced_chat_send, set_trace_metadata, _get_run_tree,
-    add_trace_tags, log_eval_failure,
+from claude_client import (
+    TaskComplexity, run_tool_loop,
 )
-
-genai.configure(api_key=config.GEMINI_API_KEY)
+from connection_errors import ExternalConnectionError, format_for_agent
+import observability
+from observability import log_eval_failure
 
 # ── Tool timeout map (seconds) ───────────────────────────────
 
 _TOOL_TIMEOUTS = {
+    "get_reauth_links": 10,
     "get_todays_calendar": 10,
     "get_calendar_for_date": 10,
     "get_open_tasks": 10,
@@ -34,8 +33,8 @@ _TOOL_TIMEOUTS = {
     "delete_task": 10,
     "get_recent_emails": 15,
     "search_emails": 15,
-    "search_knowledge_graph": 30,
-    "get_meeting_notes": 30,
+    "search_knowledge_graph": 20,
+    "get_meeting_notes": 20,
     "get_jira_tickets": 12,
     "get_jira_issue": 12,
     "search_jira_tickets": 12,
@@ -57,47 +56,48 @@ _TOOL_CATEGORIES = {
 }
 
 # ── Schema helper ────────────────────────────────────────────
-
-_TYPE_MAP = {
-    "string": genai.protos.Type.STRING,
-    "integer": genai.protos.Type.INTEGER,
-    "number": genai.protos.Type.NUMBER,
-    "boolean": genai.protos.Type.BOOLEAN,
-    "object": genai.protos.Type.OBJECT,
-    "array": genai.protos.Type.ARRAY,
-}
+# Claude tools use plain JSON Schema directly, so the schema passes
+# through unchanged. _tool() wraps a declaration into a Claude tool dict.
 
 
-def _schema(json_schema: dict) -> genai.protos.Schema:
-    """Convert a JSON-Schema-style dict to a genai.protos.Schema."""
-    schema_type = _TYPE_MAP.get(json_schema.get("type", "object"), genai.protos.Type.OBJECT)
+def _schema(json_schema: dict) -> dict:
+    return json_schema
 
-    properties = {}
-    for key, prop in json_schema.get("properties", {}).items():
-        properties[key] = genai.protos.Schema(
-            type=_TYPE_MAP.get(prop.get("type", "string"), genai.protos.Type.STRING),
-            description=prop.get("description", ""),
-        )
 
-    required = json_schema.get("required") or None
-
-    return genai.protos.Schema(
-        type=schema_type,
-        properties=properties if properties else None,
-        required=required,
-    )
+def _tool(name: str, description: str, parameters: dict) -> dict:
+    return {"name": name, "description": description, "input_schema": parameters}
 
 
 # ── Tool declarations ────────────────────────────────────────
 
 _CORE_TOOLS = [
-    genai.protos.Tool(function_declarations=[
-        genai.protos.FunctionDeclaration(
+    *[
+        _tool(
+            name="get_reauth_links",
+            description=(
+                "Get fresh reconnect/sign-in links for Google Workspace and/or Granola. "
+                "Use for every explicit reauth/reconnect request, including expired or missing links. "
+                "Works even when integrations are expired; does not send a separate Chat alert. "
+                "Return the exact URLs from the provider outcomes."
+            ),
+            parameters=_schema({
+                "type": "object",
+                "properties": {
+                    "service": {
+                        "type": "string", "enum": ["google_workspace", "granola", "all"],
+                        "description": "Provider to reconnect; use all when unspecified.",
+                    },
+                },
+                "required": ["service"],
+                "additionalProperties": False,
+            }),
+        ),
+        _tool(
             name="get_todays_calendar",
             description="Get today's meetings and schedule from Google Calendar. Returns all events for today with times, attendees, and details.",
             parameters=_schema({"type": "object", "properties": {}}),
         ),
-        genai.protos.FunctionDeclaration(
+        _tool(
             name="get_calendar_for_date",
             description="Get meetings for a specific date from Google Calendar. Use this when the user asks about a date other than today.",
             parameters=_schema({
@@ -108,12 +108,12 @@ _CORE_TOOLS = [
                 "required": ["date"],
             }),
         ),
-        genai.protos.FunctionDeclaration(
+        _tool(
             name="get_open_tasks",
             description="Get all open/incomplete tasks from Google Tasks across all task lists. Includes due dates, overdue status, and recently completed tasks.",
             parameters=_schema({"type": "object", "properties": {}}),
         ),
-        genai.protos.FunctionDeclaration(
+        _tool(
             name="create_task",
             description="Queue a new task request for approval. This does not execute until the user explicitly approves it.",
             parameters=_schema({
@@ -126,7 +126,7 @@ _CORE_TOOLS = [
                 "required": ["title"],
             }),
         ),
-        genai.protos.FunctionDeclaration(
+        _tool(
             name="update_task",
             description="Queue an update request for an existing task. This does not execute until the user explicitly approves it.",
             parameters=_schema({
@@ -140,7 +140,7 @@ _CORE_TOOLS = [
                 "required": ["find"],
             }),
         ),
-        genai.protos.FunctionDeclaration(
+        _tool(
             name="complete_task",
             description="Queue a completion request for a task. This does not execute until the user explicitly approves it.",
             parameters=_schema({
@@ -151,7 +151,7 @@ _CORE_TOOLS = [
                 "required": ["find"],
             }),
         ),
-        genai.protos.FunctionDeclaration(
+        _tool(
             name="delete_task",
             description="Queue a delete request for a task. This does not execute until the user explicitly approves it.",
             parameters=_schema({
@@ -162,7 +162,7 @@ _CORE_TOOLS = [
                 "required": ["find"],
             }),
         ),
-        genai.protos.FunctionDeclaration(
+        _tool(
             name="get_recent_emails",
             description="Get recent unread emails from the inbox. Returns sender, subject, date, and body.",
             parameters=_schema({
@@ -172,7 +172,7 @@ _CORE_TOOLS = [
                 },
             }),
         ),
-        genai.protos.FunctionDeclaration(
+        _tool(
             name="search_emails",
             description="Search emails with a custom query. Use this when looking for emails from a specific person, about a specific topic, or in a time range.",
             parameters=_schema({
@@ -185,7 +185,7 @@ _CORE_TOOLS = [
                 "required": ["query"],
             }),
         ),
-        genai.protos.FunctionDeclaration(
+        _tool(
             name="search_knowledge_graph",
             description=(
                 "Search Momo's institutional memory — the knowledge graph built from meetings, emails, "
@@ -201,7 +201,7 @@ _CORE_TOOLS = [
                 "required": ["query"],
             }),
         ),
-    ]),
+    ],
 ]
 
 
@@ -210,7 +210,7 @@ def _build_optional_tools() -> list:
     extra_decls = []
 
     if config.GRANOLA_ENABLED:
-        extra_decls.append(genai.protos.FunctionDeclaration(
+        extra_decls.append(_tool(
             name="get_meeting_notes",
             description="Search Granola meeting notes, transcripts, and action items. Use for questions about what was discussed in meetings.",
             parameters=_schema({
@@ -223,12 +223,12 @@ def _build_optional_tools() -> list:
         ))
 
     if config.JIRA_ENABLED:
-        extra_decls.append(genai.protos.FunctionDeclaration(
+        extra_decls.append(_tool(
             name="get_jira_tickets",
             description="Get active Jira tickets where the user is assignee, reporter, or watcher.",
             parameters=_schema({"type": "object", "properties": {}}),
         ))
-        extra_decls.append(genai.protos.FunctionDeclaration(
+        extra_decls.append(_tool(
             name="get_jira_issue",
             description="Get details for a specific Jira issue by key (e.g. PROJ-123).",
             parameters=_schema({
@@ -239,7 +239,7 @@ def _build_optional_tools() -> list:
                 "required": ["key"],
             }),
         ))
-        extra_decls.append(genai.protos.FunctionDeclaration(
+        extra_decls.append(_tool(
             name="search_jira_tickets",
             description="Search Jira tickets with a text query.",
             parameters=_schema({
@@ -251,8 +251,59 @@ def _build_optional_tools() -> list:
             }),
         ))
 
+        if config.JIRA_WRITE_ENABLED:
+            extra_decls.append(_tool(
+                name="create_jira_ticket",
+                description=(
+                    "Propose creating a new Jira ticket. This does NOT create the "
+                    "ticket — it queues it for the user's explicit approval. The user "
+                    "must confirm before anything is written to Jira."
+                ),
+                parameters=_schema({
+                    "type": "object",
+                    "properties": {
+                        "project": {"type": "string", "description": "Jira project key, e.g. OSD"},
+                        "summary": {"type": "string", "description": "Ticket title/summary"},
+                        "description": {"type": "string", "description": "Ticket description (optional)"},
+                        "issue_type": {"type": "string", "description": "Issue type, e.g. Task, Bug, Story (default Task)"},
+                        "priority": {"type": "string", "description": "Priority name (optional)"},
+                    },
+                    "required": ["project", "summary"],
+                }),
+            ))
+            extra_decls.append(_tool(
+                name="comment_jira_ticket",
+                description=(
+                    "Propose adding a comment to a Jira ticket. This does NOT post the "
+                    "comment — it queues it for the user's explicit approval."
+                ),
+                parameters=_schema({
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string", "description": "Jira issue key, e.g. OSD-123"},
+                        "comment": {"type": "string", "description": "Comment text"},
+                    },
+                    "required": ["key", "comment"],
+                }),
+            ))
+            extra_decls.append(_tool(
+                name="transition_jira_ticket",
+                description=(
+                    "Propose changing a Jira ticket's status. This does NOT change the "
+                    "status — it queues it for the user's explicit approval."
+                ),
+                parameters=_schema({
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string", "description": "Jira issue key, e.g. OSD-123"},
+                        "transition": {"type": "string", "description": "Target status or transition name, e.g. 'In Progress', 'Done'"},
+                    },
+                    "required": ["key", "transition"],
+                }),
+            ))
+
     if config.USER_MEMORY_ENABLED:
-        extra_decls.append(genai.protos.FunctionDeclaration(
+        extra_decls.append(_tool(
             name="remember_this",
             description=(
                 "Store a user correction or preference for future conversations. "
@@ -274,7 +325,7 @@ def _build_optional_tools() -> list:
                 "required": ["content"],
             }),
         ))
-        extra_decls.append(genai.protos.FunctionDeclaration(
+        extra_decls.append(_tool(
             name="forget_this",
             description=(
                 "Remove a previously stored memory. Use when the user says "
@@ -293,9 +344,36 @@ def _build_optional_tools() -> list:
             }),
         ))
 
+    if config.KG_RESOLUTION_ENABLED:
+        extra_decls.append(_tool(
+            name="review_merge_suggestion",
+            description=(
+                "Approve or reject a pending knowledge-graph merge suggestion "
+                "(two name/identity variants Momo proposed combining into one). "
+                "Use when the user responds to a merge suggestion from the "
+                "morning briefing, e.g. 'approve the Sarah merge' or 'reject "
+                "Ads / Ads Team'."
+            ),
+            parameters=_schema({
+                "type": "object",
+                "properties": {
+                    "pair": {"type": "string", "description": "The two names from the suggestion, as the user refers to them (e.g. 'Sarah and Sarah Chen'). Matched against pending merges."},
+                    "decision": {"type": "string", "description": "'approve' to merge the pair into one canonical identity, or 'reject' to dismiss the suggestion."},
+                },
+                "required": ["pair", "decision"],
+            }),
+        ))
+
+    if config.MCP_ENABLED:
+        try:
+            import mcp_client
+            extra_decls.extend(mcp_client.list_all_mcp_tools())
+        except Exception as exc:
+            print(f"[agent] MCP tool discovery failed (continuing without MCP tools): {exc}")
+
     if not extra_decls:
         return []
-    return [genai.protos.Tool(function_declarations=extra_decls)]
+    return list(extra_decls)
 
 
 def _get_all_tools() -> list:
@@ -305,9 +383,9 @@ def _get_all_tools() -> list:
 # ── Tool executor ────────────────────────────────────────────
 
 
-@traceable(run_type="tool", name="agent-tool")
 def execute_tool(name: str, args: dict, pending_task_actions: list[dict] | None = None,
-                 user_id: str | None = None, user_message: str | None = None) -> str:
+                 user_id: str | None = None, user_message: str | None = None,
+                 pending_jira_actions: list[dict] | None = None) -> str:
     """Dispatch a tool call to the appropriate service function.
 
     Returns a string result for the agent to consume, or an error message.
@@ -315,10 +393,18 @@ def execute_tool(name: str, args: dict, pending_task_actions: list[dict] | None 
     t0 = time.time()
     try:
         result = _dispatch(name, args, pending_task_actions=pending_task_actions,
-                           user_id=user_id, user_message=user_message)
+                           user_id=user_id, user_message=user_message,
+                           pending_jira_actions=pending_jira_actions)
         elapsed = time.time() - t0
         print(f"[agent] tool '{name}': {elapsed:.2f}s ({len(result)} chars)")
         return result
+    except ExternalConnectionError as exc:
+        # Typed connector failure (auth/permission): surface the stable
+        # CONNECTION_AUTH_ERROR string verbatim so the model tells the user
+        # credentials expired instead of "no data found".
+        elapsed = time.time() - t0
+        print(f"[agent] tool '{name}' CONNECTION FAILURE after {elapsed:.2f}s: {exc}")
+        return format_for_agent(exc)
     except Exception as exc:
         elapsed = time.time() - t0
         print(f"[agent] tool '{name}' FAILED after {elapsed:.2f}s: {exc}")
@@ -326,8 +412,13 @@ def execute_tool(name: str, args: dict, pending_task_actions: list[dict] | None 
 
 
 def _dispatch(name: str, args: dict, pending_task_actions: list[dict] | None = None,
-              user_id: str | None = None, user_message: str | None = None) -> str:
+              user_id: str | None = None, user_message: str | None = None,
+              pending_jira_actions: list[dict] | None = None) -> str:
     """Route a tool call to the correct service function."""
+
+    if name == "get_reauth_links":
+        from reauth_service import get_reauth_links
+        return json.dumps(get_reauth_links(args.get("service", "all")))
 
     if name == "get_todays_calendar":
         from calendar_service import fetch_todays_meetings, format_meetings_for_context
@@ -408,6 +499,29 @@ def _dispatch(name: str, args: dict, pending_task_actions: list[dict] | None = N
         from jira_service import search_jira_tickets
         return search_jira_tickets(args["query"]) or "No matching Jira tickets found."
 
+    if name == "create_jira_ticket":
+        action = {"action": "create_jira", "project": args["project"], "summary": args["summary"]}
+        if args.get("description"):
+            action["description"] = args["description"]
+        action["issue_type"] = args.get("issue_type") or "Task"
+        if args.get("priority"):
+            action["priority"] = args["priority"]
+        if pending_jira_actions is not None:
+            pending_jira_actions.append(action)
+        return json.dumps({"status": "pending_approval", "action": action})
+
+    if name == "comment_jira_ticket":
+        action = {"action": "comment_jira", "key": args["key"], "comment": args["comment"]}
+        if pending_jira_actions is not None:
+            pending_jira_actions.append(action)
+        return json.dumps({"status": "pending_approval", "action": action})
+
+    if name == "transition_jira_ticket":
+        action = {"action": "transition_jira", "key": args["key"], "transition": args["transition"]}
+        if pending_jira_actions is not None:
+            pending_jira_actions.append(action)
+        return json.dumps({"status": "pending_approval", "action": action})
+
     if name == "remember_this":
         from user_memory import add_memory
         result = add_memory(
@@ -428,7 +542,82 @@ def _dispatch(name: str, args: dict, pending_task_actions: list[dict] | None = N
             return json.dumps(result)
         return json.dumps({"status": "not_found", "message": "No matching memory found."})
 
+    if name == "review_merge_suggestion":
+        if not config.KG_RESOLUTION_ENABLED:
+            return "resolution disabled"
+        from conversation_store import get_db
+        from knowledge_resolution import (
+            apply_merge, get_pending_merge_suggestions, reject_merge,
+        )
+        db = get_db()
+        pending = get_pending_merge_suggestions(limit=50, db=db)
+        decision = (args.get("decision") or "").strip().lower()
+        if not (decision.startswith("appr") or decision.startswith("rej")):
+            return json.dumps({
+                "status": "error",
+                "message": "decision must be 'approve' or 'reject'",
+            })
+        match = _match_merge_pair(args.get("pair", ""), pending)
+        if not match:
+            return json.dumps({
+                "status": "not_found",
+                "message": f"No pending merge matching '{args.get('pair', '')}'.",
+            })
+        if match.get("status") == "ambiguous":
+            return json.dumps(match)
+        if decision.startswith("rej"):
+            reject_merge(match, db)
+            return json.dumps({"status": "rejected", "pair": match.get("pair")})
+        apply_merge(match, db)
+        return json.dumps({"status": "approved", "pair": match.get("pair")})
+
+    if name.startswith("mcp_"):
+        import mcp_client
+        return mcp_client.call_mcp_tool(name, args)
+
     return f"Unknown tool: {name}"
+
+
+def _match_merge_pair(pair_text: str, pending: list[dict]) -> dict | None:
+    """Find the pending merge whose two pair names both appear in the user's
+    reference text (substring, case-insensitive).
+
+    When several pending pairs fully match (overlapping alias chains like
+    ("Alex", "Alex Rivera") vs ("Alex Rivera", "alex@example.com")), prefer
+    the most specific match — one where neither name is a strict substring of a
+    name in another match. If multiple matches remain, return
+    {"status": "ambiguous", "candidates": [...]} so the caller writes nothing.
+    Returns None when no pending pair is fully named."""
+    text = (pair_text or "").lower()
+    matches = []
+    for item in pending:
+        pair = item.get("pair", [])
+        if len(pair) == 2 and all(str(p).lower() in text for p in pair):
+            matches.append(item)
+
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]
+
+    def _is_specific(candidate):
+        cand_names = [str(p).lower() for p in candidate.get("pair", [])]
+        for other in matches:
+            if other is candidate:
+                continue
+            other_names = [str(p).lower() for p in other.get("pair", [])]
+            for name in cand_names:
+                if any(name != o and name in o for o in other_names):
+                    return False
+        return True
+
+    specific = [m for m in matches if _is_specific(m)]
+    if len(specific) == 1:
+        return specific[0]
+    return {
+        "status": "ambiguous",
+        "candidates": [m.get("pair") for m in (specific or matches)],
+    }
 
 
 # ── Agent system prompt ──────────────────────────────────────
@@ -448,16 +637,48 @@ If the user asks what you remember about them, summarize the memories from the [
 
 AGENT_SYSTEM_PROMPT = f"""You are Momo, a chill, sharp, and low-key hilarious AI assistant living inside Google Chat. You talk like someone's most competent friend — the one who's somehow always got the answer but never makes it weird.
 {_OWNER_LINE}
-You have access to tools that let you read Gmail, Google Calendar, Google Tasks, a knowledge graph of institutional memory, Granola meeting notes, and Jira tickets. You also have tools to create, update, complete, and delete tasks.
+You have access to tools that let you read Gmail, Google Calendar, Google Tasks, a knowledge graph of institutional memory, Granola meeting notes, and Jira tickets. You also have tools to create, update, complete, and delete tasks. You can also ask RoktGPT — Rokt's internal company AI — anything Rokt-related via the mcp_roktgpt_ask_roktgpt tool: company policies, processes, people, internal docs, systems, and engineering questions. RoktGPT answers from Rokt's internal knowledge bases.
 
 === VIBE ===
-You're casual. Like texting-your-friend casual. Lowercase is your default. capitalization is for emphasis or when you're being dramatic on purpose.
-You're warm but not try-hard. No "certainly!" no "absolutely!" no "great question!" — that energy is dead to you.
-You use gen-z slang naturally, not like a brand account trying to go viral. If it doesn't fit, you don't force it.
-You're a little sarcastic, a little playful, but never mean. You roast gently and only when it's funny.
-You match the user's energy. If they're stressed, you dial it back and actually help. If they're vibing, you vibe back.
-You say "ngl", "lowkey", "fr", "tbh", "bet", "no cap" etc. when it flows — but you're not spamming them in every sentence like a parody.
-You use "lol", "lmao" sparingly for flavor — not as punctuation.
+You're a young NYC twenty-something texting your people. modern gen-z/gen-alpha, not millennial. lowercase ALWAYS. caps only for emphasis or being dramatic on purpose.
+You keep it SHORT and dry. gen-z doesn't over-talk — you say the thing and stop. no paragraphs when a line does it.
+Your slang is current + NYC: "deadass", "lowkey/highkey", "mad" (= very, "mad busy"), "tweakin/buggin" (= overreacting), "on god", "fr fr", "ngl", "tbh", "it's giving ___", "that's crazy", "say less", "bet", "locked in", "cooked" (= done for), "ate", "no shot", "wild", "brick" (= freezing). NO dated stuff — never "holler", "homie", "the bomb", "lit", "yaas", "on fleek". if it sounds like a millennial or a brand account, kill it.
+You don't force slang into every line — that's corny. let it land where it's natural. sometimes a plain dry line hits harder.
+You're a lil sarcastic + playful, roast gently when it's funny, never mean.
+You match energy. they stressed → lock in and help. they chill → keep it light.
+For support, auth failures, or corrections: be calm and helpful, not dismissive. Acknowledge quoted notifications. Missing conversation history is not proof the user is wrong or that you never sent something. No argumentative "nah ... lol", teasing, or blaming the user in support replies.
+Emojis: 💀 😭 🫡 🔥 sparingly for flavor, never as punctuation. "lol"/"lmao" rare.
+
+=== HOW YOU TALK (study these — THIS is your voice) ===
+modern nyc, gen-z/gen-alpha. short, dry, current. lowercase always. accurate but never corporate.
+
+User: "what's on my calendar today?"
+✅ "today's mad packed — standup at 10, client call at 2 (lock in for that one), 1:1 at 4."
+❌ "You have three events scheduled for today. Your first meeting is..."
+
+User: "any urgent emails?"
+✅ "one that actually matters — sarah needs the deck by eod. rest is nothing."
+❌ "I found one email that appears to require your attention regarding..."
+
+User: "thanks!"
+✅ "bet" or "say less" or "🫡"
+❌ "You're welcome! I'm happy to help. Let me know if there's anything else!"
+
+User: "what did we decide about pricing last week?"
+✅ "usage-based, $0.02 a unit. mike wanted flat-rate but got outvoted 💀"
+❌ "Based on the knowledge graph, the decision regarding pricing was as follows:"
+
+User: "ugh today is so busy"
+✅ "deadass it's a lot today. you got a gap 12-1 tho if you wanna breathe."
+❌ "I understand you're feeling busy. Here is your complete schedule for today:"
+
+User: "did i finish the q1 report?"
+✅ "nah it's still open — overdue like 3 weeks 😭 wanna push the date or just knock it out?"
+❌ "According to your task list, the Q1 report task remains incomplete."
+
+User: "is my 2pm still happening?"
+✅ "yeah it's still on. you're good."
+❌ "Yes, your 2:00 PM meeting is still scheduled to occur as planned."
 
 === HOW YOU WORK ===
 You still get stuff done. Being casual doesn't mean being lazy. When someone needs a real answer, a plan, a breakdown — you deliver, and you deliver well.
@@ -472,10 +693,16 @@ You MUST call tools to get real data before answering questions about emails, ca
 NEVER guess, fabricate, or hallucinate data. If you don't have data from a tool call, say so.
 Be efficient — call only the tools you need. Don't call everything "just in case".
 If one tool doesn't return what you need, try a different one. For example, if search_knowledge_graph doesn't find it, try search_emails.
-For task changes (create, update, complete, delete), use the task tools to prepare the request. Those tools do NOT execute immediately — they queue a pending approval.
-After queueing a task change, explicitly say it's waiting for approval and tell the user to reply "yes" to approve or "no" to cancel.
-Never say a task was already created, updated, completed, or deleted before approval happens.
+For anything about Rokt the company — policies, processes, people, internal tools, systems, engineering details — use mcp_roktgpt_ask_roktgpt. Pass a clear, self-contained question (it doesn't see this conversation). It's slower than other tools, so use it when the question is actually rokt-internal, not for the user's own emails/calendar/tasks.
+For task changes (create, update, complete, delete), use the task tools to prepare the request. Those tools do NOT execute immediately — they wait for the user to approve. Approval works one of two ways depending on the change:
+- Creating a task (or several): an interactive card with "add" / "edit" / "dismiss" buttons drops into chat. the user approves by TAPPING a button, not by replying. so do NOT tell them to "reply yes" — just say something chill like "dropped it in the tray, hit add to lock it in" and stop. don't claim it's on their list until they actually tap add.
+- Updating, completing, or deleting a task (or any MIX of changes): no card — the user approves by replying. say it's waiting and tell them to reply "yes" to confirm or "no" to cancel.
+When the user later confirms, you'll see a note in the conversation history — a "[task card resolved]" line for cards, or an approval confirmation for the reply flow. TRUST it: a task shown as added IS on their list now, so never say it's "still pending" or "needs approval first" once you see it was resolved. you can complete / update / delete it from there.
+Never say a task was already created, updated, completed, or deleted before approval actually happens.
 When a tool returns an error, tell the user naturally — don't retry endlessly.
+If a tool result starts with CONNECTION_AUTH_ERROR, that service's credentials have EXPIRED — tell the user plainly which service needs to be reconnected (the connector= field names it) and that momo can't see that data until they re-auth. NEVER present an auth failure as "no data found", "nothing came back", or an empty result.
+For EVERY explicit reauth, reconnect, sign-in, or replacement-link request, call get_reauth_links FIRST (google_workspace for Gmail/Calendar/Tasks/Google access, granola for meeting notes, all when unspecified or both). This is a core tool available even with expired integrations. Never say you cannot provide a link without checking this tool. Notification cooldowns do not prevent fresh user-requested links.
+Use the exact URL returned for each successful provider, preserving case and the entire query string. Never fabricate a URL, offer a bare ticketless Google auth path, or reuse a Google link from history: Google links are single-use and expire in 10 minutes. If one provider fails, still share the other provider's valid link and briefly explain the failure. Acknowledge a quoted auth alert even if it isn't in your history; focus on getting a fresh link, not disputing the notification. Do not promise a fixed sign-in time or that reconnecting guarantees every feature is restored; check access afterward if asked.
 
 The search_knowledge_graph tool searches across ALL of Momo's memory — meetings, emails, calendar events, tasks, chat history, and Granola notes. Use it for any "what happened", "what did we discuss", "who said what", "what was decided" type questions.
 {_MEMORY_SECTION}
@@ -575,7 +802,7 @@ Keep responses scannable. Google Chat supports *bold* and basic formatting. Use 
 
 
 def _build_history(conversation_history: list[dict], user_memories_context: str = "") -> list[dict]:
-    """Convert stored conversation history to Gemini chat format."""
+    """Convert stored conversation history to Claude message format."""
     from datetime import timedelta as _td
 
     now = datetime.now()
@@ -592,68 +819,91 @@ def _build_history(conversation_history: list[dict], user_memories_context: str 
     date_ref += "Upcoming days: " + ", ".join(f"{k.capitalize()}={v}" for k, v in weekday_dates.items())
 
     history = [
-        {"role": "user", "parts": [f"[SYSTEM DATE REFERENCE]\n{date_ref}\n[END DATE REFERENCE]"]},
-        {"role": "model", "parts": ["got it, i know the date. what's up?"]},
+        {"role": "user", "content": f"[SYSTEM DATE REFERENCE]\n{date_ref}\n[END DATE REFERENCE]"},
+        {"role": "assistant", "content": "got it, i know the date. what's up?"},
     ]
 
     if user_memories_context:
-        history.append({"role": "user", "parts": [user_memories_context]})
-        history.append({"role": "model", "parts": ["got it, i'll keep those in mind."]})
+        history.append({"role": "user", "content": user_memories_context})
+        history.append({"role": "assistant", "content": "got it, i'll keep those in mind."})
 
     recent = conversation_history[-20:] if len(conversation_history) > 20 else conversation_history
     for turn in recent:
-        role = "model" if turn["role"] == "assistant" else "user"
-        history.append({"role": role, "parts": [turn["content"]]})
+        role = "assistant" if turn["role"] == "assistant" else "user"
+        history.append({"role": role, "content": turn["content"]})
 
     return history
 
 
-def _flush_trace_metrics(metrics: dict, t0: float):
-    """Write accumulated trajectory metrics to the current LangSmith trace."""
+def _build_trace_metadata(metrics: dict, t0: float) -> dict:
+    """Shape accumulated trajectory metrics for the root observation metadata."""
     elapsed = time.time() - t0
-    set_trace_metadata(
-        iteration_count=metrics["iteration_count"],
-        total_tool_calls=metrics["total_tool_calls"],
-        unique_tools=list(metrics["unique_tools"]),
-        tool_sequence=metrics["tool_names"],
-        total_latency_s=round(elapsed, 3),
-        tool_details=metrics["tool_calls"],
-        errors=metrics["errors"],
-    )
-    # Auto-tag the trace with behavior categories based on tools used
+    # Behavior categories derived from the tools that ran
     behavior_tags = set()
     for category, tool_set in _TOOL_CATEGORIES.items():
         if metrics["unique_tools"] & tool_set:
             behavior_tags.add(category)
     if len(metrics["unique_tools"]) >= 3:
         behavior_tags.add("multi_tool")
-    if behavior_tags:
-        add_trace_tags(*behavior_tags)
+    return {
+        "iteration_count": metrics["iteration_count"],
+        "total_tool_calls": metrics["total_tool_calls"],
+        "unique_tools": sorted(metrics["unique_tools"]),
+        "tool_sequence": metrics["tool_names"],
+        "total_latency_s": round(elapsed, 3),
+        "tool_details": metrics["tool_calls"],
+        "errors": metrics["errors"],
+        "behavior_tags": sorted(behavior_tags),
+    }
 
 
-@traceable(name="agent-loop", tags=["chat", "user-initiated"])
 def run_agent_loop(user_message: str, conversation_history: list[dict],
                    max_iterations: int = 6,
                    thread_id: str | None = None,
-                   user_id: str | None = None) -> tuple[str, list[dict]]:
-    """Run the agentic tool-use loop.
+                   user_id: str | None = None,
+                   jira_actions_sink: list[dict] | None = None,
+                   metrics_sink: dict | None = None) -> tuple[str, list[dict]]:
+    """Run the agentic tool-use loop (root Langfuse observation for the turn).
 
-    Sends the user message to Gemini with tool declarations.  If Gemini
-    responds with function calls, executes them and sends results back.
-    Repeats until Gemini produces a text response or max_iterations is hit.
+    Sends the user message to Claude with tool declarations.  If Claude
+    responds with tool calls, executes them and sends results back.
+    Repeats until Claude produces a text response or max_iterations is hit.
 
-    Returns the final text response and any queued task actions.
+    Returns the final text response and any queued TASK actions. Queued JIRA
+    write actions are appended to jira_actions_sink (if provided) and kept on a
+    SEPARATE list so a task approval can never apply a Jira write.
+    metrics_sink, when provided, receives the loop's trajectory metadata
+    (iteration_count, tool_sequence, ...) — used by the eval harness.
     """
-    if thread_id:
-        set_trace_metadata(thread_id=thread_id)
-    tools = _get_all_tools()
-    model = genai.GenerativeModel(
-        model_name=config.GEMINI_MODEL_FLASH,
-        system_instruction=AGENT_SYSTEM_PROMPT,
-        tools=tools,
-    )
+    # EXPLICIT INPUT ONLY (skill rule): the trace input is just the user's
+    # message — never the full history/config, which may contain secrets.
+    with observability.start_as_current_observation(
+        name="agent-loop", as_type="agent", input={"message": user_message},
+    ) as root_span, observability.propagate_attributes(
+        user_id=user_id, session_id=thread_id, tags=["chat"],
+    ):
+        reply, pending_task_actions, metadata = _run_agent_loop_inner(
+            user_message, conversation_history,
+            max_iterations=max_iterations, user_id=user_id,
+            jira_actions_sink=jira_actions_sink,
+        )
+        if metrics_sink is not None:
+            metrics_sink.update(metadata)
+        try:
+            root_span.update(output=reply, metadata=metadata)
+        except Exception:
+            pass
+        return reply, pending_task_actions
 
-    # Load user memories for context injection
+
+def _run_agent_loop_inner(user_message: str, conversation_history: list[dict],
+                          max_iterations: int = 6,
+                          user_id: str | None = None,
+                          jira_actions_sink: list[dict] | None = None,
+                          ) -> tuple[str, list[dict], dict]:
+    """The actual loop. Returns (reply, pending_task_actions, trace_metadata)."""
+    tools = _get_all_tools()
+
     user_memories_context = ""
     if config.USER_MEMORY_ENABLED and user_id:
         try:
@@ -663,145 +913,96 @@ def run_agent_loop(user_message: str, conversation_history: list[dict],
         except Exception as exc:
             print(f"[agent] failed to load user memories: {exc}")
 
-    history = _build_history(conversation_history, user_memories_context=user_memories_context)
-    chat = model.start_chat(history=history)
+    messages = _build_history(conversation_history, user_memories_context=user_memories_context)
+    messages.append({"role": "user", "content": user_message})
 
     t0 = time.time()
     print(f"[agent] starting loop (max_iterations={max_iterations})")
 
     _trace_metrics = {
         "iteration_count": 0,
-        "tool_calls": [],       # list of {"name", "elapsed_s", "success"}
-        "tool_names": [],       # ordered tool names called
+        "tool_calls": [],
+        "tool_names": [],
         "total_tool_calls": 0,
         "unique_tools": set(),
         "errors": [],
     }
 
     pending_task_actions: list[dict] = []
+    pending_jira_actions: list[dict] = jira_actions_sink if jira_actions_sink is not None else []
 
-    try:
-        response = traced_chat_send(chat, user_message, model_name=config.GEMINI_MODEL_FLASH)
-    except Exception as exc:
-        print(f"[agent] initial send failed: {exc}")
-        traceback.print_exc()
-        _trace_metrics["errors"].append(f"initial_send: {exc}")
-        _flush_trace_metrics(_trace_metrics, t0)
-        return "sorry, something went wrong talking to gemini — try again in a sec?", pending_task_actions
+    def _dispatch_tool(name, tool_input):
+        timeout = _TOOL_TIMEOUTS.get(name, config.MCP_DEFAULT_TIMEOUT if name.startswith("mcp_") else 10)
 
-    for iteration in range(max_iterations):
-        _trace_metrics["iteration_count"] = iteration + 1
+        def _run_tool():
+            # ThreadingInstrumentor propagates the OTel context into this
+            # worker thread, so nested observations land under the tool span.
+            return execute_tool(name, tool_input, pending_task_actions,
+                                user_id=user_id, user_message=user_message,
+                                pending_jira_actions=pending_jira_actions)
 
-        candidate = response.candidates[0] if response.candidates else None
-        if not candidate:
-            break
-
-        parts = candidate.content.parts
-        function_calls = [p for p in parts if p.function_call and p.function_call.name]
-        text_parts = [p.text for p in parts if hasattr(p, "text") and p.text]
-
-        if not function_calls:
-            if text_parts:
-                final = "\n".join(text_parts)
-                print(f"[agent] done in {iteration + 1} iteration(s), {time.time() - t0:.2f}s total")
-                _flush_trace_metrics(_trace_metrics, t0)
-                return final, pending_task_actions
-            break
-
-        print(f"[agent] iteration {iteration + 1}: {len(function_calls)} tool call(s): "
-              f"{[fc.function_call.name for fc in function_calls]}")
-
-        tool_responses = []
-        # Capture the current run tree so child threads inherit the trace context
-        parent_run_tree = _get_run_tree()
-        for part in function_calls:
-            fc = part.function_call
-            timeout = _TOOL_TIMEOUTS.get(fc.name, 10)
-
-            def _run_tool(name, args, pending, rt=parent_run_tree):
-                """Execute tool with LangSmith context propagated."""
-                if rt is not None:
-                    import contextvars
-                    try:
-                        from langsmith.run_helpers import _PARENT_RUN_TREE
-                        _PARENT_RUN_TREE.set(rt)
-                    except (ImportError, AttributeError):
-                        pass
-                return execute_tool(name, args, pending,
-                                    user_id=user_id, user_message=user_message)
-
-            _tool_t0 = time.time()
-            tool_success = True
+        _tool_t0 = time.time()
+        # One observation per tool dispatch (unit budget: no micro-op spans).
+        # Explicit input: only the model-provided tool args.
+        with observability.start_as_current_observation(
+            name=f"tool:{name}", as_type="tool", input={"args": tool_input},
+        ) as tool_span:
             try:
                 with ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(_run_tool, fc.name, dict(fc.args), pending_task_actions)
-                    result_str = future.result(timeout=timeout)
-                    if result_str.startswith(("Tool '", "Error calling")):
-                        tool_success = False
+                    result_str = pool.submit(_run_tool).result(timeout=timeout)
             except FuturesTimeoutError:
-                result_str = f"Tool '{fc.name}' timed out after {timeout}s"
-                print(f"[agent] tool '{fc.name}' timed out")
-                tool_success = False
-                _trace_metrics["errors"].append(f"timeout: {fc.name}")
+                result_str = f"Tool '{name}' timed out after {timeout}s"
+                print(f"[agent] tool '{name}' timed out")
+                _trace_metrics["errors"].append(f"timeout: {name}")
             except Exception as exc:
-                result_str = f"Tool '{fc.name}' failed: {str(exc)}"
-                tool_success = False
-                _trace_metrics["errors"].append(f"exception: {fc.name}: {exc}")
+                result_str = f"Tool '{name}' failed: {str(exc)}"
+                _trace_metrics["errors"].append(f"exception: {name}: {exc}")
+            try:
+                tool_span.update(output=(
+                    "Reconnect link result withheld (contains single-use URLs)"
+                    if name == "get_reauth_links" else (result_str or "")[:1000]
+                ))
+            except Exception:
+                pass
+        _trace_metrics["tool_calls"].append({
+            "name": name,
+            "elapsed_s": round(time.time() - _tool_t0, 3),
+        })
+        _trace_metrics["tool_names"].append(name)
+        _trace_metrics["unique_tools"].add(name)
+        _trace_metrics["total_tool_calls"] += 1
+        return result_str
 
-            # Record tool metrics for trajectory evaluation
-            _trace_metrics["tool_calls"].append({
-                "name": fc.name,
-                "elapsed_s": round(time.time() - _tool_t0, 3),
-                "success": tool_success,
-            })
-            _trace_metrics["tool_names"].append(fc.name)
-            _trace_metrics["unique_tools"].add(fc.name)
-            _trace_metrics["total_tool_calls"] += 1
-
-            tool_responses.append(
-                genai.protos.Part(
-                    function_response=genai.protos.FunctionResponse(
-                        name=fc.name,
-                        response={"result": result_str},
-                    )
-                )
-            )
-
-        if text_parts:
-            tool_responses.append(genai.protos.Part(text="\n".join(text_parts)))
-
-        try:
-            response = traced_chat_send(chat, tool_responses, model_name=config.GEMINI_MODEL_FLASH, iteration=iteration + 1)
-        except Exception as exc:
-            print(f"[agent] send_message failed on iteration {iteration + 1}: {exc}")
-            _trace_metrics["errors"].append(f"send_message: {exc}")
-            _flush_trace_metrics(_trace_metrics, t0)
-            if text_parts:
-                return "\n".join(text_parts), pending_task_actions
-            return "sorry, hit a snag pulling your data — try again?", pending_task_actions
-
-    final_text = ""
     try:
-        if response.candidates:
-            for p in response.candidates[0].content.parts:
-                if hasattr(p, "text") and p.text:
-                    final_text += p.text
-    except Exception:
-        pass
+        final_text, stop_reason = run_tool_loop(
+            messages=messages,
+            tools=tools,
+            system=AGENT_SYSTEM_PROMPT,
+            dispatch=_dispatch_tool,
+            max_iterations=max_iterations,
+            tier=TaskComplexity.STANDARD,
+            max_tokens=config.CLAUDE_MAX_TOKENS_AGENT,
+        )
+    except Exception as exc:
+        print(f"[agent] loop failed: {exc}")
+        traceback.print_exc()
+        _trace_metrics["errors"].append(f"loop: {exc}")
+        return ("sorry, something went wrong — try again in a sec?",
+                pending_task_actions, _build_trace_metadata(_trace_metrics, t0))
 
+    _trace_metrics["iteration_count"] = len(_trace_metrics["tool_names"]) or 1
     elapsed = time.time() - t0
-    print(f"[agent] loop ended after {max_iterations} iterations, {elapsed:.2f}s total")
+    print(f"[agent] done, {elapsed:.2f}s total")
+    metadata = _build_trace_metadata(_trace_metrics, t0)
 
-    _flush_trace_metrics(_trace_metrics, t0)
-
-    # Log exhausted loops as eval failure candidates
     if not final_text:
         log_eval_failure(
             user_message=user_message,
             expected_behavior="Agent should produce a text response",
-            actual_behavior=f"Exhausted {max_iterations} iterations without text response. "
+            actual_behavior=f"Loop ended ({stop_reason}) without text. "
                             f"Tools called: {_trace_metrics['tool_names']}",
             category="agent_loop_exhaustion",
         )
 
-    return final_text or "i pulled a lot of info but couldn't put it together — try asking differently?", pending_task_actions
+    reply = final_text or "i pulled a lot of info but couldn't put it together — try asking differently?"
+    return reply, pending_task_actions, metadata
