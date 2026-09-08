@@ -10,34 +10,33 @@ Covers the must-hold guarantees:
       reminder after cooldown does, recovery alerts)
   (f) Chat send non-2xx no longer reports success (and 401 never crashes)
 
-Co-run-safe isolation (HANDOFF_addon_cards.md §8): sibling test files stub
-modules via sys.modules[...] = MagicMock() at import time. Purge every
-MagicMock stand-in plus cached first-party modules, then import the REAL
-modules fresh — this file passes alone and in any co-run order. All
-network/Firestore access is monkeypatched at module seams.
+Sibling test files stub modules during collection. Load the real production
+modules lazily in a private, restoring module graph instead of globally
+purging siblings' stubs. All network/Firestore access is patched at seams.
 """
 
-import sys
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
-# ── Purge sibling stubs so we get REAL modules ──────────────────────────────
-for _name in list(sys.modules):
-    if isinstance(sys.modules.get(_name), MagicMock):
-        sys.modules.pop(_name, None)
-for _name in ("connection_health", "connection_errors", "agent", "claude_client",
-              "observability", "jira_service", "mcp_client", "chat_service",
-              "google_auth", "config"):
-    sys.modules.pop(_name, None)
+import pytest
+from test_reauth_tools import real_auth_modules  # shared, restoring isolation fixture
 
-import pytest  # noqa: E402
+if TYPE_CHECKING:  # runtime bindings come from _real_modules
+    import agent
+    import chat_service
+    import config
+    import connection_health
+    import jira_service
+    import mcp_client
+    from connection_errors import ExternalAuthError, format_for_agent
 
-import config  # noqa: E402,F401
-from connection_errors import ExternalAuthError, format_for_agent  # noqa: E402
-import jira_service  # noqa: E402
-import mcp_client  # noqa: E402
-import chat_service  # noqa: E402
-import connection_health  # noqa: E402
-import agent  # noqa: E402
+
+@pytest.fixture(autouse=True)
+def _real_modules(monkeypatch, real_auth_modules):
+    for name in ("config", "jira_service", "mcp_client", "chat_service", "connection_health", "agent"):
+        monkeypatch.setitem(globals(), name, real_auth_modules[name])
+    for name in ("ExternalAuthError", "format_for_agent"):
+        monkeypatch.setitem(globals(), name, getattr(real_auth_modules["connection_errors"], name))
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -213,7 +212,7 @@ def test_health_check_alerts_only_on_transition(monkeypatch):
     fake_db = _FakeDB()
     alerts = []
     monkeypatch.setattr(connection_health, "get_db", lambda: fake_db)
-    monkeypatch.setattr(connection_health, "_send_alert", alerts.append)
+    monkeypatch.setattr(connection_health, "_send_alert", lambda text: alerts.append(text) or True)
 
     failing = [("jira", lambda: _probe_result("jira", "auth_failed"))]
     recovered = [("jira", lambda: _probe_result("jira", "ok"))]
@@ -272,6 +271,78 @@ def test_health_check_firestore_down_best_effort_alert(monkeypatch):
     # Persistence skipped, but the failure still alerts best-effort.
     assert out["status"] == "degraded"
     assert len(alerts) == 1
+
+
+def test_failed_health_alert_does_not_record_delivery_and_retries(monkeypatch):
+    fake_db = _FakeDB()
+    send = MagicMock(return_value=False)
+    monkeypatch.setattr(connection_health, "get_db", lambda: fake_db)
+    monkeypatch.setattr(connection_health, "_send_alert", send)
+    failed = _probe_result("jira", "auth_failed")
+    connection_health._persist_and_alert(failed)
+    assert fake_db.store["jira"]["status"] == "auth_failed"
+    assert fake_db.store["jira"]["last_alerted_at"] == 0
+    send.return_value = True
+    connection_health._persist_and_alert(failed)
+    assert send.call_count == 2
+    last_sent = fake_db.store["jira"]["last_alerted_at"]
+    assert last_sent > 0
+    send.return_value = False
+    connection_health._persist_and_alert(_probe_result("jira", "ok"))
+    assert fake_db.store["jira"]["status"] == "ok"
+    assert fake_db.store["jira"]["last_alerted_at"] == last_sent
+
+
+@pytest.mark.parametrize("connector", ["google_workspace", "granola"])
+def test_health_provider_cooldown_is_authoritative_even_with_recent_health_alert(monkeypatch, connector):
+    import google_auth
+    import granola_service
+
+    fake_db = _FakeDB()
+    fake_db.store[connector] = {
+        "status": "auth_failed", "last_alerted_at": connection_health.time.time(),
+    }
+    sender = MagicMock(return_value=False)
+    module, name = (google_auth, "_send_throttled_reauth_alert") if connector == "google_workspace" else (
+        granola_service, "send_reauth_alert"
+    )
+    monkeypatch.setattr(module, name, sender)
+    monkeypatch.setattr(connection_health, "get_db", lambda: fake_db)
+    direct_send = MagicMock()
+    monkeypatch.setattr(connection_health, "_send_alert", direct_send)
+    before = fake_db.store[connector]["last_alerted_at"]
+    connection_health._persist_and_alert(_probe_result(connector, "auth_failed"))
+    sender.assert_called_once_with()
+    direct_send.assert_not_called()
+    assert fake_db.store[connector]["last_alerted_at"] == before
+
+
+@pytest.mark.parametrize("connector", ["google_workspace", "granola"])
+def test_health_firestore_down_still_routes_through_provider(monkeypatch, connector):
+    import google_auth
+    import granola_service
+
+    monkeypatch.setattr(connection_health, "get_db", MagicMock(side_effect=RuntimeError("offline")))
+    module, name = (google_auth, "_send_throttled_reauth_alert") if connector == "google_workspace" else (
+        granola_service, "send_reauth_alert"
+    )
+    sender = MagicMock(return_value=False)
+    monkeypatch.setattr(module, name, sender)
+    direct_send = MagicMock()
+    monkeypatch.setattr(connection_health, "_send_alert", direct_send)
+    result = _probe_result(
+        connector, "auth_failed",
+        user_message=f"{connector} needs re-auth — ask momo for a fresh reconnect link",
+    )
+    connection_health._persist_and_alert(result)
+    sender.assert_called_once_with()
+    # Only the unavailable health-state read permits this safe, link-free
+    # fallback when the provider could not deliver its own notification.
+    message = connection_health._alert_text(result, "failure")
+    direct_send.assert_called_once_with(message)
+    assert "fresh reconnect link" in message
+    for broken_link in ("http://", "https://", "/google-auth/start", "/granola-auth/start", "?t="):
+        assert broken_link not in message
 
 
 # ── (f) Chat send non-2xx is a failure, never a success ─────────────────────

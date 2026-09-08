@@ -21,6 +21,7 @@ description: "HTTP endpoints and the Cloud Scheduler jobs that drive them"
 | `/google-auth/callback` | GET | Google OAuth redirect | Completes Google reauth and stores credentials |
 | `/granola-token-refresh` | POST | Cloud Scheduler (every 4h) | Keep Granola OAuth token alive |
 | `/run-evals` | POST | Cloud Scheduler (daily) | Run LLM-as-judge evals against the golden dataset via Langfuse |
+| `/connection-health` | POST | Cloud Scheduler (hourly) | Probe every external connector and alert Chat on auth-state transitions |
 
 ## Scheduled jobs (Cloud Scheduler)
 
@@ -34,6 +35,7 @@ One-time         ──► POST /knowledge-embed-backfill (add embeddings to exi
 Cloud Scheduler ──► POST /google-token-refresh     (every 4 hours - keeps Google token alive)
 Cloud Scheduler ──► POST /granola-token-refresh    (every 4 hours — keeps token alive)
 Cloud Scheduler ──► POST /run-evals                 (daily — nightly eval suite via Langfuse)
+Cloud Scheduler ──► POST /connection-health        (hourly — connector auth health checks)
 ```
 
 ## What each job does
@@ -100,3 +102,13 @@ Cloud Scheduler ──► POST /run-evals                 (daily — nightly eva
 2. Exercises the live agent end-to-end and records results as a Langfuse experiment named `momo-eval-YYYYMMDD`
 3. Returns `{"status": "ok", "experiment": "<name>"}` on success, or `{"status": "skipped"}` if the dataset is empty
 4. Requires Langfuse keys to be configured (see [Configuration](/setup/configuration))
+
+**`/connection-health`**:
+
+1. Runs a lightweight authenticated probe against every configured connector in parallel (Jira, Google Workspace, Google Chat, Granola, each MCP server, Anthropic, Gemini, Firestore, Langfuse)
+2. Classifies each result as `ok`, `auth_failed`, `unavailable`, or `skipped` (for disabled connectors)
+3. Persists per-connector state in the `connection_health` Firestore collection
+4. Posts a Chat alert only when a connector's status transitions (for example, `ok` → `auth_failed`, or recovery back to `ok`), plus a reminder at most every 12 hours while a connector is still failing
+5. Returns `{ "status": "ok" | "degraded", "connectors": [...] }` so scheduler logs show a full snapshot
+
+Run it hourly from Cloud Scheduler. Each connector's probe is capped at roughly 10 seconds so a single dead integration cannot stall the others.

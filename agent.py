@@ -23,6 +23,7 @@ from observability import log_eval_failure
 # ── Tool timeout map (seconds) ───────────────────────────────
 
 _TOOL_TIMEOUTS = {
+    "get_reauth_links": 10,
     "get_todays_calendar": 10,
     "get_calendar_for_date": 10,
     "get_open_tasks": 10,
@@ -71,6 +72,26 @@ def _tool(name: str, description: str, parameters: dict) -> dict:
 
 _CORE_TOOLS = [
     *[
+        _tool(
+            name="get_reauth_links",
+            description=(
+                "Get fresh reconnect/sign-in links for Google Workspace and/or Granola. "
+                "Use for every explicit reauth/reconnect request, including expired or missing links. "
+                "Works even when integrations are expired; does not send a separate Chat alert. "
+                "Return the exact URLs from the provider outcomes."
+            ),
+            parameters=_schema({
+                "type": "object",
+                "properties": {
+                    "service": {
+                        "type": "string", "enum": ["google_workspace", "granola", "all"],
+                        "description": "Provider to reconnect; use all when unspecified.",
+                    },
+                },
+                "required": ["service"],
+                "additionalProperties": False,
+            }),
+        ),
         _tool(
             name="get_todays_calendar",
             description="Get today's meetings and schedule from Google Calendar. Returns all events for today with times, attendees, and details.",
@@ -395,6 +416,10 @@ def _dispatch(name: str, args: dict, pending_task_actions: list[dict] | None = N
               pending_jira_actions: list[dict] | None = None) -> str:
     """Route a tool call to the correct service function."""
 
+    if name == "get_reauth_links":
+        from reauth_service import get_reauth_links
+        return json.dumps(get_reauth_links(args.get("service", "all")))
+
     if name == "get_todays_calendar":
         from calendar_service import fetch_todays_meetings, format_meetings_for_context
         return format_meetings_for_context(fetch_todays_meetings())
@@ -621,6 +646,7 @@ Your slang is current + NYC: "deadass", "lowkey/highkey", "mad" (= very, "mad bu
 You don't force slang into every line — that's corny. let it land where it's natural. sometimes a plain dry line hits harder.
 You're a lil sarcastic + playful, roast gently when it's funny, never mean.
 You match energy. they stressed → lock in and help. they chill → keep it light.
+For support, auth failures, or corrections: be calm and helpful, not dismissive. Acknowledge quoted notifications. Missing conversation history is not proof the user is wrong or that you never sent something. No argumentative "nah ... lol", teasing, or blaming the user in support replies.
 Emojis: 💀 😭 🫡 🔥 sparingly for flavor, never as punctuation. "lol"/"lmao" rare.
 
 === HOW YOU TALK (study these — THIS is your voice) ===
@@ -675,6 +701,8 @@ When the user later confirms, you'll see a note in the conversation history — 
 Never say a task was already created, updated, completed, or deleted before approval actually happens.
 When a tool returns an error, tell the user naturally — don't retry endlessly.
 If a tool result starts with CONNECTION_AUTH_ERROR, that service's credentials have EXPIRED — tell the user plainly which service needs to be reconnected (the connector= field names it) and that momo can't see that data until they re-auth. NEVER present an auth failure as "no data found", "nothing came back", or an empty result.
+For EVERY explicit reauth, reconnect, sign-in, or replacement-link request, call get_reauth_links FIRST (google_workspace for Gmail/Calendar/Tasks/Google access, granola for meeting notes, all when unspecified or both). This is a core tool available even with expired integrations. Never say you cannot provide a link without checking this tool. Notification cooldowns do not prevent fresh user-requested links.
+Use the exact URL returned for each successful provider, preserving case and the entire query string. Never fabricate a URL, offer a bare ticketless Google auth path, or reuse a Google link from history: Google links are single-use and expire in 10 minutes. If one provider fails, still share the other provider's valid link and briefly explain the failure. Acknowledge a quoted auth alert even if it isn't in your history; focus on getting a fresh link, not disputing the notification. Do not promise a fixed sign-in time or that reconnecting guarantees every feature is restored; check access afterward if asked.
 
 The search_knowledge_graph tool searches across ALL of Momo's memory — meetings, emails, calendar events, tasks, chat history, and Granola notes. Use it for any "what happened", "what did we discuss", "who said what", "what was decided" type questions.
 {_MEMORY_SECTION}
@@ -930,7 +958,10 @@ def _run_agent_loop_inner(user_message: str, conversation_history: list[dict],
                 result_str = f"Tool '{name}' failed: {str(exc)}"
                 _trace_metrics["errors"].append(f"exception: {name}: {exc}")
             try:
-                tool_span.update(output=(result_str or "")[:1000])
+                tool_span.update(output=(
+                    "Reconnect link result withheld (contains single-use URLs)"
+                    if name == "get_reauth_links" else (result_str or "")[:1000]
+                ))
             except Exception:
                 pass
         _trace_metrics["tool_calls"].append({
@@ -950,6 +981,7 @@ def _run_agent_loop_inner(user_message: str, conversation_history: list[dict],
             dispatch=_dispatch_tool,
             max_iterations=max_iterations,
             tier=TaskComplexity.STANDARD,
+            max_tokens=config.CLAUDE_MAX_TOKENS_AGENT,
         )
     except Exception as exc:
         print(f"[agent] loop failed: {exc}")

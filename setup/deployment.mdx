@@ -52,4 +52,9 @@ export CHAT_SPACE_ID="spaces/XXXXXXXXX"
   <Step title="Nightly evals (optional)">
     If Langfuse is configured, create a Cloud Scheduler job: `POST https://<url>/run-evals` — daily. Runs the LLM-as-judge suite against the golden dataset and records results as a Langfuse experiment.
   </Step>
+  <Step title="Connector health checks">
+    Create a Cloud Scheduler job: `POST https://<url>/connection-health` — hourly (e.g. `0 * * * *`).
+
+    The endpoint probes every configured connector and posts a Chat alert when one flips to `auth_failed` (and again on recovery). Without it, an expired token can silently degrade briefings and agent answers until someone notices.
+  </Step>
 </Steps>
