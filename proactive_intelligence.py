@@ -351,6 +351,8 @@ def run_meeting_prep() -> dict:
     Only creates a Langfuse trace when there are actual meetings to prep,
     so idle polling runs don't flood the trace dashboard.
     """
+    from connection_errors import ExternalAuthError
+
     if not config.PROACTIVE_INTELLIGENCE_ENABLED or not config.MEETING_PREP_ENABLED:
         return {"status": "skipped", "reason": "meeting prep disabled"}
     if not config.KNOWLEDGE_GRAPH_ENABLED:
@@ -358,7 +360,16 @@ def run_meeting_prep() -> dict:
     if not config.CHAT_SPACE_ID:
         return {"status": "skipped", "reason": "CHAT_SPACE_ID not configured"}
 
-    upcoming = fetch_upcoming_meetings(hours=config.MEETING_PREP_LOOKAHEAD_HOURS)
+    try:
+        upcoming = fetch_upcoming_meetings(hours=config.MEETING_PREP_LOOKAHEAD_HOURS)
+    except ExternalAuthError as exc:
+        print(f"  Meeting prep calendar AUTH failure: {exc}")
+        return {
+            "status": "auth_failed",
+            "source": "calendar_events",
+            "reason": "Google Calendar connection needs re-auth",
+            "preps_sent": 0,
+        }
     if not upcoming:
         return {"status": "no_meetings", "preps_sent": 0}
 
