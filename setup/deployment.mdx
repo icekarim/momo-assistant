@@ -49,4 +49,9 @@ export CHAT_SPACE_ID="spaces/XXXXXXXXX"
   <Step title="Granola token keepalive">
     Create a Cloud Scheduler job: `POST https://<url>/granola-token-refresh` — every 4 hours
   </Step>
+  <Step title="Connector health checks">
+    Create a Cloud Scheduler job: `POST https://<url>/connection-health` — hourly (e.g. `0 * * * *`).
+
+    The endpoint probes every configured connector and posts a Chat alert when one flips to `auth_failed` (and again on recovery). Without it, an expired token can silently degrade briefings and agent answers until someone notices.
+  </Step>
 </Steps>
