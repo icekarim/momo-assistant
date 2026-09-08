@@ -32,7 +32,6 @@ from conversation_store import (
     mark_prep_sent,
 )
 from knowledge_graph import (
-    format_knowledge_for_context,
     get_canonical_aliases,
     query_all_entries,
     query_by_person,
@@ -107,11 +106,18 @@ Meeting: {title}
 Attendees: {attendees}
 Starts: {start_time}
 
-Here is everything Momo knows about the people and topics involved (from past meetings, emails, and conversations):
+Use ONLY evidence items below. Each item has an ID like [E1].
+Every bullet MUST cite at least one evidence ID, like [E1].
+Do NOT mention a person, task, project, blocker, departure, deadline, or decision unless evidence explicitly supports it.
+Do NOT combine facts across evidence items unless they share the same person or project explicitly.
+If evidence is weak or empty, say no strong prep context.
+Keep 3-6 bullets max.
+
+Evidence:
 
 {knowledge_context}
 
-Write a short pre-meeting prep (3-6 bullet points max). Include:
+Write a short pre-meeting prep. Include:
 - Key context about the attendees from past interactions
 - Any open commitments or action items involving these people
 - Relevant decisions or blockers from previous meetings
@@ -200,14 +206,43 @@ def _rerank_prep_entries(entries: list[dict], title: str,
 
 
 def _build_meeting_prep(meeting: dict) -> str | None:
-    """Gather KG context for a meeting and generate a prep brief via Gemini."""
+    """Gather bounded, relevant KG evidence and generate a prep via Claude."""
     attendee_names = [a["name"] for a in meeting.get("attendees", [])]
     if not attendee_names:
         return None
 
-    all_entries = []
-    seen_ids = set()
+    entries_by_id = {}
     title = meeting.get("title", "")
+    from meeting_prep_accuracy import (
+        MEETING_PREP_MAX_PERSON_QUERIES,
+        build_prep_diagnostics,
+        finalize_evidence_gated_prep,
+        format_prep_evidence_context,
+        plan_prep_queries,
+        select_prep_evidence,
+    )
+    query_plan = plan_prep_queries(meeting)
+    query_labels = []
+
+    def _add_labeled_entry(entry: dict, label: str) -> None:
+        entry_id = entry["id"]
+        existing = entries_by_id.get(entry_id)
+        if existing is None:
+            existing = dict(entry)
+            entries_by_id[entry_id] = existing
+
+        labels = set()
+        legacy_label = existing.get("_query_label")
+        if legacy_label:
+            labels.add(legacy_label)
+        existing_labels = existing.get("_query_labels") or []
+        if isinstance(existing_labels, str):
+            existing_labels = [existing_labels]
+        labels.update(existing_labels)
+        labels.add(label)
+        sorted_labels = sorted(labels)
+        existing["_query_labels"] = sorted_labels
+        existing["_query_label"] = sorted_labels[0]
 
     # Recency window: KG entries older than this are stale for meeting prep.
     cutoff_dt = (
@@ -225,62 +260,69 @@ def _build_meeting_prep(meeting: dict) -> str | None:
         else:
             non_owner_attendees.append(attendee)
 
-    # Expand each attendee with their canonical aliases. get_canonical_aliases
-    # returns [] when KG_RESOLUTION_ENABLED is off, so query_names equals the
-    # attendee set then — a no-op. Deduped by normalized form.
+    # Expand only planned non-owner people. Base names take priority over
+    # aliases, and aliases share the planner's total person-query budget.
+    planned_people = [
+        person for person in query_plan["people"]
+        if not _matches_owner(person, owner_tokens)
+    ]
     query_names: list[str] = []
     query_attendee: dict[str, str] = {}  # query name -> base attendee
     seen_query: set[str] = set()
-    for attendee in non_owner_attendees:
-        for candidate in [attendee, *get_canonical_aliases(attendee)]:
-            normalized = candidate.strip().lower()
-            if not normalized or normalized in seen_query:
-                continue
-            if _matches_owner(candidate, owner_tokens):
-                print(f"    Meeting prep: dropping owner alias '{candidate}' from KG retrieval")
-                continue
-            seen_query.add(normalized)
-            query_names.append(candidate)
-            query_attendee[candidate] = attendee
+    for expand_aliases in (False, True):
+        for attendee in planned_people:
+            if len(query_names) >= MEETING_PREP_MAX_PERSON_QUERIES:
+                break
+            candidates = get_canonical_aliases(attendee) if expand_aliases else [attendee]
+            for candidate in candidates:
+                normalized = candidate.strip().lower()
+                if not normalized or normalized in seen_query:
+                    continue
+                if _matches_owner(candidate, owner_tokens):
+                    print(f"    Meeting prep: dropping owner alias '{candidate}' from KG retrieval")
+                    continue
+                seen_query.add(normalized)
+                query_names.append(candidate)
+                query_attendee[candidate] = attendee
+                if len(query_names) >= MEETING_PREP_MAX_PERSON_QUERIES:
+                    break
 
-    # Query KG in parallel: by each attendee AND by meeting title (semantic search)
-    attendees_with_context: set[str] = set()
+    # Query KG in parallel, suppressing generic title searches per the planner.
     from knowledge_graph import semantic_search as _semantic_search
-    workers = max(len(query_names) + 1, 4)
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures: dict = {
-            pool.submit(query_by_person, name, cutoff_str, 8): ("person", name)
-            for name in query_names
-        }
-        # Also search by meeting title to catch topic-based KG entries.
-        # rerank=False: the merged set (person + semantic + project fan-out)
-        # is reranked ONCE below against title + attendees — reranking here
-        # too would double the latency for no precision gain.
-        title_future = pool.submit(lambda: _semantic_search(title, limit=10, rerank=False))
-        futures[title_future] = ("title", title)
+    successfully_queried_attendees: set[str] = set()
+    query_count = len(query_names) + int(query_plan["include_title_semantic_search"])
+    if query_count:
+        with ThreadPoolExecutor(max_workers=max(query_count, 4)) as pool:
+            kg_futures = {
+                pool.submit(query_by_person, name, cutoff_str, 8): f"person:{name}"
+                for name in query_names
+            }
+            if query_plan["include_title_semantic_search"]:
+                # Rerank the merged set once below, not each retrieval leg.
+                title_future = pool.submit(_semantic_search, title, limit=10, rerank=False)
+                kg_futures[title_future] = f"title:{title}"
+            query_labels.extend(kg_futures.values())
 
-        for future in as_completed(futures):
-            kind, name = futures[future]
-            try:
-                for entry in future.result():
-                    # semantic_search has no date awareness (embeddings omit
-                    # source_date) — post-filter stale entries; undated kept.
-                    if kind == "title" and not _entry_within_cutoff(entry, cutoff_dt):
-                        continue
-                    if kind == "person":
-                        base_attendee = query_attendee.get(name)
-                        attendees_with_context.add(base_attendee if base_attendee else name)
-                    if entry["id"] not in seen_ids:
-                        seen_ids.add(entry["id"])
-                        all_entries.append(entry)
-            except Exception as exc:
-                print(f"    KG query failed ({kind}:{name}): {exc}")
+            for future in as_completed(kg_futures):
+                label = kg_futures[future]
+                try:
+                    for entry in future.result():
+                        # Semantic retrieval has no date awareness; keep undated hits.
+                        if label.startswith("title:") and not _entry_within_cutoff(entry, cutoff_dt):
+                            continue
+                        _add_labeled_entry(entry, label)
+                    if label.startswith("person:"):
+                        successfully_queried_attendees.add(query_attendee[label.removeprefix("person:")])
+                except Exception as exc:
+                    print(f"    KG query failed ({label}): {exc}")
+    else:
+        print("    KG query skipped: no planned meeting prep queries")
 
     # Also query by projects found in existing results
     projects = set()
-    for e in all_entries:
+    for e in entries_by_id.values():
         projects.update(e.get("related_projects", []))
-    project_list = list(projects)[:3]
+    project_list = sorted(projects)[:3]
 
     if project_list:
         with ThreadPoolExecutor(max_workers=len(project_list)) as pool:
@@ -288,38 +330,40 @@ def _build_meeting_prep(meeting: dict) -> str | None:
                 pool.submit(query_by_project, proj, cutoff_str, 5): proj
                 for proj in project_list
             }
+            query_labels.extend(f"project:{proj}" for proj in proj_futures.values())
             for future in as_completed(proj_futures):
+                proj = proj_futures[future]
                 try:
                     for entry in future.result():
-                        if entry["id"] not in seen_ids:
-                            seen_ids.add(entry["id"])
-                            all_entries.append(entry)
+                        _add_labeled_entry(entry, f"project:{proj}")
                 except Exception as exc:
                     print(f"    KG project query failed: {exc}")
 
     # Rerank the merged, deduped set against THIS meeting so context that is
     # merely owner-adjacent (old unrelated projects) gets dropped.
     all_entries = _rerank_prep_entries(
-        all_entries, title, non_owner_attendees or attendee_names
+        list(entries_by_id.values()), title, non_owner_attendees
     )
+    included_evidence, excluded_evidence = select_prep_evidence(meeting, all_entries)
+    print(build_prep_diagnostics(meeting, included_evidence, excluded_evidence, query_labels))
 
     attendees_str = ", ".join(attendee_names)
+    knowledge_context = format_prep_evidence_context(included_evidence)
 
-    # Per-attendee gaps must be explicit — otherwise sparse attendees get
-    # silently padded with other attendees' (or the owner's) context.
+    # Report gaps only for successfully queried attendees, never for people
+    # skipped by the planner or whose queries failed.
+    # Only evidence surviving both filters counts as usable prior context.
+    attendees_with_context = {
+        query_attendee[label.removeprefix("person:")]
+        for item in included_evidence
+        for label in item.entry.get("_query_labels", [])
+        if label.startswith("person:") and label.removeprefix("person:") in query_attendee
+    }
     missing_context_notes = [
-        f"(No prior context found for {attendee}.)"
+        f"(No relevant prior context found for {attendee}.)"
         for attendee in non_owner_attendees
-        if attendee not in attendees_with_context
+        if attendee in successfully_queried_attendees and attendee not in attendees_with_context
     ]
-
-    if not all_entries:
-        # No KG context — generate a minimal prep with just attendee + time info
-        knowledge_context = "(No prior context found for these attendees or topics.)"
-    else:
-        knowledge_context = format_knowledge_for_context(all_entries[:20])
-        if missing_context_notes:
-            knowledge_context += "\n" + "\n".join(missing_context_notes)
 
     prompt = _PREP_PROMPT.format(
         title=meeting["title"],
@@ -330,16 +374,10 @@ def _build_meeting_prep(meeting: dict) -> str | None:
 
     try:
         msg = generate(prompt=prompt, tier=TaskComplexity.LIGHT)
-        body = extract_text(msg).strip()
-        # Defensive: drop any header line the model emits despite instructions.
-        # The header is prepended deterministically below so the meeting title
-        # is never LLM-transcribed (a model slip once glued words onto it).
-        lines = body.split("\n")
-        if lines and ("meeting prep" in lines[0].lower() or lines[0].lstrip().startswith("📋")):
-            body = "\n".join(lines[1:]).lstrip("\n")
-        if not body:
-            return None
-        return f"📋 *meeting prep — {title}*\n\n{body}"
+        return finalize_evidence_gated_prep(
+            title, extract_text(msg).strip(), included_evidence,
+            missing_context_notes=missing_context_notes,
+        )
     except Exception as exc:
         print(f"  Meeting prep generation failed: {exc}")
         return None

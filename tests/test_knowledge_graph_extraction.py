@@ -59,3 +59,19 @@ def test_run_extraction_returns_empty_on_prose_no_json(monkeypatch):
     )
 
     assert result == []
+
+
+def test_run_extraction_preserves_auth_failure(monkeypatch):
+    import knowledge_graph
+
+    failure = knowledge_graph.ExternalAuthError("anthropic", "Expired credentials")
+
+    def _fail(**kwargs):
+        raise failure
+
+    monkeypatch.setattr(knowledge_graph, "generate", _fail)
+
+    with pytest.raises(knowledge_graph.ExternalAuthError) as caught:
+        knowledge_graph._run_extraction("meeting", "Planning", "Alice owns launch.", ["Alice"])
+
+    assert caught.value is failure
