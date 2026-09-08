@@ -42,7 +42,33 @@ EMAIL_ALERTS_MAX_PER_RUN=5
 IMPORTANT_EMAIL_KEYWORDS=urgent,asap,important,action required,deadline,escalation,blocker
 CLIENT_EMAIL_KEYWORDS=client,customer
 CLIENT_DOMAINS=
+
+# Langfuse observability (optional — tracing no-ops when keys are absent)
+LANGFUSE_PUBLIC_KEY=
+LANGFUSE_SECRET_KEY=
+LANGFUSE_BASE_URL=https://us.cloud.langfuse.com
+LANGFUSE_TRACING_ENABLED=true
 ```
+
+## Langfuse observability (optional)
+
+Momo can send traces to [Langfuse Cloud](https://us.cloud.langfuse.com) for request-level visibility into the agent loop, tool calls, Claude generations (with model and token usage for cost tracking), and scheduled jobs.
+
+**Enable it:**
+
+1. Create a project at [us.cloud.langfuse.com](https://us.cloud.langfuse.com) and copy the public and secret keys.
+2. Set `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` in `.env` (or as Cloud Run env vars).
+3. Redeploy.
+
+When keys are absent or `LANGFUSE_TRACING_ENABLED=false`, tracing is a zero-overhead no-op and Momo runs normally without any external calls.
+
+**What gets traced:**
+
+- Each `/chat` turn as an `agent-loop` root with the user message as input, nested `tool:<name>` spans, and Claude generations tagged with model and token counts.
+- Scheduled jobs (`morning-briefing`, `meeting-prep`, `post-meeting-debrief`, and so on) as named roots.
+- Query-time embeddings. Bulk-ingestion embeddings are intentionally excluded to stay under the Langfuse Hobby tier's 50k-unit monthly budget.
+
+Args, chat history, and API keys never appear in trace inputs.
 
 ## Granola integration (optional)
 
@@ -120,3 +146,9 @@ If Granola is disabled, all meeting-note features are silently skipped.
 | **Firestore** | | | |
 | `FIRESTORE_DATABASE` | No | `testing` | Firestore database name |
 | `MAX_CONVERSATION_TURNS` | No | `50` | Max conversation turns stored per user |
+| **Langfuse Observability** | | | |
+| `LANGFUSE_PUBLIC_KEY` | No | — | Langfuse public key. Tracing is a no-op when unset |
+| `LANGFUSE_SECRET_KEY` | No | — | Langfuse secret key. Tracing is a no-op when unset |
+| `LANGFUSE_BASE_URL` | No | `https://us.cloud.langfuse.com` | Langfuse ingestion endpoint |
+| `LANGFUSE_TRACING_ENABLED` | No | `true` | Set to `false` to force tracing off even when keys are present |
+| `LANGFUSE_TRACING_ENVIRONMENT` | No | `production` | Environment label attached to traces (e.g. `development`, `staging`) |

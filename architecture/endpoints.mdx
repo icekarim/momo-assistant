@@ -20,6 +20,7 @@ description: "HTTP endpoints and the Cloud Scheduler jobs that drive them"
 | `/google-auth/start` | GET | Chat reauth link | Browser-based Google reauth (requires one-time ticket `?t=`) |
 | `/google-auth/callback` | GET | Google OAuth redirect | Completes Google reauth and stores credentials |
 | `/granola-token-refresh` | POST | Cloud Scheduler (every 4h) | Keep Granola OAuth token alive |
+| `/run-evals` | POST | Cloud Scheduler (daily) | Run LLM-as-judge evals against the golden dataset via Langfuse |
 | `/connection-health` | POST | Cloud Scheduler (hourly) | Probe every external connector and alert Chat on auth-state transitions |
 
 ## Scheduled jobs (Cloud Scheduler)
@@ -33,6 +34,7 @@ One-time         ──► POST /knowledge-backfill      (bootstrap knowledge gr
 One-time         ──► POST /knowledge-embed-backfill (add embeddings to existing entities)
 Cloud Scheduler ──► POST /google-token-refresh     (every 4 hours - keeps Google token alive)
 Cloud Scheduler ──► POST /granola-token-refresh    (every 4 hours — keeps token alive)
+Cloud Scheduler ──► POST /run-evals                 (daily — nightly eval suite via Langfuse)
 Cloud Scheduler ──► POST /connection-health        (hourly — connector auth health checks)
 ```
 
@@ -93,6 +95,13 @@ Cloud Scheduler ──► POST /connection-health        (hourly — connector a
 1. Forces a proactive refresh of the Granola OAuth token
 2. Scheduled every 4 hours via Cloud Scheduler to prevent the refresh_token from expiring due to inactivity
 3. Granola access tokens last 6 hours — refreshing at 4h intervals keeps the token chain alive permanently
+
+**`/run-evals`** — in `main.py`:
+
+1. Runs the LLM-as-judge eval suite against the `momo-eval-golden` dataset (up to 50 items per run)
+2. Exercises the live agent end-to-end and records results as a Langfuse experiment named `momo-eval-YYYYMMDD`
+3. Returns `{"status": "ok", "experiment": "<name>"}` on success, or `{"status": "skipped"}` if the dataset is empty
+4. Requires Langfuse keys to be configured (see [Configuration](/setup/configuration))
 
 **`/connection-health`**:
 
