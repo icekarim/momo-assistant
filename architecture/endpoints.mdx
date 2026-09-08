@@ -96,7 +96,7 @@ Cloud Scheduler ──► POST /connection-health        (hourly — connector a
 
 **`/connection-health`**:
 
-1. Runs a lightweight authenticated probe against every configured connector in parallel (Jira, Google Workspace, Google Chat, Granola, each MCP server, Anthropic, Gemini, Firestore, LangSmith)
+1. Runs a lightweight authenticated probe against every configured connector in parallel (Jira, Google Workspace, Google Chat, Granola, each MCP server, Anthropic, Gemini, Firestore, Langfuse)
 2. Classifies each result as `ok`, `auth_failed`, `unavailable`, or `skipped` (for disabled connectors)
 3. Persists per-connector state in the `connection_health` Firestore collection
 4. Posts a Chat alert only when a connector's status transitions (for example, `ok` → `auth_failed`, or recovery back to `ok`), plus a reminder at most every 12 hours while a connector is still failing
