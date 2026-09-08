@@ -16,13 +16,18 @@ no LLM calls (conventions follow tests/test_p1_consumers.py).
 """
 
 from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
+from unittest.mock import MagicMock
 
 import pytest
+from test_reauth_tools import _load_fresh_module, isolated_module_registry
 
 import claude_client
 import config
 import knowledge_graph as kg
 import proactive_intelligence as pi
+if TYPE_CHECKING:  # The new run-path regressions bind real classes at execution time.
+    from connection_errors import ExternalAuthError, ExternalUnavailableError
 
 
 def _meeting(attendees=("Cameron",), title="Karim / Cameron intro"):
@@ -235,3 +240,80 @@ def test_rerank_failure_falls_back_to_unreranked_list(monkeypatch):
 
     assert captured["ids"] == ["p1", "p2"], "must fall back to the unreranked list"
     assert result is not None
+
+
+# ── (g) calendar failure must stop prep before KG or delivery ─
+
+
+@pytest.fixture
+def prep_error_types(monkeypatch):
+    """Match run_meeting_prep's lazy import without retaining a sibling's class.
+
+    Keep this scoped to the new run-path tests; legacy relevance tests and
+    sibling module bindings are restored unchanged afterward.
+    """
+    with isolated_module_registry("connection_errors"):
+        errors = _load_fresh_module("connection_errors")
+        for name in ("ExternalAuthError", "ExternalUnavailableError"):
+            monkeypatch.setitem(globals(), name, getattr(errors, name))
+        yield errors
+
+
+@pytest.fixture
+def prep_run_env(monkeypatch, prep_error_types):
+    monkeypatch.setattr(config, "PROACTIVE_INTELLIGENCE_ENABLED", True)
+    monkeypatch.setattr(config, "MEETING_PREP_ENABLED", True)
+    monkeypatch.setattr(config, "KNOWLEDGE_GRAPH_ENABLED", True)
+    monkeypatch.setattr(config, "CHAT_SPACE_ID", "spaces/test")
+    mocks = {}
+    for name in (
+        "has_prep_been_sent", "_run_meeting_prep_traced", "_build_meeting_prep",
+        "query_by_person", "query_by_project", "generate", "send_chat_message",
+        "_store_proactive_message", "mark_prep_sent",
+    ):
+        mocks[name] = MagicMock()
+        monkeypatch.setattr(pi, name, mocks[name])
+    mocks["semantic_search"] = MagicMock()
+    monkeypatch.setattr(kg, "semantic_search", mocks["semantic_search"])
+    return mocks
+
+
+def test_run_meeting_prep_reports_calendar_auth_failure(monkeypatch, prep_run_env, capsys):
+    fetch = MagicMock(side_effect=ExternalAuthError("google_workspace", "Reconnect Calendar"))
+    monkeypatch.setattr(pi, "fetch_upcoming_meetings", fetch)
+
+    result = pi.run_meeting_prep()
+
+    assert result["status"] == "auth_failed"
+    assert result["source"] == "calendar_events"
+    assert result["preps_sent"] == 0
+    assert "re-auth" in result["reason"]
+    fetch.assert_called_once_with(hours=config.MEETING_PREP_LOOKAHEAD_HOURS)
+    for mock in prep_run_env.values():
+        mock.assert_not_called()
+    assert "no meetings" not in capsys.readouterr().out.lower()
+
+
+def test_run_meeting_prep_preserves_legitimately_empty_calendar(monkeypatch, prep_run_env):
+    monkeypatch.setattr(pi, "fetch_upcoming_meetings", MagicMock(return_value=[]))
+
+    assert pi.run_meeting_prep() == {"status": "no_meetings", "preps_sent": 0}
+
+    for mock in prep_run_env.values():
+        mock.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", [
+    lambda: ConnectionError("Calendar unreachable"),
+    lambda: ExternalUnavailableError("google_workspace", "Calendar unavailable"),
+])
+def test_run_meeting_prep_does_not_misclassify_outage(monkeypatch, prep_run_env, failure):
+    failure = failure()
+    monkeypatch.setattr(pi, "fetch_upcoming_meetings", MagicMock(side_effect=failure))
+
+    with pytest.raises(type(failure)) as caught:
+        pi.run_meeting_prep()
+
+    assert caught.value is failure
+    for mock in prep_run_env.values():
+        mock.assert_not_called()

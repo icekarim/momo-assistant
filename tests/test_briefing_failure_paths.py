@@ -60,6 +60,7 @@ import briefing  # noqa: E402
 import chat_service  # noqa: E402
 import config  # noqa: E402
 import gemini_service  # noqa: E402
+from connection_errors import ExternalAuthError  # noqa: E402
 
 
 def _msg(text=None, stop_reason="max_tokens"):
@@ -227,3 +228,45 @@ def test_successful_send_returns_sent_status(monkeypatch, briefing_env):
 
     assert result["status"] == "sent"
     kg_mock.assert_called_once()  # post-send KG extraction still runs
+
+
+@pytest.mark.parametrize("has_other_data", [False, True], ids=["calendar_only", "with_tasks"])
+def test_calendar_auth_failure_is_visible_not_silently_empty(monkeypatch, briefing_env, has_other_data):
+    monkeypatch.setattr(briefing, "fetch_todays_meetings", MagicMock(
+        side_effect=ExternalAuthError("google_workspace", "Calendar credentials expired"),
+    ))
+    if not has_other_data:
+        monkeypatch.setattr(briefing, "fetch_open_tasks", lambda: [])
+    generate = MagicMock(return_value="the briefing")
+    send = MagicMock(return_value=True)
+    monkeypatch.setattr(briefing, "generate_morning_briefing", generate)
+    monkeypatch.setattr(briefing, "send_chat_message", send)
+
+    result = briefing.run_morning_briefing()
+
+    assert result["status"] == "sent", "auth failure must not become 'nothing to report'"
+    generate.assert_called_once()
+    send.assert_called_once()
+    assert "Google Calendar connection needs re-auth" in send.call_args.args[1]
+    assert "the briefing" in send.call_args.args[1]
+
+
+@pytest.mark.parametrize("has_other_data", [False, True], ids=["calendar_only", "with_tasks"])
+def test_legitimately_empty_calendar_has_no_auth_notice(monkeypatch, briefing_env, has_other_data):
+    if not has_other_data:
+        monkeypatch.setattr(briefing, "fetch_open_tasks", lambda: [])
+    generate = MagicMock(return_value="the briefing")
+    send = MagicMock(return_value=True)
+    monkeypatch.setattr(briefing, "generate_morning_briefing", generate)
+    monkeypatch.setattr(briefing, "send_chat_message", send)
+
+    result = briefing.run_morning_briefing()
+
+    if has_other_data:
+        assert result["status"] == "sent"
+        generate.assert_called_once()
+        send.assert_called_once_with("spaces/test", "the briefing")
+    else:
+        assert result == {"status": "skipped", "reason": "nothing to report"}
+        generate.assert_not_called()
+        send.assert_not_called()
